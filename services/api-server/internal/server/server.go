@@ -160,6 +160,7 @@ func New(logger *slog.Logger) (*Server, error) {
 		api.Delete("/crons/{cron_id}", s.deleteCron)
 		api.Get("/system", s.systemInfo)
 		api.Get("/system/health", s.systemHealth)
+		api.Get("/system/attention", s.systemAttention)
 	})
 
 	r.Post("/a2a/{assistant_id}", s.a2a)
@@ -1099,6 +1100,70 @@ func (s *Server) systemHealth(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, response)
 		return
 	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) systemAttention(w http.ResponseWriter, r *http.Request) {
+	now := time.Now().UTC()
+	stuckThresholdSeconds := int64(envIntOrDefault("STUCK_RUN_SECONDS", 300))
+	response := map[string]any{
+		"stuck_runs":              int64(0),
+		"pending_runs":            int64(0),
+		"error_runs":              int64(0),
+		"webhook_dead_letters":    int64(0),
+		"stuck_threshold_seconds": stuckThresholdSeconds,
+		"timestamp":               now,
+	}
+
+	if s.pg != nil {
+		var stuckRuns int64
+		_ = s.pg.QueryRow(r.Context(), `
+			SELECT COUNT(1)
+			FROM runs
+			WHERE status='running' AND updated_at < NOW() - ($1::bigint * INTERVAL '1 second')
+		`, stuckThresholdSeconds).Scan(&stuckRuns)
+		response["stuck_runs"] = stuckRuns
+
+		var pendingRuns int64
+		_ = s.pg.QueryRow(r.Context(), `SELECT COUNT(1) FROM runs WHERE status='pending'`).Scan(&pendingRuns)
+		response["pending_runs"] = pendingRuns
+
+		var errorRuns int64
+		_ = s.pg.QueryRow(r.Context(), `SELECT COUNT(1) FROM runs WHERE status='error'`).Scan(&errorRuns)
+		response["error_runs"] = errorRuns
+
+		var deadLetters int64
+		_ = s.pg.QueryRow(r.Context(), `
+			SELECT COUNT(1)
+			FROM webhook_deliveries
+			WHERE status IN ('dead_letter', 'failed')
+		`).Scan(&deadLetters)
+		response["webhook_dead_letters"] = deadLetters
+
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+
+	s.store.mu.RLock()
+	defer s.store.mu.RUnlock()
+	var stuckRuns int64
+	var pendingRuns int64
+	var errorRuns int64
+	for _, run := range s.store.runs {
+		switch run.Status {
+		case contracts.RunStatusPending:
+			pendingRuns++
+		case contracts.RunStatusError:
+			errorRuns++
+		case contracts.RunStatusRunning:
+			if now.Sub(run.UpdatedAt) > time.Duration(stuckThresholdSeconds)*time.Second {
+				stuckRuns++
+			}
+		}
+	}
+	response["stuck_runs"] = stuckRuns
+	response["pending_runs"] = pendingRuns
+	response["error_runs"] = errorRuns
 	writeJSON(w, http.StatusOK, response)
 }
 

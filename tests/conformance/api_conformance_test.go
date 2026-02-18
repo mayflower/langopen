@@ -203,6 +203,17 @@ func TestStoreStatelessRunsAndSystem(t *testing.T) {
 	}
 	healthResp.Body.Close()
 
+	attentionReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/system/attention", nil)
+	attentionReq.Header.Set("X-Api-Key", "test-key")
+	attentionResp, err := client.Do(attentionReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attentionResp.StatusCode != http.StatusOK {
+		t.Fatalf("system attention status=%d", attentionResp.StatusCode)
+	}
+	attentionResp.Body.Close()
+
 	putResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/store/items", map[string]any{
 		"namespace": "ns_conformance",
 		"key":       "k1",

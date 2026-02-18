@@ -330,6 +330,16 @@
         }
       }
     },
+    "/system/attention": {
+      "get": {
+        "summary": "System attention summary",
+        "responses": {
+          "200": {
+            "description": "Operational attention counters"
+          }
+        }
+      }
+    },
     "/a2a/{assistant_id}": {
       "post": {
         "summary": "A2A JSON-RPC endpoint",
