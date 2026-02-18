@@ -143,37 +143,8 @@ func New(logger *slog.Logger) (*Server, error) {
 	r.Get("/docs", s.docs)
 	r.Get("/openapi.json", s.openapi)
 
-	r.Route("/api/v1", func(api chi.Router) {
-		api.Get("/assistants", s.listAssistants)
-		api.Post("/assistants", s.createAssistant)
-		api.Get("/assistants/{assistant_id}", s.getAssistant)
-		api.Patch("/assistants/{assistant_id}", s.updateAssistant)
-		api.Delete("/assistants/{assistant_id}", s.deleteAssistant)
-		api.Get("/threads", s.listThreads)
-		api.Post("/threads", s.createThread)
-		api.Get("/threads/{thread_id}", s.getThread)
-		api.Patch("/threads/{thread_id}", s.updateThread)
-		api.Delete("/threads/{thread_id}", s.deleteThread)
-		api.Post("/threads/{thread_id}/runs/stream", s.createRunStream)
-		api.Get("/threads/{thread_id}/runs/{run_id}/stream", s.joinRunStream)
-		api.Post("/threads/{thread_id}/runs/{run_id}/cancel", s.cancelRun)
-		api.Post("/runs/stream", s.createStatelessRunStream)
-		api.Get("/runs/{run_id}/stream", s.joinRunStream)
-		api.Post("/runs/{run_id}/cancel", s.cancelRun)
-		api.Get("/runs/{run_id}", s.getRun)
-		api.Get("/store/items", s.listStoreItems)
-		api.Post("/store/items", s.putStoreItem)
-		api.Get("/store/items/{namespace}/{key}", s.getStoreItem)
-		api.Delete("/store/items/{namespace}/{key}", s.deleteStoreItem)
-		api.Get("/crons", s.listCrons)
-		api.Post("/crons", s.createCron)
-		api.Get("/crons/{cron_id}", s.getCron)
-		api.Patch("/crons/{cron_id}", s.updateCron)
-		api.Delete("/crons/{cron_id}", s.deleteCron)
-		api.Get("/system", s.systemInfo)
-		api.Get("/system/health", s.systemHealth)
-		api.Get("/system/attention", s.systemAttention)
-	})
+	r.Route("/api/v1", s.registerDataPlaneRoutes)
+	r.Group(s.registerDataPlaneRoutes)
 
 	r.Post("/a2a/{assistant_id}", s.a2a)
 	r.Post("/mcp", s.mcp)
@@ -183,6 +154,38 @@ func New(logger *slog.Logger) (*Server, error) {
 }
 
 func (s *Server) Router() http.Handler { return s.router }
+
+func (s *Server) registerDataPlaneRoutes(api chi.Router) {
+	api.Get("/assistants", s.listAssistants)
+	api.Post("/assistants", s.createAssistant)
+	api.Get("/assistants/{assistant_id}", s.getAssistant)
+	api.Patch("/assistants/{assistant_id}", s.updateAssistant)
+	api.Delete("/assistants/{assistant_id}", s.deleteAssistant)
+	api.Get("/threads", s.listThreads)
+	api.Post("/threads", s.createThread)
+	api.Get("/threads/{thread_id}", s.getThread)
+	api.Patch("/threads/{thread_id}", s.updateThread)
+	api.Delete("/threads/{thread_id}", s.deleteThread)
+	api.Post("/threads/{thread_id}/runs/stream", s.createRunStream)
+	api.Get("/threads/{thread_id}/runs/{run_id}/stream", s.joinRunStream)
+	api.Post("/threads/{thread_id}/runs/{run_id}/cancel", s.cancelRun)
+	api.Post("/runs/stream", s.createStatelessRunStream)
+	api.Get("/runs/{run_id}/stream", s.joinRunStream)
+	api.Post("/runs/{run_id}/cancel", s.cancelRun)
+	api.Get("/runs/{run_id}", s.getRun)
+	api.Get("/store/items", s.listStoreItems)
+	api.Post("/store/items", s.putStoreItem)
+	api.Get("/store/items/{namespace}/{key}", s.getStoreItem)
+	api.Delete("/store/items/{namespace}/{key}", s.deleteStoreItem)
+	api.Get("/crons", s.listCrons)
+	api.Post("/crons", s.createCron)
+	api.Get("/crons/{cron_id}", s.getCron)
+	api.Patch("/crons/{cron_id}", s.updateCron)
+	api.Delete("/crons/{cron_id}", s.deleteCron)
+	api.Get("/system", s.systemInfo)
+	api.Get("/system/health", s.systemHealth)
+	api.Get("/system/attention", s.systemAttention)
+}
 
 func projectIDFromContext(ctx context.Context) string {
 	projectID, _ := ctx.Value(projectIDContextKey).(string)
@@ -243,14 +246,18 @@ func requiredDataRoleFor(method, path string) contracts.ProjectRole {
 	if method == http.MethodGet || method == http.MethodHead {
 		return contracts.RoleViewer
 	}
-	if strings.HasPrefix(path, "/api/v1/system") {
+	normalizedPath := path
+	if strings.HasPrefix(normalizedPath, "/api/v1") {
+		normalizedPath = strings.TrimPrefix(normalizedPath, "/api/v1")
+	}
+	if strings.HasPrefix(normalizedPath, "/system") {
 		return contracts.RoleViewer
 	}
-	if strings.HasPrefix(path, "/api/v1/store/items") ||
-		strings.HasPrefix(path, "/api/v1/assistants") ||
-		strings.HasPrefix(path, "/api/v1/threads") ||
-		strings.HasPrefix(path, "/api/v1/runs") ||
-		strings.HasPrefix(path, "/api/v1/crons") ||
+	if strings.HasPrefix(normalizedPath, "/store/items") ||
+		strings.HasPrefix(normalizedPath, "/assistants") ||
+		strings.HasPrefix(normalizedPath, "/threads") ||
+		strings.HasPrefix(normalizedPath, "/runs") ||
+		strings.HasPrefix(normalizedPath, "/crons") ||
 		strings.HasPrefix(path, "/a2a/") ||
 		strings.HasPrefix(path, "/mcp") {
 		return contracts.RoleDeveloper

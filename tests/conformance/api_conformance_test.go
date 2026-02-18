@@ -233,6 +233,48 @@ func TestAssistantsAndThreadsCRUD(t *testing.T) {
 	deleteAssistantResp.Body.Close()
 }
 
+func TestCompatibilityRootPaths(t *testing.T) {
+	ts, client := newClientServer(t)
+
+	createThreadResp := doJSON(t, client, http.MethodPost, ts.URL+"/threads", map[string]any{}, "test-key")
+	if createThreadResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(createThreadResp.Body)
+		t.Fatalf("root create thread status=%d body=%s", createThreadResp.StatusCode, string(body))
+	}
+	var thread map[string]any
+	if err := json.NewDecoder(createThreadResp.Body).Decode(&thread); err != nil {
+		t.Fatal(err)
+	}
+	createThreadResp.Body.Close()
+	threadID, _ := thread["id"].(string)
+	if threadID == "" {
+		t.Fatal("missing thread id")
+	}
+
+	getThreadReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/threads/"+threadID, nil)
+	getThreadReq.Header.Set("X-Api-Key", "test-key")
+	getThreadResp, err := client.Do(getThreadReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getThreadResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(getThreadResp.Body)
+		t.Fatalf("root get thread status=%d body=%s", getThreadResp.StatusCode, string(body))
+	}
+	getThreadResp.Body.Close()
+
+	rootStreamResp := doJSON(t, client, http.MethodPost, ts.URL+"/threads/"+threadID+"/runs/stream", map[string]any{}, "test-key")
+	if rootStreamResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(rootStreamResp.Body)
+		t.Fatalf("root run stream status=%d body=%s", rootStreamResp.StatusCode, string(body))
+	}
+	runID := findRunID(t, rootStreamResp.Body)
+	rootStreamResp.Body.Close()
+	if runID == "" {
+		t.Fatal("root run stream missing run id")
+	}
+}
+
 func TestRunStreamResumeAndReplay(t *testing.T) {
 	ts, client := newClientServer(t)
 
