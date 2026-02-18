@@ -1321,6 +1321,15 @@ func (s *Server) a2a(w http.ResponseWriter, r *http.Request) {
 	if threadID == "" {
 		threadID = "thread_default"
 	}
+	if req.Method == "message/stream" {
+		startFrom := parseStartFrom(r.Header.Get("Last-Event-ID"))
+		events := []streamEvent{
+			mkEvent(1, "message_received", map[string]any{"thread_id": threadID, "assistant_id": chi.URLParam(r, "assistant_id")}),
+			mkEvent(2, "message_completed", map[string]any{"thread_id": threadID, "status": "ok"}),
+		}
+		streamSSE(w, r, events, startFrom)
+		return
+	}
 
 	result := map[string]any{
 		"accepted":  true,

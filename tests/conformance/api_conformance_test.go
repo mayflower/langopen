@@ -126,6 +126,17 @@ func TestA2AAndMCP(t *testing.T) {
 	}
 	a2aResp.Body.Close()
 
+	a2aStreamBody := map[string]any{"jsonrpc": "2.0", "id": "stream1", "method": "message/stream", "params": map[string]any{"message": map[string]any{"contextId": "thread_x"}}}
+	a2aStreamResp := doJSON(t, client, http.MethodPost, ts.URL+"/a2a/asst_1", a2aStreamBody, "test-key")
+	if a2aStreamResp.StatusCode != http.StatusOK {
+		t.Fatalf("a2a stream status=%d", a2aStreamResp.StatusCode)
+	}
+	streamBytes, _ := io.ReadAll(a2aStreamResp.Body)
+	a2aStreamResp.Body.Close()
+	if !strings.Contains(string(streamBytes), "event: message_received") {
+		t.Fatalf("expected a2a stream event, got: %s", string(streamBytes))
+	}
+
 	mcpResp := doJSON(t, client, http.MethodPost, ts.URL+"/mcp", map[string]any{"jsonrpc": "2.0", "id": "1", "method": "initialize"}, "test-key")
 	if mcpResp.StatusCode != http.StatusOK {
 		t.Fatalf("mcp status=%d", mcpResp.StatusCode)
