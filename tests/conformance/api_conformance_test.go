@@ -191,6 +191,23 @@ func TestAssistantsAndThreadsCRUD(t *testing.T) {
 	}
 	getThreadResp.Body.Close()
 
+	patchThreadResp := doJSON(t, client, http.MethodPatch, ts.URL+"/api/v1/threads/"+threadID, map[string]any{
+		"metadata": map[string]any{"source": "updated"},
+	}, "test-key")
+	if patchThreadResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(patchThreadResp.Body)
+		t.Fatalf("patch thread status=%d body=%s", patchThreadResp.StatusCode, string(body))
+	}
+	var patchedThread map[string]any
+	if err := json.NewDecoder(patchThreadResp.Body).Decode(&patchedThread); err != nil {
+		t.Fatal(err)
+	}
+	patchThreadResp.Body.Close()
+	metadata, _ := patchedThread["metadata"].(map[string]any)
+	if got, _ := metadata["source"].(string); got != "updated" {
+		t.Fatalf("expected metadata.source=updated got %q", got)
+	}
+
 	deleteThreadReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/threads/"+threadID, nil)
 	deleteThreadReq.Header.Set("X-Api-Key", "test-key")
 	deleteThreadResp, err := client.Do(deleteThreadReq)

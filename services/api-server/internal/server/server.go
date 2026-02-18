@@ -20,6 +20,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"langopen.dev/pkg/contracts"
@@ -151,6 +152,7 @@ func New(logger *slog.Logger) (*Server, error) {
 		api.Get("/threads", s.listThreads)
 		api.Post("/threads", s.createThread)
 		api.Get("/threads/{thread_id}", s.getThread)
+		api.Patch("/threads/{thread_id}", s.updateThread)
 		api.Delete("/threads/{thread_id}", s.deleteThread)
 		api.Post("/threads/{thread_id}/runs/stream", s.createRunStream)
 		api.Get("/threads/{thread_id}/runs/{run_id}/stream", s.joinRunStream)
@@ -838,6 +840,56 @@ func (s *Server) getThread(w http.ResponseWriter, r *http.Request) {
 		contracts.WriteError(w, http.StatusNotFound, "thread_not_found", "thread not found", observability.RequestIDFromContext(r.Context()))
 		return
 	}
+	writeJSON(w, http.StatusOK, thread)
+}
+
+func (s *Server) updateThread(w http.ResponseWriter, r *http.Request) {
+	threadID := strings.TrimSpace(chi.URLParam(r, "thread_id"))
+	if threadID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_thread_id", "thread_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	var req struct {
+		Metadata *map[string]string `json:"metadata"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if req.Metadata == nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_thread_update", "metadata is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	metadata := *req.Metadata
+
+	if s.pg != nil {
+		thread, err := s.updateThreadInPostgres(r.Context(), projectIDFromContext(r.Context()), threadID, metadata)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "thread_not_found", "thread not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_update_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		writeJSON(w, http.StatusOK, thread)
+		return
+	}
+
+	s.store.mu.Lock()
+	thread, ok := s.store.threads[threadID]
+	if !ok {
+		s.store.mu.Unlock()
+		contracts.WriteError(w, http.StatusNotFound, "thread_not_found", "thread not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	thread.Metadata = map[string]string{}
+	for k, v := range metadata {
+		thread.Metadata[k] = v
+	}
+	thread.UpdatedAt = time.Now().UTC()
+	s.store.threads[threadID] = thread
+	s.store.mu.Unlock()
 	writeJSON(w, http.StatusOK, thread)
 }
 
@@ -1537,6 +1589,33 @@ func (s *Server) deleteThreadFromPostgres(ctx context.Context, projectID, thread
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (s *Server) updateThreadInPostgres(ctx context.Context, projectID, threadID string, metadata map[string]string) (contracts.Thread, error) {
+	raw, err := json.Marshal(metadata)
+	if err != nil {
+		return contracts.Thread{}, err
+	}
+
+	var tag pgconn.CommandTag
+	if projectID == "" {
+		tag, err = s.pg.Exec(ctx, `UPDATE threads SET metadata=$2, updated_at=NOW() WHERE id=$1`, threadID, raw)
+	} else {
+		tag, err = s.pg.Exec(ctx, `
+			UPDATE threads t
+			SET metadata=$2, updated_at=NOW()
+			FROM assistants a
+			JOIN deployments d ON d.id = a.deployment_id
+			WHERE t.id=$1 AND a.id = t.assistant_id AND d.project_id=$3
+		`, threadID, raw, projectID)
+	}
+	if err != nil {
+		return contracts.Thread{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		return contracts.Thread{}, sql.ErrNoRows
+	}
+	return s.getThreadFromPostgres(ctx, projectID, threadID)
 }
 
 func nilString(input *string) any {

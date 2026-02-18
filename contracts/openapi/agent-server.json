@@ -121,6 +121,24 @@
           }
         }
       },
+      "patch": {
+        "summary": "Update thread",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Thread updated"
+          }
+        }
+      },
       "delete": {
         "summary": "Delete thread",
         "parameters": [
