@@ -14,9 +14,10 @@ export default async function Home() {
   let threads: Thread[] = [];
 
   try {
+    const projectQuery = `project_id=${encodeURIComponent(cfg.projectID)}`;
     [deployments, builds, assistants, threads] = await Promise.all([
-      fetchControl<Deployment[]>("/internal/v1/deployments"),
-      fetchControl<Build[]>("/internal/v1/builds"),
+      fetchControl<Deployment[]>(`/internal/v1/deployments?${projectQuery}`),
+      fetchControl<Build[]>(`/internal/v1/builds?${projectQuery}`),
       fetchData<Assistant[]>("/api/v1/assistants"),
       fetchData<Thread[]>("/api/v1/threads")
     ]);
@@ -30,7 +31,7 @@ export default async function Home() {
       <section className="hero">
         <h1>LangOpen Platform</h1>
         <p>Drop-in LangGraph-compatible runtime with Kubernetes sandboxing and operator-grade observability.</p>
-        <p className="muted">Data API: {cfg.dataBase} | Control API: {cfg.controlBase} | API key loaded: {String(cfg.hasAPIKey)}</p>
+        <p className="muted">Project: {cfg.projectID} | Data API: {cfg.dataBase} | Control API: {cfg.controlBase} | API key loaded: {String(cfg.hasAPIKey)}</p>
       </section>
       <section className="grid">
         <article className="card">

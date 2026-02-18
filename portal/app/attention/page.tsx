@@ -24,10 +24,11 @@ export default async function AttentionPage() {
   let healthErr = "";
 
   try {
+    const projectQuery = `project_id=${encodeURIComponent(cfg.projectID)}`;
     [health, summary, builds] = await Promise.all([
       fetchData<HealthResponse>("/api/v1/system/health"),
       fetchData<AttentionSummary>("/api/v1/system/attention"),
-      fetchControl<Build[]>("/internal/v1/builds")
+      fetchControl<Build[]>(`/internal/v1/builds?${projectQuery}`)
     ]);
   } catch (err) {
     healthErr = err instanceof Error ? err.message : "failed to load health";

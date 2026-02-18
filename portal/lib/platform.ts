@@ -1,6 +1,7 @@
 const DATA_BASE = process.env.PLATFORM_DATA_API_BASE_URL || "http://langopen-api-server";
 const CONTROL_BASE = process.env.PLATFORM_CONTROL_API_BASE_URL || "http://langopen-control-plane";
 const API_KEY = process.env.PLATFORM_API_KEY || process.env.BOOTSTRAP_API_KEY || "";
+const PORTAL_PROJECT_ID = process.env.PORTAL_PROJECT_ID || "proj_default";
 
 type FetchOptions = {
   method?: string;
@@ -50,6 +51,7 @@ export function portalRuntimeConfig() {
   return {
     dataBase: DATA_BASE,
     controlBase: CONTROL_BASE,
+    projectID: PORTAL_PROJECT_ID,
     hasAPIKey: API_KEY.length > 0,
     grafanaBase,
     grafanaExploreUrl: process.env.GRAFANA_EXPLORE_URL || defaultExplore,
