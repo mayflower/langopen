@@ -118,3 +118,9 @@ extraEnvFrom:
   builder: []
   operator: []
   portal: []
+
+observability:
+  dashboards:
+    enabled: true
+  alerts:
+    enabled: false

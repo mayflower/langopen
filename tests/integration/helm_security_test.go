@@ -31,6 +31,9 @@ func TestHelmDefaultsEnforceSecurity(t *testing.T) {
 	if runtimeClassCount < 4 {
 		t.Fatalf("expected runtimeClassName gvisor for runtime pods, got count=%d", runtimeClassCount)
 	}
+	if !strings.Contains(rendered, "langopen-grafana-dashboard") {
+		t.Fatalf("expected grafana dashboard configmap in rendered chart")
+	}
 }
 
 func TestBuilderHasJobRBAC(t *testing.T) {

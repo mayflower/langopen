@@ -1,0 +1,76 @@
+{{- if .Values.observability.dashboards.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "langopen.fullname" . }}-grafana-dashboard
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: observability
+    grafana_dashboard: "1"
+data:
+  langopen-overview.json: |
+    {
+      "title": "LangOpen Overview",
+      "schemaVersion": 39,
+      "version": 1,
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "HTTP Request Rate",
+          "targets": [
+            {
+              "expr": "sum(rate(langopen_http_requests_total[5m])) by (service, status)",
+              "legendFormat": "service_status"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "HTTP P95 Latency",
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(langopen_http_request_duration_seconds_bucket[5m])) by (le, service))",
+              "legendFormat": "service"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Queued Builds",
+          "targets": [
+            {
+              "expr": "sum(langopen_builds_status{status=~\"queued|running\"})",
+              "legendFormat": "queued_or_running"
+            }
+          ]
+        }
+      ]
+    }
+{{- end }}
+{{- if .Values.observability.alerts.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "langopen.fullname" . }}-alerts
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: langopen.rules
+      rules:
+        - alert: LangOpenHighErrorRate
+          expr: sum(rate(langopen_http_requests_total{status=~"5.."}[5m])) / sum(rate(langopen_http_requests_total[5m])) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "LangOpen error rate exceeds 5%"
+        - alert: LangOpenHighLatency
+          expr: histogram_quantile(0.95, sum(rate(langopen_http_request_duration_seconds_bucket[5m])) by (le, service)) > 2
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "LangOpen p95 latency exceeds 2s"
+{{- end }}
