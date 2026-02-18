@@ -60,8 +60,10 @@ func TestDocsAndOpenAPI(t *testing.T) {
 		"/assistants/{assistant_id}",
 		"/threads",
 		"/threads/{thread_id}",
+		"/threads/{thread_id}/runs",
 		"/threads/{thread_id}/runs/stream",
 		"/threads/{thread_id}/runs/{run_id}/stream",
+		"/runs",
 		"/runs/stream",
 		"/runs/{run_id}",
 		"/store/items",
@@ -272,6 +274,123 @@ func TestCompatibilityRootPaths(t *testing.T) {
 	rootStreamResp.Body.Close()
 	if runID == "" {
 		t.Fatal("root run stream missing run id")
+	}
+
+	rootCreateRunResp := doJSON(t, client, http.MethodPost, ts.URL+"/threads/"+threadID+"/runs", map[string]any{}, "test-key")
+	if rootCreateRunResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(rootCreateRunResp.Body)
+		t.Fatalf("root run create status=%d body=%s", rootCreateRunResp.StatusCode, string(body))
+	}
+	rootCreateRunResp.Body.Close()
+
+	rootCreateStatelessResp := doJSON(t, client, http.MethodPost, ts.URL+"/runs", map[string]any{}, "test-key")
+	if rootCreateStatelessResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(rootCreateStatelessResp.Body)
+		t.Fatalf("root stateless run create status=%d body=%s", rootCreateStatelessResp.StatusCode, string(body))
+	}
+	rootCreateStatelessResp.Body.Close()
+}
+
+func TestRunCreateAndListNonStream(t *testing.T) {
+	ts, client := newClientServer(t)
+
+	threadResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/threads", map[string]any{}, "test-key")
+	defer threadResp.Body.Close()
+	var thread struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(threadResp.Body).Decode(&thread); err != nil {
+		t.Fatal(err)
+	}
+
+	createThreadRunResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/threads/"+thread.ID+"/runs", map[string]any{
+		"multitask_strategy": "enqueue",
+	}, "test-key")
+	if createThreadRunResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(createThreadRunResp.Body)
+		t.Fatalf("create thread run status=%d body=%s", createThreadRunResp.StatusCode, string(body))
+	}
+	var threadRun map[string]any
+	if err := json.NewDecoder(createThreadRunResp.Body).Decode(&threadRun); err != nil {
+		t.Fatal(err)
+	}
+	createThreadRunResp.Body.Close()
+	threadRunID, _ := threadRun["id"].(string)
+	if threadRunID == "" {
+		t.Fatal("missing thread run id")
+	}
+
+	listThreadRunsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/threads/"+thread.ID+"/runs", nil)
+	listThreadRunsReq.Header.Set("X-Api-Key", "test-key")
+	listThreadRunsResp, err := client.Do(listThreadRunsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listThreadRunsResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(listThreadRunsResp.Body)
+		t.Fatalf("list thread runs status=%d body=%s", listThreadRunsResp.StatusCode, string(body))
+	}
+	var listedThreadRuns []map[string]any
+	if err := json.NewDecoder(listThreadRunsResp.Body).Decode(&listedThreadRuns); err != nil {
+		t.Fatal(err)
+	}
+	listThreadRunsResp.Body.Close()
+	foundThreadRun := false
+	for _, item := range listedThreadRuns {
+		if id, _ := item["id"].(string); id == threadRunID {
+			foundThreadRun = true
+			break
+		}
+	}
+	if !foundThreadRun {
+		t.Fatalf("created thread run %s not found in thread run list", threadRunID)
+	}
+
+	createStatelessResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/runs", map[string]any{
+		"assistant_id": "asst_default",
+	}, "test-key")
+	if createStatelessResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(createStatelessResp.Body)
+		t.Fatalf("create stateless run status=%d body=%s", createStatelessResp.StatusCode, string(body))
+	}
+	var stateless map[string]any
+	if err := json.NewDecoder(createStatelessResp.Body).Decode(&stateless); err != nil {
+		t.Fatal(err)
+	}
+	createStatelessResp.Body.Close()
+	statelessRunID, _ := stateless["id"].(string)
+	if statelessRunID == "" {
+		t.Fatal("missing stateless run id")
+	}
+
+	listRunsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/runs", nil)
+	listRunsReq.Header.Set("X-Api-Key", "test-key")
+	listRunsResp, err := client.Do(listRunsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listRunsResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(listRunsResp.Body)
+		t.Fatalf("list runs status=%d body=%s", listRunsResp.StatusCode, string(body))
+	}
+	var listedRuns []map[string]any
+	if err := json.NewDecoder(listRunsResp.Body).Decode(&listedRuns); err != nil {
+		t.Fatal(err)
+	}
+	listRunsResp.Body.Close()
+	foundThread := false
+	foundStateless := false
+	for _, item := range listedRuns {
+		id, _ := item["id"].(string)
+		if id == threadRunID {
+			foundThread = true
+		}
+		if id == statelessRunID {
+			foundStateless = true
+		}
+	}
+	if !foundThread || !foundStateless {
+		t.Fatalf("expected both created runs in list, foundThread=%v foundStateless=%v", foundThread, foundStateless)
 	}
 }
 

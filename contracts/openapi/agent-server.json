@@ -181,6 +181,44 @@
         }
       }
     },
+    "/threads/{thread_id}/runs": {
+      "get": {
+        "summary": "List runs for thread",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run list"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create run",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Run created"
+          }
+        }
+      }
+    },
     "/threads/{thread_id}/runs/{run_id}/stream": {
       "get": {
         "summary": "Join run stream",
@@ -233,6 +271,24 @@
         "responses": {
           "200": {
             "description": "SSE stream"
+          }
+        }
+      }
+    },
+    "/runs": {
+      "get": {
+        "summary": "List runs",
+        "responses": {
+          "200": {
+            "description": "Run list"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create stateless run",
+        "responses": {
+          "201": {
+            "description": "Run created"
           }
         }
       }

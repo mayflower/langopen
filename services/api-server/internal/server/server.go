@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -166,9 +167,13 @@ func (s *Server) registerDataPlaneRoutes(api chi.Router) {
 	api.Get("/threads/{thread_id}", s.getThread)
 	api.Patch("/threads/{thread_id}", s.updateThread)
 	api.Delete("/threads/{thread_id}", s.deleteThread)
+	api.Get("/threads/{thread_id}/runs", s.listThreadRuns)
+	api.Post("/threads/{thread_id}/runs", s.createRun)
 	api.Post("/threads/{thread_id}/runs/stream", s.createRunStream)
 	api.Get("/threads/{thread_id}/runs/{run_id}/stream", s.joinRunStream)
 	api.Post("/threads/{thread_id}/runs/{run_id}/cancel", s.cancelRun)
+	api.Get("/runs", s.listRuns)
+	api.Post("/runs", s.createStatelessRun)
 	api.Post("/runs/stream", s.createStatelessRunStream)
 	api.Get("/runs/{run_id}/stream", s.joinRunStream)
 	api.Post("/runs/{run_id}/cancel", s.cancelRun)
@@ -957,6 +962,130 @@ func (s *Server) deleteThread(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (s *Server) listThreadRuns(w http.ResponseWriter, r *http.Request) {
+	threadID := strings.TrimSpace(chi.URLParam(r, "thread_id"))
+	if threadID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_thread_id", "thread_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	runs, err := s.listRunsFiltered(r.Context(), projectIDFromContext(r.Context()), threadID, "", "")
+	if err != nil {
+		contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	writeJSON(w, http.StatusOK, runs)
+}
+
+func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
+	threadID := strings.TrimSpace(r.URL.Query().Get("thread_id"))
+	assistantID := strings.TrimSpace(r.URL.Query().Get("assistant_id"))
+	status := strings.TrimSpace(r.URL.Query().Get("status"))
+	if status != "" && !isValidRunStatus(contracts.RunStatus(status)) {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_status", "status must be pending, running, error, success, timeout, interrupted", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	runs, err := s.listRunsFiltered(r.Context(), projectIDFromContext(r.Context()), threadID, assistantID, status)
+	if err != nil {
+		contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	writeJSON(w, http.StatusOK, runs)
+}
+
+func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
+	threadID := chi.URLParam(r, "thread_id")
+	var req createRunRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if req.AssistantID == "" {
+		req.AssistantID = "asst_default"
+	}
+	strategy := contracts.MultitaskStrategy(strings.TrimSpace(req.MultitaskStrategy))
+	if strategy == "" {
+		strategy = contracts.MultitaskEnqueue
+	}
+	if !isValidMultitaskStrategy(strategy) {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_multitask_strategy", "multitask_strategy must be reject, rollback, interrupt, enqueue", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	streamResumable := true
+	if req.StreamResumable != nil {
+		streamResumable = *req.StreamResumable
+	}
+
+	var run contracts.Run
+	var err error
+	if s.pg != nil {
+		run, err = s.createRunInPostgres(r.Context(), projectIDFromContext(r.Context()), threadID, req.AssistantID, strategy, streamResumable, strings.TrimSpace(req.WebhookURL))
+		if err != nil {
+			if errors.Is(err, errRunConflict) {
+				contracts.WriteError(w, http.StatusConflict, "run_conflict", "thread already has active run", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			if errors.Is(err, errProjectScope) {
+				contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "thread or assistant is not accessible for this API key project", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "create_run_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		if s.redis != nil {
+			_ = s.redis.LPush(r.Context(), s.cfg.QueueKey, "wake").Err()
+		}
+	} else {
+		run = s.createRunInMemory(threadID, req.AssistantID, strategy, streamResumable)
+	}
+	writeJSON(w, http.StatusCreated, run)
+}
+
+func (s *Server) createStatelessRun(w http.ResponseWriter, r *http.Request) {
+	var req createRunRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if req.AssistantID == "" {
+		req.AssistantID = "asst_default"
+	}
+	strategy := contracts.MultitaskStrategy(strings.TrimSpace(req.MultitaskStrategy))
+	if strategy == "" {
+		strategy = contracts.MultitaskEnqueue
+	}
+	if !isValidMultitaskStrategy(strategy) {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_multitask_strategy", "multitask_strategy must be reject, rollback, interrupt, enqueue", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	streamResumable := true
+	if req.StreamResumable != nil {
+		streamResumable = *req.StreamResumable
+	}
+
+	var (
+		run contracts.Run
+		err error
+	)
+	if s.pg != nil {
+		run, err = s.createStatelessRunInPostgres(r.Context(), projectIDFromContext(r.Context()), req.AssistantID, strategy, streamResumable, strings.TrimSpace(req.WebhookURL))
+		if err != nil {
+			if errors.Is(err, errProjectScope) {
+				contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "assistant is not accessible for this API key project", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "create_run_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		if s.redis != nil {
+			_ = s.redis.LPush(r.Context(), s.cfg.QueueKey, "wake").Err()
+		}
+	} else {
+		run = s.createRunInMemory("", req.AssistantID, strategy, streamResumable)
+	}
+
+	writeJSON(w, http.StatusCreated, run)
+}
+
 func (s *Server) createRunStream(w http.ResponseWriter, r *http.Request) {
 	threadID := chi.URLParam(r, "thread_id")
 	var req createRunRequest
@@ -1443,6 +1572,85 @@ func (s *Server) getRunFromPostgres(ctx context.Context, projectID, runID string
 	run.Status = contracts.RunStatus(status)
 	run.MultitaskStrategy = contracts.MultitaskStrategy(strategy)
 	return run, nil
+}
+
+func (s *Server) listRunsFiltered(ctx context.Context, projectID, threadID, assistantID, status string) ([]contracts.Run, error) {
+	if s.pg != nil {
+		return s.listRunsFromPostgres(ctx, projectID, threadID, assistantID, status)
+	}
+	s.store.mu.RLock()
+	defer s.store.mu.RUnlock()
+	out := make([]contracts.Run, 0)
+	for _, run := range s.store.runs {
+		if threadID != "" && run.ThreadID != threadID {
+			continue
+		}
+		if assistantID != "" && run.AssistantID != assistantID {
+			continue
+		}
+		if status != "" && string(run.Status) != status {
+			continue
+		}
+		out = append(out, run)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+func (s *Server) listRunsFromPostgres(ctx context.Context, projectID, threadID, assistantID, status string) ([]contracts.Run, error) {
+	query := `
+		SELECT r.id, COALESCE(r.thread_id,''), r.assistant_id, r.status, r.multitask_strategy, r.stream_resumable, r.created_at, r.updated_at
+		FROM runs r
+	`
+	conditions := make([]string, 0, 4)
+	args := make([]any, 0, 4)
+	nextArg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	if projectID != "" {
+		query += `
+			JOIN assistants a ON a.id = r.assistant_id
+			JOIN deployments d ON d.id = a.deployment_id
+		`
+		conditions = append(conditions, "d.project_id="+nextArg(projectID))
+	}
+	if threadID != "" {
+		conditions = append(conditions, "r.thread_id="+nextArg(threadID))
+	}
+	if assistantID != "" {
+		conditions = append(conditions, "r.assistant_id="+nextArg(assistantID))
+	}
+	if status != "" {
+		conditions = append(conditions, "r.status="+nextArg(status))
+	}
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += " ORDER BY r.created_at DESC LIMIT 500"
+
+	rows, err := s.pg.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]contracts.Run, 0)
+	for rows.Next() {
+		var run contracts.Run
+		var rawStatus string
+		var rawStrategy string
+		if err := rows.Scan(&run.ID, &run.ThreadID, &run.AssistantID, &rawStatus, &rawStrategy, &run.StreamResumable, &run.CreatedAt, &run.UpdatedAt); err != nil {
+			return nil, err
+		}
+		run.Status = contracts.RunStatus(rawStatus)
+		run.MultitaskStrategy = contracts.MultitaskStrategy(rawStrategy)
+		out = append(out, run)
+	}
+	return out, rows.Err()
 }
 
 func (s *Server) getAssistantFromPostgres(ctx context.Context, projectID, assistantID string) (contracts.Assistant, error) {
@@ -2549,6 +2757,15 @@ func streamSSE(w http.ResponseWriter, r *http.Request, events []streamEvent, sta
 func isValidMultitaskStrategy(strategy contracts.MultitaskStrategy) bool {
 	switch strategy {
 	case contracts.MultitaskReject, contracts.MultitaskRollback, contracts.MultitaskInterrupt, contracts.MultitaskEnqueue:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidRunStatus(status contracts.RunStatus) bool {
+	switch status {
+	case contracts.RunStatusPending, contracts.RunStatusRunning, contracts.RunStatusError, contracts.RunStatusSuccess, contracts.RunStatusTimeout, contracts.RunStatusInterrupted:
 		return true
 	default:
 		return false
