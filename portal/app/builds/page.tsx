@@ -14,6 +14,7 @@ type Build = {
 
 export default function BuildsPage() {
   const [builds, setBuilds] = useState<Build[]>([]);
+  const [projectID, setProjectID] = useState("proj_default");
   const [selectedBuildID, setSelectedBuildID] = useState("");
   const [logs, setLogs] = useState("");
   const [error, setError] = useState("");
@@ -21,13 +22,13 @@ export default function BuildsPage() {
 
   useEffect(() => {
     void loadBuilds();
-  }, []);
+  }, [projectID]);
 
   async function loadBuilds() {
     setLoading(true);
     setError("");
     try {
-      const resp = await fetch("/api/platform/control/internal/v1/builds", { cache: "no-store" });
+      const resp = await fetch(`/api/platform/control/internal/v1/builds?project_id=${encodeURIComponent(projectID)}`, { cache: "no-store" });
       if (!resp.ok) {
         throw new Error(`load builds failed (${resp.status})`);
       }
@@ -65,6 +66,7 @@ export default function BuildsPage() {
       <h2>Builds</h2>
       <p>BuildKit rootless jobs with commit-tagged image digests and inline log view.</p>
       <div className="row">
+        <input value={projectID} onChange={(e) => setProjectID(e.target.value)} placeholder="project_id" />
         <button disabled={loading} type="button" onClick={() => void loadBuilds()}>Refresh</button>
       </div>
       {error ? <p className="warn">{error}</p> : null}

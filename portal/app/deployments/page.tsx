@@ -24,6 +24,7 @@ type SecretBinding = {
 
 export default function DeploymentsPage() {
   const [deployments, setDeployments] = useState<Deployment[]>([]);
+  const [projectID, setProjectID] = useState("proj_default");
   const [error, setError] = useState("");
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
@@ -43,7 +44,7 @@ export default function DeploymentsPage() {
 
   useEffect(() => {
     void loadDeployments();
-  }, []);
+  }, [projectID]);
 
   useEffect(() => {
     if (deploymentID) {
@@ -55,7 +56,7 @@ export default function DeploymentsPage() {
 
   async function loadDeployments() {
     try {
-      const resp = await fetch("/api/platform/control/internal/v1/deployments", { cache: "no-store" });
+      const resp = await fetch(`/api/platform/control/internal/v1/deployments?project_id=${encodeURIComponent(projectID)}`, { cache: "no-store" });
       if (!resp.ok) {
         throw new Error(`load deployments failed (${resp.status})`);
       }
@@ -89,7 +90,7 @@ export default function DeploymentsPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          project_id: "proj_default",
+          project_id: projectID,
           repo_url: repoURL,
           git_ref: gitRef,
           repo_path: repoPath,
@@ -231,6 +232,7 @@ export default function DeploymentsPage() {
       <form onSubmit={createDeployment} className="card">
         <h3>Create Deployment</h3>
         <div className="row">
+          <input value={projectID} onChange={(e) => setProjectID(e.target.value)} placeholder="project_id" />
           <input value={repoURL} onChange={(e) => setRepoURL(e.target.value)} placeholder="repo_url" />
           <input value={gitRef} onChange={(e) => setGitRef(e.target.value)} placeholder="git_ref" />
           <input value={repoPath} onChange={(e) => setRepoPath(e.target.value)} placeholder="repo_path" />
