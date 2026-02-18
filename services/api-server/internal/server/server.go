@@ -380,7 +380,33 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) docs(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(`<html><body><h1>LangOpen API Docs</h1><p>OpenAPI spec: <a href="/openapi.json">/openapi.json</a></p></body></html>`))
+	_, _ = w.Write([]byte(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LangOpen API Docs</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+  <style>
+    body { margin: 0; background: #fafafa; }
+    .fallback { font-family: sans-serif; margin: 1rem; }
+  </style>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <noscript>
+    <div class="fallback">OpenAPI spec: <a href="/openapi.json">/openapi.json</a></div>
+  </noscript>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    window.ui = SwaggerUIBundle({
+      url: "/openapi.json",
+      dom_id: "#swagger-ui",
+      deepLinking: true
+    });
+  </script>
+</body>
+</html>`))
 }
 
 func (s *Server) openapi(w http.ResponseWriter, _ *http.Request) {

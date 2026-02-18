@@ -33,9 +33,13 @@ func TestDocsAndOpenAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("/docs status = %d", resp.StatusCode)
+	}
+	docsBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(docsBody), "swagger-ui") {
+		t.Fatalf("/docs did not render OpenAPI UI content")
 	}
 
 	resp, err = client.Get(ts.URL + "/openapi.json")
@@ -315,6 +319,21 @@ func TestA2AAndMCP(t *testing.T) {
 		t.Fatalf("expected tasks/cancel error response, got %#v", a2aCancelResult)
 	} else if code, ok := errObj["code"].(float64); !ok || int(code) != -32001 {
 		t.Fatalf("unexpected tasks/cancel error code: %#v", errObj["code"])
+	}
+
+	a2aGetBody := map[string]any{"jsonrpc": "2.0", "id": "get1", "method": "tasks/get", "params": map[string]any{"taskId": "task_x"}}
+	a2aGetResp := doJSON(t, client, http.MethodPost, ts.URL+"/a2a/asst_1", a2aGetBody, "test-key")
+	if a2aGetResp.StatusCode != http.StatusOK {
+		t.Fatalf("a2a tasks/get status=%d", a2aGetResp.StatusCode)
+	}
+	var a2aGetResult map[string]any
+	if err := json.NewDecoder(a2aGetResp.Body).Decode(&a2aGetResult); err != nil {
+		t.Fatal(err)
+	}
+	a2aGetResp.Body.Close()
+	getResultObj, _ := a2aGetResult["result"].(map[string]any)
+	if got, _ := getResultObj["task_id"].(string); got != "task_x" {
+		t.Fatalf("expected task_id task_x, got %q", got)
 	}
 
 	mcpResp := doJSON(t, client, http.MethodPost, ts.URL+"/mcp", map[string]any{"jsonrpc": "2.0", "id": "1", "method": "initialize"}, "test-key")
