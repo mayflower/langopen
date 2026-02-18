@@ -32,6 +32,8 @@ const projectIDContextKey contextKey = "project_id"
 
 var errRunConflict = errors.New("run_conflict")
 
+var errProjectScope = errors.New("project_scope_violation")
+
 type Server struct {
 	logger *slog.Logger
 	router chi.Router
@@ -171,6 +173,11 @@ func New(logger *slog.Logger) (*Server, error) {
 }
 
 func (s *Server) Router() http.Handler { return s.router }
+
+func projectIDFromContext(ctx context.Context) string {
+	projectID, _ := ctx.Value(projectIDContextKey).(string)
+	return strings.TrimSpace(projectID)
+}
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -376,7 +383,23 @@ func resolveMigrationsDir() string {
 
 func (s *Server) listAssistants(w http.ResponseWriter, r *http.Request) {
 	if s.pg != nil {
-		rows, err := s.pg.Query(r.Context(), `SELECT id, deployment_id, graph_id, config, version FROM assistants ORDER BY created_at DESC LIMIT 200`)
+		projectID := projectIDFromContext(r.Context())
+		var (
+			rows pgx.Rows
+			err  error
+		)
+		if projectID == "" {
+			rows, err = s.pg.Query(r.Context(), `SELECT id, deployment_id, graph_id, config, version FROM assistants ORDER BY created_at DESC LIMIT 200`)
+		} else {
+			rows, err = s.pg.Query(r.Context(), `
+				SELECT a.id, a.deployment_id, a.graph_id, a.config, a.version
+				FROM assistants a
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE d.project_id=$1
+				ORDER BY a.created_at DESC
+				LIMIT 200
+			`, projectID)
+		}
 		if err != nil {
 			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
@@ -423,6 +446,19 @@ func (s *Server) createAssistant(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.pg != nil {
+		projectID := projectIDFromContext(r.Context())
+		if projectID != "" {
+			var deploymentAllowed bool
+			err := s.pg.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM deployments WHERE id=$1 AND project_id=$2)`, in.DeploymentID, projectID).Scan(&deploymentAllowed)
+			if err != nil {
+				contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			if !deploymentAllowed {
+				contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "deployment is not accessible for this API key project", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+		}
 		cfg := map[string]string{}
 		for k, v := range in.Config {
 			cfg[k] = v
@@ -445,7 +481,24 @@ func (s *Server) createAssistant(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listThreads(w http.ResponseWriter, r *http.Request) {
 	if s.pg != nil {
-		rows, err := s.pg.Query(r.Context(), `SELECT id, assistant_id, metadata, updated_at FROM threads ORDER BY updated_at DESC LIMIT 200`)
+		projectID := projectIDFromContext(r.Context())
+		var (
+			rows pgx.Rows
+			err  error
+		)
+		if projectID == "" {
+			rows, err = s.pg.Query(r.Context(), `SELECT id, assistant_id, metadata, updated_at FROM threads ORDER BY updated_at DESC LIMIT 200`)
+		} else {
+			rows, err = s.pg.Query(r.Context(), `
+				SELECT t.id, t.assistant_id, t.metadata, t.updated_at
+				FROM threads t
+				JOIN assistants a ON a.id = t.assistant_id
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE d.project_id=$1
+				ORDER BY t.updated_at DESC
+				LIMIT 200
+			`, projectID)
+		}
 		if err != nil {
 			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
@@ -489,6 +542,26 @@ func (s *Server) createThread(w http.ResponseWriter, r *http.Request) {
 	in.UpdatedAt = time.Now().UTC()
 
 	if s.pg != nil {
+		projectID := projectIDFromContext(r.Context())
+		if projectID != "" {
+			var assistantAllowed bool
+			err := s.pg.QueryRow(r.Context(), `
+				SELECT EXISTS(
+					SELECT 1
+					FROM assistants a
+					JOIN deployments d ON d.id = a.deployment_id
+					WHERE a.id=$1 AND d.project_id=$2
+				)
+			`, in.AssistantID, projectID).Scan(&assistantAllowed)
+			if err != nil {
+				contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			if !assistantAllowed {
+				contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "assistant is not accessible for this API key project", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+		}
 		raw, _ := json.Marshal(in.Metadata)
 		_, err := s.pg.Exec(r.Context(), `INSERT INTO threads (id, assistant_id, metadata, updated_at, created_at) VALUES ($1,$2,$3,$4,NOW())`, in.ID, in.AssistantID, raw, in.UpdatedAt)
 		if err != nil {
@@ -531,10 +604,14 @@ func (s *Server) createRunStream(w http.ResponseWriter, r *http.Request) {
 	var run contracts.Run
 	var err error
 	if s.pg != nil {
-		run, err = s.createRunInPostgres(r.Context(), threadID, req.AssistantID, strategy, streamResumable, strings.TrimSpace(req.WebhookURL))
+		run, err = s.createRunInPostgres(r.Context(), projectIDFromContext(r.Context()), threadID, req.AssistantID, strategy, streamResumable, strings.TrimSpace(req.WebhookURL))
 		if err != nil {
 			if errors.Is(err, errRunConflict) {
 				contracts.WriteError(w, http.StatusConflict, "run_conflict", "thread already has active run", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			if errors.Is(err, errProjectScope) {
+				contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "thread or assistant is not accessible for this API key project", observability.RequestIDFromContext(r.Context()))
 				return
 			}
 			contracts.WriteError(w, http.StatusInternalServerError, "create_run_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
@@ -596,8 +673,12 @@ func (s *Server) createStatelessRunStream(w http.ResponseWriter, r *http.Request
 		err error
 	)
 	if s.pg != nil {
-		run, err = s.createStatelessRunInPostgres(r.Context(), req.AssistantID, strategy, streamResumable, strings.TrimSpace(req.WebhookURL))
+		run, err = s.createStatelessRunInPostgres(r.Context(), projectIDFromContext(r.Context()), req.AssistantID, strategy, streamResumable, strings.TrimSpace(req.WebhookURL))
 		if err != nil {
+			if errors.Is(err, errProjectScope) {
+				contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "assistant is not accessible for this API key project", observability.RequestIDFromContext(r.Context()))
+				return
+			}
 			contracts.WriteError(w, http.StatusInternalServerError, "create_run_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
 		}
@@ -655,18 +736,58 @@ func (s *Server) createRunInMemory(threadID, assistantID string, strategy contra
 	return run
 }
 
-func (s *Server) createRunInPostgres(ctx context.Context, threadID, assistantID string, strategy contracts.MultitaskStrategy, streamResumable bool, webhookURL string) (contracts.Run, error) {
+func (s *Server) createRunInPostgres(ctx context.Context, projectID, threadID, assistantID string, strategy contracts.MultitaskStrategy, streamResumable bool, webhookURL string) (contracts.Run, error) {
 	tx, err := s.pg.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return contracts.Run{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if projectID != "" {
+		var assistantAllowed bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1
+				FROM assistants a
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE a.id=$1 AND d.project_id=$2
+			)
+		`, assistantID, projectID).Scan(&assistantAllowed); err != nil {
+			return contracts.Run{}, err
+		}
+		if !assistantAllowed {
+			return contracts.Run{}, errProjectScope
+		}
+	}
+
 	var threadExists bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM threads WHERE id=$1)`, threadID).Scan(&threadExists); err != nil {
+	threadScopeQuery := `SELECT EXISTS(SELECT 1 FROM threads WHERE id=$1)`
+	threadScopeArgs := []any{threadID}
+	if projectID != "" {
+		threadScopeQuery = `
+			SELECT EXISTS(
+				SELECT 1
+				FROM threads t
+				JOIN assistants a ON a.id = t.assistant_id
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE t.id=$1 AND d.project_id=$2
+			)
+		`
+		threadScopeArgs = append(threadScopeArgs, projectID)
+	}
+	if err := tx.QueryRow(ctx, threadScopeQuery, threadScopeArgs...).Scan(&threadExists); err != nil {
 		return contracts.Run{}, err
 	}
 	if !threadExists {
+		if projectID != "" {
+			var threadExistsGlobal bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM threads WHERE id=$1)`, threadID).Scan(&threadExistsGlobal); err != nil {
+				return contracts.Run{}, err
+			}
+			if threadExistsGlobal {
+				return contracts.Run{}, errProjectScope
+			}
+		}
 		_, err = tx.Exec(ctx, `INSERT INTO threads (id, assistant_id, metadata, updated_at, created_at) VALUES ($1,$2,'{}'::jsonb,NOW(),NOW())`, threadID, assistantID)
 		if err != nil {
 			return contracts.Run{}, err
@@ -801,7 +922,7 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.pg != nil {
-		if err := s.cancelRunInPostgres(r.Context(), runID, action); err != nil {
+		if err := s.cancelRunInPostgres(r.Context(), projectIDFromContext(r.Context()), runID, action); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				contracts.WriteError(w, http.StatusNotFound, "run_not_found", "run not found", observability.RequestIDFromContext(r.Context()))
 				return
@@ -836,7 +957,7 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "action": action})
 }
 
-func (s *Server) cancelRunInPostgres(ctx context.Context, runID, action string) error {
+func (s *Server) cancelRunInPostgres(ctx context.Context, projectID, runID, action string) error {
 	tx, err := s.pg.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
@@ -844,7 +965,21 @@ func (s *Server) cancelRunInPostgres(ctx context.Context, runID, action string) 
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var exists bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM runs WHERE id=$1)`, runID).Scan(&exists); err != nil {
+	scopeQuery := `SELECT EXISTS(SELECT 1 FROM runs WHERE id=$1)`
+	scopeArgs := []any{runID}
+	if projectID != "" {
+		scopeQuery = `
+			SELECT EXISTS(
+				SELECT 1
+				FROM runs r
+				JOIN assistants a ON a.id = r.assistant_id
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE r.id=$1 AND d.project_id=$2
+			)
+		`
+		scopeArgs = append(scopeArgs, projectID)
+	}
+	if err := tx.QueryRow(ctx, scopeQuery, scopeArgs...).Scan(&exists); err != nil {
 		return err
 	}
 	if !exists {
@@ -872,7 +1007,7 @@ func (s *Server) cancelRunInPostgres(ctx context.Context, runID, action string) 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "run_id")
 	if s.pg != nil {
-		run, err := s.getRunFromPostgres(r.Context(), runID)
+		run, err := s.getRunFromPostgres(r.Context(), projectIDFromContext(r.Context()), runID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				contracts.WriteError(w, http.StatusNotFound, "run_not_found", "run not found", observability.RequestIDFromContext(r.Context()))
@@ -895,14 +1030,26 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, run)
 }
 
-func (s *Server) getRunFromPostgres(ctx context.Context, runID string) (contracts.Run, error) {
+func (s *Server) getRunFromPostgres(ctx context.Context, projectID, runID string) (contracts.Run, error) {
 	var run contracts.Run
 	var status string
 	var strategy string
-	err := s.pg.QueryRow(ctx, `
-		SELECT id, COALESCE(thread_id,''), assistant_id, status, multitask_strategy, stream_resumable, created_at, updated_at
-		FROM runs WHERE id=$1
-	`, runID).Scan(&run.ID, &run.ThreadID, &run.AssistantID, &status, &strategy, &run.StreamResumable, &run.CreatedAt, &run.UpdatedAt)
+	query := `
+		SELECT r.id, COALESCE(r.thread_id,''), r.assistant_id, r.status, r.multitask_strategy, r.stream_resumable, r.created_at, r.updated_at
+		FROM runs r
+	`
+	args := []any{runID}
+	if projectID == "" {
+		query += ` WHERE r.id=$1`
+	} else {
+		query += `
+			JOIN assistants a ON a.id = r.assistant_id
+			JOIN deployments d ON d.id = a.deployment_id
+			WHERE r.id=$1 AND d.project_id=$2
+		`
+		args = append(args, projectID)
+	}
+	err := s.pg.QueryRow(ctx, query, args...).Scan(&run.ID, &run.ThreadID, &run.AssistantID, &status, &strategy, &run.StreamResumable, &run.CreatedAt, &run.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return contracts.Run{}, sql.ErrNoRows
@@ -1116,28 +1263,60 @@ func (s *Server) systemAttention(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.pg != nil {
-		var stuckRuns int64
-		_ = s.pg.QueryRow(r.Context(), `
-			SELECT COUNT(1)
-			FROM runs
-			WHERE status='running' AND updated_at < NOW() - ($1::bigint * INTERVAL '1 second')
-		`, stuckThresholdSeconds).Scan(&stuckRuns)
+		projectID := projectIDFromContext(r.Context())
+		var (
+			stuckRuns   int64
+			pendingRuns int64
+			errorRuns   int64
+			deadLetters int64
+		)
+		if projectID == "" {
+			_ = s.pg.QueryRow(r.Context(), `
+				SELECT COUNT(1)
+				FROM runs
+				WHERE status='running' AND updated_at < NOW() - ($1::bigint * INTERVAL '1 second')
+			`, stuckThresholdSeconds).Scan(&stuckRuns)
+			_ = s.pg.QueryRow(r.Context(), `SELECT COUNT(1) FROM runs WHERE status='pending'`).Scan(&pendingRuns)
+			_ = s.pg.QueryRow(r.Context(), `SELECT COUNT(1) FROM runs WHERE status='error'`).Scan(&errorRuns)
+			_ = s.pg.QueryRow(r.Context(), `
+				SELECT COUNT(1)
+				FROM webhook_deliveries
+				WHERE status IN ('dead_letter', 'failed')
+			`).Scan(&deadLetters)
+		} else {
+			_ = s.pg.QueryRow(r.Context(), `
+				SELECT COUNT(1)
+				FROM runs r
+				JOIN assistants a ON a.id = r.assistant_id
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE d.project_id=$1 AND r.status='running' AND r.updated_at < NOW() - ($2::bigint * INTERVAL '1 second')
+			`, projectID, stuckThresholdSeconds).Scan(&stuckRuns)
+			_ = s.pg.QueryRow(r.Context(), `
+				SELECT COUNT(1)
+				FROM runs r
+				JOIN assistants a ON a.id = r.assistant_id
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE d.project_id=$1 AND r.status='pending'
+			`, projectID).Scan(&pendingRuns)
+			_ = s.pg.QueryRow(r.Context(), `
+				SELECT COUNT(1)
+				FROM runs r
+				JOIN assistants a ON a.id = r.assistant_id
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE d.project_id=$1 AND r.status='error'
+			`, projectID).Scan(&errorRuns)
+			_ = s.pg.QueryRow(r.Context(), `
+				SELECT COUNT(1)
+				FROM webhook_deliveries wd
+				JOIN runs r ON r.id = wd.run_id
+				JOIN assistants a ON a.id = r.assistant_id
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE d.project_id=$1 AND wd.status IN ('dead_letter', 'failed')
+			`, projectID).Scan(&deadLetters)
+		}
 		response["stuck_runs"] = stuckRuns
-
-		var pendingRuns int64
-		_ = s.pg.QueryRow(r.Context(), `SELECT COUNT(1) FROM runs WHERE status='pending'`).Scan(&pendingRuns)
 		response["pending_runs"] = pendingRuns
-
-		var errorRuns int64
-		_ = s.pg.QueryRow(r.Context(), `SELECT COUNT(1) FROM runs WHERE status='error'`).Scan(&errorRuns)
 		response["error_runs"] = errorRuns
-
-		var deadLetters int64
-		_ = s.pg.QueryRow(r.Context(), `
-			SELECT COUNT(1)
-			FROM webhook_deliveries
-			WHERE status IN ('dead_letter', 'failed')
-		`).Scan(&deadLetters)
 		response["webhook_dead_letters"] = deadLetters
 
 		writeJSON(w, http.StatusOK, response)
@@ -1167,7 +1346,25 @@ func (s *Server) systemAttention(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
-func (s *Server) createStatelessRunInPostgres(ctx context.Context, assistantID string, strategy contracts.MultitaskStrategy, streamResumable bool, webhookURL string) (contracts.Run, error) {
+func (s *Server) createStatelessRunInPostgres(ctx context.Context, projectID, assistantID string, strategy contracts.MultitaskStrategy, streamResumable bool, webhookURL string) (contracts.Run, error) {
+	if projectID != "" {
+		var assistantAllowed bool
+		err := s.pg.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1
+				FROM assistants a
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE a.id=$1 AND d.project_id=$2
+			)
+		`, assistantID, projectID).Scan(&assistantAllowed)
+		if err != nil {
+			return contracts.Run{}, err
+		}
+		if !assistantAllowed {
+			return contracts.Run{}, errProjectScope
+		}
+	}
+
 	now := time.Now().UTC()
 	run := contracts.Run{
 		ID:                contracts.NewID("run"),
@@ -1339,7 +1536,24 @@ func (s *Server) deleteCronFromPostgres(ctx context.Context, cronID string) erro
 
 func (s *Server) listCrons(w http.ResponseWriter, r *http.Request) {
 	if s.pg != nil {
-		rows, err := s.pg.Query(r.Context(), `SELECT id, assistant_id, schedule, enabled FROM cron_jobs ORDER BY created_at DESC LIMIT 200`)
+		projectID := projectIDFromContext(r.Context())
+		var (
+			rows pgx.Rows
+			err  error
+		)
+		if projectID == "" {
+			rows, err = s.pg.Query(r.Context(), `SELECT id, assistant_id, schedule, enabled FROM cron_jobs ORDER BY created_at DESC LIMIT 200`)
+		} else {
+			rows, err = s.pg.Query(r.Context(), `
+				SELECT c.id, c.assistant_id, c.schedule, c.enabled
+				FROM cron_jobs c
+				JOIN assistants a ON a.id = c.assistant_id
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE d.project_id=$1
+				ORDER BY c.created_at DESC
+				LIMIT 200
+			`, projectID)
+		}
 		if err != nil {
 			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
@@ -1398,6 +1612,26 @@ func (s *Server) createCron(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.pg != nil {
+		projectID := projectIDFromContext(r.Context())
+		if projectID != "" {
+			var assistantAllowed bool
+			err := s.pg.QueryRow(r.Context(), `
+				SELECT EXISTS(
+					SELECT 1
+					FROM assistants a
+					JOIN deployments d ON d.id = a.deployment_id
+					WHERE a.id=$1 AND d.project_id=$2
+				)
+			`, in.AssistantID, projectID).Scan(&assistantAllowed)
+			if err != nil {
+				contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			if !assistantAllowed {
+				contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "assistant is not accessible for this API key project", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+		}
 		_, err := s.pg.Exec(r.Context(), `INSERT INTO cron_jobs (id, assistant_id, schedule, enabled, created_at, updated_at) VALUES ($1,$2,$3,$4,NOW(),NOW())`, in.ID, in.AssistantID, in.Schedule, in.Enabled)
 		if err != nil {
 			contracts.WriteError(w, http.StatusBadRequest, "db_insert_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
