@@ -1,0 +1,130 @@
+{{- if .Values.portal.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "langopen.fullname" . }}-portal
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: portal
+spec:
+  replicas: {{ .Values.portal.replicas }}
+  selector:
+    matchLabels:
+      {{- include "langopen.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: portal
+  template:
+    metadata:
+      labels:
+        {{- include "langopen.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: portal
+    spec:
+      {{- if .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      {{- if .Values.portal.runtimeClassName }}
+      runtimeClassName: {{ .Values.portal.runtimeClassName }}
+      {{- end }}
+      automountServiceAccountToken: false
+      containers:
+        - name: portal
+          image: {{ include "langopen.image" (dict "Values" .Values "component" "portal") | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.portal.service.targetPort }}
+              name: http
+          env:
+            - name: OPENAUTH_ISSUER_URL
+              value: {{ .Values.portal.env.openauthIssuerUrl | quote }}
+            - name: OPENAUTH_CLIENT_ID
+              value: {{ .Values.portal.env.openauthClientId | quote }}
+            - name: OPENAUTH_REDIRECT_URI
+              value: {{ .Values.portal.env.openauthRedirectUri | quote }}
+            - name: PORTAL_SESSION_SECRET
+              value: {{ .Values.portal.env.portalSessionSecret | quote }}
+            - name: PLATFORM_DATA_API_BASE_URL
+              value: {{ .Values.portal.env.platformDataApiBaseUrl | quote }}
+            - name: PLATFORM_CONTROL_API_BASE_URL
+              value: {{ .Values.portal.env.platformControlApiBaseUrl | quote }}
+            - name: PLATFORM_API_KEY
+              value: {{ .Values.portal.env.platformApiKey | quote }}
+            - name: GRAFANA_BASE_URL
+              value: {{ .Values.portal.env.grafanaBaseUrl | quote }}
+            - name: NODE_ENV
+              value: production
+          {{- range .Values.extraEnv.portal }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+          {{- end }}
+          {{- if or .Values.global.envFromSecret (gt (len .Values.extraEnvFrom.portal) 0) }}
+          envFrom:
+            {{- if .Values.global.envFromSecret }}
+            - secretRef:
+                name: {{ .Values.global.envFromSecret }}
+            {{- end }}
+            {{- with .Values.extraEnvFrom.portal }}
+{{ toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          resources:
+            {{- toYaml .Values.portal.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "langopen.fullname" . }}-portal
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: portal
+spec:
+  type: {{ .Values.portal.service.type }}
+  selector:
+    {{- include "langopen.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: portal
+  ports:
+    - name: http
+      port: {{ .Values.portal.service.port }}
+      targetPort: {{ .Values.portal.service.targetPort }}
+---
+{{- if .Values.portal.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "langopen.fullname" . }}-portal
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+  {{- if .Values.portal.ingress.annotations }}
+  annotations:
+    {{- toYaml .Values.portal.ingress.annotations | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.portal.ingress.className }}
+  ingressClassName: {{ .Values.portal.ingress.className }}
+  {{- end }}
+  rules:
+    {{- range .Values.portal.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "langopen.fullname" $ }}-portal
+                port:
+                  number: {{ $.Values.portal.service.port }}
+          {{- end }}
+    {{- end }}
+  {{- if .Values.portal.ingress.tls }}
+  tls:
+    {{- toYaml .Values.portal.ingress.tls | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

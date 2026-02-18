@@ -1,0 +1,118 @@
+nameOverride: ""
+fullnameOverride: ""
+
+global:
+  image:
+    repository: ghcr.io/mayflower/langopen
+    tag: latest
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  envFromSecret: ""
+
+env:
+  postgresDsn: ""
+  redisAddr: ""
+  bootstrapApiKey: ""
+  builderUrl: "http://langopen-builder"
+  openapiSpecPath: "/app/contracts/openapi/agent-server.json"
+  migrationsDir: "/app/db/migrations"
+  runWakeupList: "langopen:runs:wakeup"
+  runCancelKeyPrefix: "langopen:run:cancel:"
+  runCancelChannelPrefix: "langopen:run:cancel:ch:"
+  runStreamChannelPrefix: "langopen:run:stream:"
+  runStreamBufferPrefix: "langopen:run:events:"
+  runStreamBufferTtlSeconds: 3600
+
+apiServer:
+  enabled: true
+  replicas: 2
+  runtimeClassName: gvisor
+  autoMigrate: true
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 8080
+  ingress:
+    enabled: false
+    className: traefik
+    annotations: {}
+    hosts: []
+    tls: []
+  resources: {}
+
+worker:
+  enabled: true
+  replicas: 2
+  runtimeClassName: gvisor
+  resources: {}
+
+controlPlane:
+  enabled: true
+  replicas: 1
+  runtimeClassName: gvisor
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 8081
+  resources: {}
+
+builder:
+  enabled: true
+  replicas: 1
+  runtimeClassName: gvisor
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 8082
+  resources: {}
+
+operator:
+  enabled: true
+  replicas: 1
+  resources: {}
+
+portal:
+  enabled: true
+  replicas: 1
+  runtimeClassName: gvisor
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 3000
+  ingress:
+    enabled: false
+    className: traefik
+    annotations: {}
+    hosts: []
+    tls: []
+  env:
+    openauthIssuerUrl: ""
+    openauthClientId: ""
+    openauthRedirectUri: ""
+    portalSessionSecret: ""
+    platformDataApiBaseUrl: "http://langopen-api-server"
+    platformControlApiBaseUrl: "http://langopen-control-plane"
+    platformApiKey: ""
+    grafanaBaseUrl: ""
+  resources: {}
+
+networkPolicy:
+  enabled: true
+  allowDns: true
+  egressCidrs: []
+
+extraEnv:
+  apiServer: []
+  worker: []
+  controlPlane: []
+  builder: []
+  operator: []
+  portal: []
+
+extraEnvFrom:
+  apiServer: []
+  worker: []
+  controlPlane: []
+  builder: []
+  operator: []
+  portal: []

@@ -1292,6 +1292,13 @@ func (s *Server) a2a(w http.ResponseWriter, r *http.Request) {
 		Method  string          `json:"method"`
 		Params  json.RawMessage `json:"params"`
 	}
+	type rpcParams struct {
+		ContextID string `json:"contextId"`
+		TaskID    string `json:"taskId"`
+		Message   struct {
+			ContextID string `json:"contextId"`
+		} `json:"message"`
+	}
 	var req rpcRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
@@ -1302,19 +1309,54 @@ func (s *Server) a2a(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32601, "message": "method not found"}})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"accepted": true, "method": req.Method}})
+
+	var params rpcParams
+	_ = json.Unmarshal(req.Params, &params)
+
+	threadID := strings.TrimSpace(params.ContextID)
+	if threadID == "" {
+		threadID = strings.TrimSpace(params.Message.ContextID)
+	}
+	if threadID == "" {
+		threadID = "thread_default"
+	}
+
+	result := map[string]any{
+		"accepted":  true,
+		"method":    req.Method,
+		"thread_id": threadID,
+	}
+	if req.Method == "tasks/get" || req.Method == "tasks/cancel" {
+		taskID := strings.TrimSpace(params.TaskID)
+		if taskID == "" {
+			taskID = contracts.NewID("task")
+		}
+		result["task_id"] = taskID
+		result["status"] = "ok"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
 }
 
 func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	writeJSON(w, http.StatusOK, map[string]any{
+	type rpcRequest struct {
+		Method string `json:"method"`
+	}
+	var req rpcRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	result := map[string]any{
 		"jsonrpc": "2.0",
 		"result": map[string]any{
 			"stateless":         true,
 			"session_terminate": "no-op",
 			"transport":         "streamable-http",
 		},
-	})
+	}
+	if strings.EqualFold(strings.TrimSpace(req.Method), "session/terminate") {
+		result["result"] = map[string]any{"ok": true, "compatibility": "no-op"}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	writeJSON(w, http.StatusOK, result)
 }
 
 func mkEvent(id int64, event string, payload any) streamEvent {

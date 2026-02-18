@@ -1,0 +1,522 @@
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"langopen.dev/pkg/contracts"
+	"langopen.dev/pkg/observability"
+)
+
+type API struct {
+	logger     *slog.Logger
+	router     chi.Router
+	mu         sync.RWMutex
+	state      state
+	pg         *pgxpool.Pool
+	builder    string
+	httpClient *http.Client
+}
+
+type state struct {
+	Deployments []map[string]any
+	Builds      []map[string]any
+	Audit       []map[string]any
+	Secrets     []map[string]any
+}
+
+type deploymentRecord struct {
+	ID                 string    `json:"id"`
+	ProjectID          string    `json:"project_id"`
+	RepoURL            string    `json:"repo_url"`
+	GitRef             string    `json:"git_ref"`
+	RepoPath           string    `json:"repo_path"`
+	RuntimeProfile     string    `json:"runtime_profile"`
+	Mode               string    `json:"mode"`
+	CurrentImageDigest string    `json:"current_image_digest,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
+}
+
+type buildRecord struct {
+	ID           string    `json:"id"`
+	DeploymentID string    `json:"deployment_id"`
+	Status       string    `json:"status"`
+	CommitSHA    string    `json:"commit_sha"`
+	ImageDigest  string    `json:"image_digest,omitempty"`
+	LogsRef      string    `json:"logs_ref,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+func New(logger *slog.Logger) *API {
+	a := &API{
+		logger:     logger,
+		builder:    strings.TrimRight(strings.TrimSpace(os.Getenv("BUILDER_URL")), "/"),
+		httpClient: &http.Client{Timeout: 12 * time.Second},
+	}
+	if a.builder == "" {
+		a.builder = "http://langopen-builder"
+	}
+	if dsn := strings.TrimSpace(os.Getenv("POSTGRES_DSN")); dsn != "" {
+		pool, err := pgxpool.New(context.Background(), dsn)
+		if err != nil {
+			logger.Error("control_plane_postgres_connect_failed", "error", err)
+		} else {
+			a.pg = pool
+		}
+	}
+
+	r := chi.NewRouter()
+	r.Use(observability.CorrelationMiddleware(logger))
+
+	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+
+	r.Route("/internal/v1", func(v1 chi.Router) {
+		v1.Post("/deployments", a.createDeployment)
+		v1.Get("/deployments", a.listDeployments)
+		v1.Post("/builds", a.triggerBuild)
+		v1.Get("/builds", a.listBuilds)
+		v1.Post("/policies/runtime", a.setRuntimePolicy)
+		v1.Post("/secrets/bind", a.bindSecret)
+		v1.Get("/audit", a.listAudit)
+	})
+	a.router = r
+	return a
+}
+
+func (a *API) Router() http.Handler { return a.router }
+
+func (a *API) createDeployment(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ProjectID      string `json:"project_id"`
+		RepoURL        string `json:"repo_url"`
+		GitRef         string `json:"git_ref"`
+		RepoPath       string `json:"repo_path"`
+		RuntimeProfile string `json:"runtime_profile"`
+		Mode           string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if strings.TrimSpace(req.RepoURL) == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment", "repo_url is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if req.ProjectID == "" {
+		req.ProjectID = "proj_default"
+	}
+	if req.GitRef == "" {
+		req.GitRef = "main"
+	}
+	if req.RepoPath == "" {
+		req.RepoPath = "/"
+	}
+	if req.RuntimeProfile == "" {
+		req.RuntimeProfile = "gvisor"
+	}
+	if req.Mode == "" {
+		req.Mode = "mode_a"
+	}
+	if req.Mode != "mode_a" && req.Mode != "mode_b" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_mode", "mode must be mode_a or mode_b", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	now := time.Now().UTC()
+	rec := deploymentRecord{
+		ID:             contracts.NewID("dep"),
+		ProjectID:      req.ProjectID,
+		RepoURL:        req.RepoURL,
+		GitRef:         req.GitRef,
+		RepoPath:       req.RepoPath,
+		RuntimeProfile: req.RuntimeProfile,
+		Mode:           req.Mode,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+
+	if a.pg != nil {
+		_, err := a.pg.Exec(r.Context(), `
+			INSERT INTO deployments (id, project_id, repo_url, git_ref, repo_path, runtime_profile, mode, created_at, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		`, rec.ID, rec.ProjectID, rec.RepoURL, rec.GitRef, rec.RepoPath, rec.RuntimeProfile, rec.Mode, rec.CreatedAt, rec.UpdatedAt)
+		if err != nil {
+			contracts.WriteError(w, http.StatusBadRequest, "db_insert_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		_ = a.writeAudit(r.Context(), rec.ProjectID, "deployment.created", map[string]any{"deployment_id": rec.ID, "repo_url": rec.RepoURL, "git_ref": rec.GitRef})
+		writeJSON(w, http.StatusCreated, rec)
+		return
+	}
+
+	a.mu.Lock()
+	a.state.Deployments = append(a.state.Deployments, mapFromDeployment(rec))
+	a.state.Audit = append(a.state.Audit, map[string]any{"event": "deployment.created", "timestamp": now, "deployment_id": rec.ID})
+	a.mu.Unlock()
+	writeJSON(w, http.StatusCreated, rec)
+}
+
+func (a *API) listDeployments(w http.ResponseWriter, r *http.Request) {
+	if a.pg != nil {
+		rows, err := a.pg.Query(r.Context(), `
+			SELECT id, project_id, repo_url, git_ref, repo_path, runtime_profile, mode, COALESCE(current_image_digest,''), created_at, updated_at
+			FROM deployments ORDER BY updated_at DESC LIMIT 500
+		`)
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		defer rows.Close()
+		out := make([]deploymentRecord, 0)
+		for rows.Next() {
+			var rec deploymentRecord
+			if err := rows.Scan(&rec.ID, &rec.ProjectID, &rec.RepoURL, &rec.GitRef, &rec.RepoPath, &rec.RuntimeProfile, &rec.Mode, &rec.CurrentImageDigest, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+				contracts.WriteError(w, http.StatusInternalServerError, "db_scan_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			out = append(out, rec)
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	writeJSON(w, http.StatusOK, a.state.Deployments)
+}
+
+func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DeploymentID  string `json:"deployment_id"`
+		CommitSHA     string `json:"commit_sha"`
+		ImageName     string `json:"image_name"`
+		RepoPath      string `json:"repo_path"`
+		LanggraphPath string `json:"langgraph_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if strings.TrimSpace(req.DeploymentID) == "" || strings.TrimSpace(req.CommitSHA) == "" || strings.TrimSpace(req.ImageName) == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_build_request", "deployment_id, commit_sha, and image_name are required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	dep, err := a.getDeployment(r.Context(), req.DeploymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	payload := map[string]any{
+		"deployment_id":  dep.ID,
+		"repo_url":       dep.RepoURL,
+		"git_ref":        dep.GitRef,
+		"repo_path":      req.RepoPath,
+		"langgraph_path": req.LanggraphPath,
+		"image_name":     req.ImageName,
+		"commit_sha":     req.CommitSHA,
+	}
+	if payload["repo_path"] == "" {
+		payload["repo_path"] = dep.RepoPath
+	}
+
+	builderResp, status, err := a.callBuilder(r.Context(), "/internal/v1/builds/trigger", payload)
+	if err != nil {
+		fallback := map[string]any{
+			"id":            contracts.NewID("build"),
+			"deployment_id": dep.ID,
+			"status":        "queued",
+			"commit_sha":    req.CommitSHA,
+			"created_at":    time.Now().UTC(),
+			"updated_at":    time.Now().UTC(),
+			"warning":       "builder unavailable; build queued placeholder created",
+		}
+		a.mu.Lock()
+		a.state.Builds = append(a.state.Builds, fallback)
+		a.mu.Unlock()
+		_ = a.writeAudit(r.Context(), dep.ProjectID, "build.triggered", map[string]any{"deployment_id": dep.ID, "build_id": fallback["id"], "fallback": true})
+		writeJSON(w, http.StatusAccepted, fallback)
+		return
+	}
+
+	if a.pg != nil {
+		var buildID, digest string
+		if v, ok := builderResp["id"].(string); ok {
+			buildID = v
+		}
+		if v, ok := builderResp["image_digest"].(string); ok {
+			digest = v
+		}
+		if buildID != "" {
+			_, _ = a.pg.Exec(r.Context(), `UPDATE deployments SET current_image_digest=COALESCE(NULLIF($2,''), current_image_digest), updated_at=NOW() WHERE id=$1`, dep.ID, digest)
+		}
+		_ = a.writeAudit(r.Context(), dep.ProjectID, "build.triggered", map[string]any{"deployment_id": dep.ID, "build_id": buildID, "commit_sha": req.CommitSHA, "status": builderResp["status"]})
+	}
+	writeJSON(w, status, builderResp)
+}
+
+func (a *API) listBuilds(w http.ResponseWriter, r *http.Request) {
+	if a.pg != nil {
+		rows, err := a.pg.Query(r.Context(), `
+			SELECT id, deployment_id, status, commit_sha, COALESCE(image_digest,''), COALESCE(logs_ref,''), created_at, updated_at
+			FROM builds ORDER BY created_at DESC LIMIT 500
+		`)
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		defer rows.Close()
+		out := make([]buildRecord, 0)
+		for rows.Next() {
+			var rec buildRecord
+			if err := rows.Scan(&rec.ID, &rec.DeploymentID, &rec.Status, &rec.CommitSHA, &rec.ImageDigest, &rec.LogsRef, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+				contracts.WriteError(w, http.StatusInternalServerError, "db_scan_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			out = append(out, rec)
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	writeJSON(w, http.StatusOK, a.state.Builds)
+}
+
+func (a *API) setRuntimePolicy(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DeploymentID   string `json:"deployment_id"`
+		RuntimeProfile string `json:"runtime_profile"`
+		Mode           string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if req.DeploymentID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_request", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if req.RuntimeProfile == "" {
+		req.RuntimeProfile = "gvisor"
+	}
+	if req.Mode == "" {
+		req.Mode = "mode_a"
+	}
+	if req.Mode != "mode_a" && req.Mode != "mode_b" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_mode", "mode must be mode_a or mode_b", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	if a.pg != nil {
+		tag, err := a.pg.Exec(r.Context(), `UPDATE deployments SET runtime_profile=$2, mode=$3, updated_at=NOW() WHERE id=$1`, req.DeploymentID, req.RuntimeProfile, req.Mode)
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_update_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		if tag.RowsAffected() == 0 {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		dep, _ := a.getDeployment(r.Context(), req.DeploymentID)
+		_ = a.writeAudit(r.Context(), dep.ProjectID, "policy.runtime.updated", map[string]any{"deployment_id": req.DeploymentID, "runtime_profile": req.RuntimeProfile, "mode": req.Mode})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "applied", "policy": req})
+		return
+	}
+
+	a.mu.Lock()
+	a.state.Audit = append(a.state.Audit, map[string]any{"event": "policy.runtime.updated", "timestamp": time.Now().UTC(), "policy": req})
+	a.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "applied", "policy": req})
+}
+
+func (a *API) bindSecret(w http.ResponseWriter, r *http.Request) {
+	var req map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	event := map[string]any{"event": "secret.bound", "timestamp": time.Now().UTC(), "binding": req}
+	if a.pg != nil {
+		projectID := "proj_default"
+		if deploymentID, ok := req["deployment_id"].(string); ok && deploymentID != "" {
+			dep, err := a.getDeployment(r.Context(), deploymentID)
+			if err == nil {
+				projectID = dep.ProjectID
+			}
+		}
+		_ = a.writeAudit(r.Context(), projectID, "secret.bound", req)
+	} else {
+		a.mu.Lock()
+		a.state.Secrets = append(a.state.Secrets, req)
+		a.state.Audit = append(a.state.Audit, event)
+		a.mu.Unlock()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "bound"})
+}
+
+func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {
+	if a.pg != nil {
+		rows, err := a.pg.Query(r.Context(), `SELECT id, project_id, actor_id, event_type, payload, created_at FROM audit_logs ORDER BY created_at DESC LIMIT 500`)
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		defer rows.Close()
+		out := make([]map[string]any, 0)
+		for rows.Next() {
+			var id, projectID sql.NullString
+			var actorID sql.NullString
+			var eventType string
+			var payloadRaw []byte
+			var createdAt time.Time
+			if err := rows.Scan(&id, &projectID, &actorID, &eventType, &payloadRaw, &createdAt); err != nil {
+				contracts.WriteError(w, http.StatusInternalServerError, "db_scan_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			payload := map[string]any{}
+			_ = json.Unmarshal(payloadRaw, &payload)
+			out = append(out, map[string]any{
+				"id":         id.String,
+				"project_id": projectID.String,
+				"actor_id":   actorID.String,
+				"event":      eventType,
+				"payload":    payload,
+				"created_at": createdAt,
+			})
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	writeJSON(w, http.StatusOK, a.state.Audit)
+}
+
+func (a *API) getDeployment(ctx context.Context, deploymentID string) (deploymentRecord, error) {
+	if a.pg != nil {
+		var rec deploymentRecord
+		err := a.pg.QueryRow(ctx, `
+			SELECT id, project_id, repo_url, git_ref, repo_path, runtime_profile, mode, COALESCE(current_image_digest,''), created_at, updated_at
+			FROM deployments WHERE id=$1
+		`, deploymentID).Scan(&rec.ID, &rec.ProjectID, &rec.RepoURL, &rec.GitRef, &rec.RepoPath, &rec.RuntimeProfile, &rec.Mode, &rec.CurrentImageDigest, &rec.CreatedAt, &rec.UpdatedAt)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return deploymentRecord{}, sql.ErrNoRows
+			}
+			return deploymentRecord{}, err
+		}
+		return rec, nil
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, item := range a.state.Deployments {
+		if id, _ := item["id"].(string); id == deploymentID {
+			return deploymentFromMap(item), nil
+		}
+	}
+	return deploymentRecord{}, sql.ErrNoRows
+}
+
+func (a *API) callBuilder(ctx context.Context, path string, payload map[string]any) (map[string]any, int, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, 0, err
+	}
+	url := a.builder + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	out := map[string]any{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, resp.StatusCode, fmt.Errorf("decode builder response: %w", err)
+		}
+	}
+	if resp.StatusCode >= 400 {
+		if msg, ok := out["message"].(string); ok && msg != "" {
+			return nil, resp.StatusCode, errors.New(msg)
+		}
+		return nil, resp.StatusCode, fmt.Errorf("builder returned status %d", resp.StatusCode)
+	}
+	return out, resp.StatusCode, nil
+}
+
+func (a *API) writeAudit(ctx context.Context, projectID, eventType string, payload map[string]any) error {
+	if a.pg == nil {
+		return nil
+	}
+	raw, _ := json.Marshal(payload)
+	_, err := a.pg.Exec(ctx, `
+		INSERT INTO audit_logs (id, project_id, actor_id, event_type, payload, created_at)
+		VALUES ($1,$2,$3,$4,$5,NOW())
+	`, contracts.NewID("audit"), projectID, "system", eventType, raw)
+	return err
+}
+
+func mapFromDeployment(rec deploymentRecord) map[string]any {
+	return map[string]any{
+		"id":                   rec.ID,
+		"project_id":           rec.ProjectID,
+		"repo_url":             rec.RepoURL,
+		"git_ref":              rec.GitRef,
+		"repo_path":            rec.RepoPath,
+		"runtime_profile":      rec.RuntimeProfile,
+		"mode":                 rec.Mode,
+		"current_image_digest": rec.CurrentImageDigest,
+		"created_at":           rec.CreatedAt,
+		"updated_at":           rec.UpdatedAt,
+	}
+}
+
+func deploymentFromMap(in map[string]any) deploymentRecord {
+	rec := deploymentRecord{}
+	rec.ID, _ = in["id"].(string)
+	rec.ProjectID, _ = in["project_id"].(string)
+	rec.RepoURL, _ = in["repo_url"].(string)
+	rec.GitRef, _ = in["git_ref"].(string)
+	rec.RepoPath, _ = in["repo_path"].(string)
+	rec.RuntimeProfile, _ = in["runtime_profile"].(string)
+	rec.Mode, _ = in["mode"].(string)
+	rec.CurrentImageDigest, _ = in["current_image_digest"].(string)
+	return rec
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}

@@ -116,13 +116,39 @@ func TestA2AAndMCP(t *testing.T) {
 	if a2aResp.StatusCode != http.StatusOK {
 		t.Fatalf("a2a status=%d", a2aResp.StatusCode)
 	}
+	var a2aResult map[string]any
+	if err := json.NewDecoder(a2aResp.Body).Decode(&a2aResult); err != nil {
+		t.Fatal(err)
+	}
+	resultObj, _ := a2aResult["result"].(map[string]any)
+	if got, _ := resultObj["thread_id"].(string); got != "thread_x" {
+		t.Fatalf("expected thread_id=thread_x, got %q", got)
+	}
 	a2aResp.Body.Close()
 
 	mcpResp := doJSON(t, client, http.MethodPost, ts.URL+"/mcp", map[string]any{"jsonrpc": "2.0", "id": "1", "method": "initialize"}, "test-key")
 	if mcpResp.StatusCode != http.StatusOK {
 		t.Fatalf("mcp status=%d", mcpResp.StatusCode)
 	}
+	var mcpResult map[string]any
+	if err := json.NewDecoder(mcpResp.Body).Decode(&mcpResult); err != nil {
+		t.Fatal(err)
+	}
 	mcpResp.Body.Close()
+
+	mcpTerminate := doJSON(t, client, http.MethodPost, ts.URL+"/mcp", map[string]any{"jsonrpc": "2.0", "id": "2", "method": "session/terminate"}, "test-key")
+	if mcpTerminate.StatusCode != http.StatusOK {
+		t.Fatalf("mcp terminate status=%d", mcpTerminate.StatusCode)
+	}
+	var terminateResult map[string]any
+	if err := json.NewDecoder(mcpTerminate.Body).Decode(&terminateResult); err != nil {
+		t.Fatal(err)
+	}
+	termObj, _ := terminateResult["result"].(map[string]any)
+	if compatibility, _ := termObj["compatibility"].(string); compatibility != "no-op" {
+		t.Fatalf("expected compatibility no-op, got %q", compatibility)
+	}
+	mcpTerminate.Body.Close()
 }
 
 func TestStoreStatelessRunsAndSystem(t *testing.T) {

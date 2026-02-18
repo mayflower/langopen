@@ -1,0 +1,74 @@
+fullnameOverride: langopen
+
+global:
+  image:
+    repository: registry.data.mayflower.zone/data/langopen
+    tag: latest
+    pullPolicy: Always
+  imagePullSecrets:
+    - name: ghcr.io
+  envFromSecret: langopen-runtime-secrets
+
+env:
+  builderUrl: http://langopen-builder
+
+apiServer:
+  replicas: 1
+  runtimeClassName: gvisor
+  autoMigrate: true
+  ingress:
+    enabled: true
+    className: traefik
+    annotations:
+      traefik.ingress.kubernetes.io/router.entrypoints: websecure
+      cert-manager.io/cluster-issuer: letsencrypt-intern-dns
+    hosts:
+      - host: langopen.data.mayflower.zone
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: langopen-api-tls
+        hosts:
+          - langopen.data.mayflower.zone
+
+worker:
+  replicas: 1
+
+controlPlane:
+  enabled: true
+  replicas: 1
+
+builder:
+  enabled: true
+  replicas: 1
+
+operator:
+  enabled: true
+  replicas: 1
+
+portal:
+  enabled: true
+  replicas: 1
+  env:
+    platformDataApiBaseUrl: http://langopen-api-server
+    platformControlApiBaseUrl: http://langopen-control-plane
+    grafanaBaseUrl: https://grafana.data.mayflower.zone
+  ingress:
+    enabled: true
+    className: traefik
+    annotations:
+      traefik.ingress.kubernetes.io/router.entrypoints: websecure
+      cert-manager.io/cluster-issuer: letsencrypt-intern-dns
+    hosts:
+      - host: langopen-portal.data.mayflower.zone
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: langopen-portal-tls
+        hosts:
+          - langopen-portal.data.mayflower.zone
+
+networkPolicy:
+  enabled: true
