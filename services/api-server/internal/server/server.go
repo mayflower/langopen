@@ -1114,9 +1114,10 @@ func (s *Server) getRunFromPostgres(ctx context.Context, projectID, runID string
 
 func (s *Server) listStoreItems(w http.ResponseWriter, r *http.Request) {
 	namespaceFilter := strings.TrimSpace(r.URL.Query().Get("namespace"))
+	projectID := projectIDFromContext(r.Context())
 
 	if s.pg != nil {
-		items, err := s.listStoreItemsFromPostgres(r.Context(), namespaceFilter)
+		items, err := s.listStoreItemsFromPostgres(r.Context(), projectID, namespaceFilter)
 		if err != nil {
 			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
@@ -1160,11 +1161,12 @@ func (s *Server) putStoreItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.pg != nil {
-		item, err := s.upsertStoreItemInPostgres(r.Context(), in.Namespace, in.Key, in.Value, in.Metadata)
+		item, err := s.upsertStoreItemInPostgres(r.Context(), scopedNamespace(projectIDFromContext(r.Context()), in.Namespace), in.Key, in.Value, in.Metadata)
 		if err != nil {
 			contracts.WriteError(w, http.StatusInternalServerError, "db_insert_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
 		}
+		item.Namespace = in.Namespace
 		writeJSON(w, http.StatusCreated, item)
 		return
 	}
@@ -1196,7 +1198,7 @@ func (s *Server) getStoreItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.pg != nil {
-		item, err := s.getStoreItemFromPostgres(r.Context(), namespace, key)
+		item, err := s.getStoreItemFromPostgres(r.Context(), scopedNamespace(projectIDFromContext(r.Context()), namespace), key)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				contracts.WriteError(w, http.StatusNotFound, "store_item_not_found", "store item not found", observability.RequestIDFromContext(r.Context()))
@@ -1205,6 +1207,7 @@ func (s *Server) getStoreItem(w http.ResponseWriter, r *http.Request) {
 			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
 		}
+		item.Namespace = namespace
 		writeJSON(w, http.StatusOK, item)
 		return
 	}
@@ -1228,7 +1231,7 @@ func (s *Server) deleteStoreItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.pg != nil {
-		if err := s.deleteStoreItemFromPostgres(r.Context(), namespace, key); err != nil {
+		if err := s.deleteStoreItemFromPostgres(r.Context(), scopedNamespace(projectIDFromContext(r.Context()), namespace), key); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				contracts.WriteError(w, http.StatusNotFound, "store_item_not_found", "store item not found", observability.RequestIDFromContext(r.Context()))
 				return
@@ -1437,15 +1440,35 @@ func (s *Server) createStatelessRunInPostgres(ctx context.Context, projectID, as
 	return run, nil
 }
 
-func (s *Server) listStoreItemsFromPostgres(ctx context.Context, namespaceFilter string) ([]storeRecord, error) {
+func (s *Server) listStoreItemsFromPostgres(ctx context.Context, projectID, namespaceFilter string) ([]storeRecord, error) {
 	var (
 		rows pgx.Rows
 		err  error
 	)
-	if namespaceFilter == "" {
-		rows, err = s.pg.Query(ctx, `SELECT id, namespace, key, value, metadata, created_at FROM store_items ORDER BY created_at DESC LIMIT 500`)
+	if projectID == "" {
+		if namespaceFilter == "" {
+			rows, err = s.pg.Query(ctx, `SELECT id, namespace, key, value, metadata, created_at FROM store_items ORDER BY created_at DESC LIMIT 500`)
+		} else {
+			rows, err = s.pg.Query(ctx, `SELECT id, namespace, key, value, metadata, created_at FROM store_items WHERE namespace=$1 ORDER BY created_at DESC LIMIT 500`, namespaceFilter)
+		}
 	} else {
-		rows, err = s.pg.Query(ctx, `SELECT id, namespace, key, value, metadata, created_at FROM store_items WHERE namespace=$1 ORDER BY created_at DESC LIMIT 500`, namespaceFilter)
+		if namespaceFilter == "" {
+			rows, err = s.pg.Query(ctx, `
+				SELECT id, namespace, key, value, metadata, created_at
+				FROM store_items
+				WHERE namespace LIKE $1
+				ORDER BY created_at DESC
+				LIMIT 500
+			`, scopedNamespace(projectID, "%"))
+		} else {
+			rows, err = s.pg.Query(ctx, `
+				SELECT id, namespace, key, value, metadata, created_at
+				FROM store_items
+				WHERE namespace=$1
+				ORDER BY created_at DESC
+				LIMIT 500
+			`, scopedNamespace(projectID, namespaceFilter))
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -1457,6 +1480,9 @@ func (s *Server) listStoreItemsFromPostgres(ctx context.Context, namespaceFilter
 		item, err := scanStoreRecord(rows)
 		if err != nil {
 			return nil, err
+		}
+		if projectID != "" {
+			item.Namespace = unscopedNamespace(projectID, item.Namespace)
 		}
 		out = append(out, item)
 	}
@@ -1542,6 +1568,26 @@ func scanStoreRecord(row pgx.Row) (storeRecord, error) {
 
 func storeKey(namespace, key string) string {
 	return namespace + "\x00" + key
+}
+
+func scopedNamespace(projectID, namespace string) string {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return namespace
+	}
+	return projectID + ":" + namespace
+}
+
+func unscopedNamespace(projectID, namespace string) string {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return namespace
+	}
+	prefix := projectID + ":"
+	if strings.HasPrefix(namespace, prefix) {
+		return strings.TrimPrefix(namespace, prefix)
+	}
+	return namespace
 }
 
 func (s *Server) getCronFromPostgres(ctx context.Context, cronID string) (contracts.CronJob, error) {
