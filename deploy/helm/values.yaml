@@ -44,6 +44,11 @@ worker:
   enabled: true
   replicas: 2
   runtimeClassName: gvisor
+  runMode: mode_a
+  sandboxEnabled: false
+  sandboxNamespace: ""
+  sandboxTemplateName: "langopen-default"
+  metricsAddr: ":9091"
   resources: {}
 
 controlPlane:

@@ -18,9 +18,24 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 	"github.com/robfig/cron/v3"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"langopen.dev/pkg/contracts"
+)
+
+var (
+	workerMetricsOnce       sync.Once
+	workerQueueDepthGauge   prometheus.Gauge
+	workerActiveRunsGauge   prometheus.Gauge
+	sandboxAllocationsTotal *prometheus.CounterVec
 )
 
 type Config struct {
@@ -36,6 +51,10 @@ type Worker struct {
 	redis               *redis.Client
 	httpClient          *http.Client
 	runMode             string
+	sandboxEnabled      bool
+	sandboxNamespace    string
+	sandboxTemplate     string
+	dynamic             dynamic.Interface
 	cronTickInterval    time.Duration
 	webhookPollInterval time.Duration
 	webhookMaxAttempts  int
@@ -64,6 +83,7 @@ type webhookDelivery struct {
 }
 
 func New(cfg Config, logger *slog.Logger) (*Worker, error) {
+	initWorkerMetrics()
 	w := &Worker{
 		cfg:    cfg,
 		logger: logger,
@@ -74,6 +94,8 @@ func New(cfg Config, logger *slog.Logger) (*Worker, error) {
 			}
 			return "mode_a"
 		}(),
+		sandboxNamespace: envOrDefault("SANDBOX_NAMESPACE", "default"),
+		sandboxTemplate:  envOrDefault("SANDBOX_TEMPLATE_NAME", "langopen-default"),
 		httpClient: &http.Client{
 			Timeout: time.Duration(envIntOrDefault("WEBHOOK_TIMEOUT_SECONDS", 5)) * time.Second,
 		},
@@ -94,6 +116,16 @@ func New(cfg Config, logger *slog.Logger) (*Worker, error) {
 			Username: strings.TrimSpace(os.Getenv("REDIS_USERNAME")),
 			Password: os.Getenv("REDIS_PASSWORD"),
 		})
+	}
+	w.sandboxEnabled = envBoolOrDefault("SANDBOX_ENABLED", w.runMode == "mode_b")
+	if w.sandboxEnabled {
+		dynClient, err := initDynamicClient()
+		if err != nil {
+			w.logger.Error("sandbox_client_init_failed", "error", err)
+			w.sandboxEnabled = false
+		} else {
+			w.dynamic = dynClient
+		}
 	}
 	return w, nil
 }
@@ -161,6 +193,7 @@ func (w *Worker) runWakeupLoop(ctx context.Context) error {
 		if len(result) < 2 {
 			continue
 		}
+		w.observeQueueDepth(ctx)
 
 		run, err := w.fetchNextPendingRun(ctx)
 		if err != nil {
@@ -240,10 +273,30 @@ func (w *Worker) fetchNextPendingRun(ctx context.Context) (pendingRun, error) {
 }
 
 func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
+	workerActiveRunsGauge.Inc()
+	defer workerActiveRunsGauge.Dec()
+
 	w.logger.Info("run_started", "run_id", run.ID, "thread_id", run.ThreadID)
 	if w.runMode == "mode_b" {
-		sandboxID := contracts.NewID("sandbox")
-		w.emitStreamEvent(ctx, run, "run_sandbox_allocated", map[string]any{"run_id": run.ID, "sandbox_id": sandboxID, "mode": w.runMode})
+		if w.sandboxEnabled {
+			sandboxID, err := w.allocateSandboxClaim(ctx, run.ID)
+			if err != nil {
+				sandboxAllocationsTotal.WithLabelValues("failed").Inc()
+				w.logger.Error("sandbox_allocation_failed", "run_id", run.ID, "error", err)
+				_ = w.updateRunStatus(ctx, run.ID, contracts.RunStatusError)
+				w.emitStreamEvent(ctx, run, "run_sandbox_allocation_failed", map[string]any{"run_id": run.ID, "error": err.Error()})
+				if enqueueErr := w.enqueueWebhookForRun(ctx, run.ID); enqueueErr != nil {
+					w.logger.Error("enqueue_webhook_failed", "run_id", run.ID, "error", enqueueErr)
+				}
+				return
+			}
+			sandboxAllocationsTotal.WithLabelValues("succeeded").Inc()
+			w.emitStreamEvent(ctx, run, "run_sandbox_allocated", map[string]any{"run_id": run.ID, "sandbox_id": sandboxID, "mode": w.runMode})
+		} else {
+			sandboxAllocationsTotal.WithLabelValues("simulated").Inc()
+			sandboxID := contracts.NewID("sandbox")
+			w.emitStreamEvent(ctx, run, "run_sandbox_allocated", map[string]any{"run_id": run.ID, "sandbox_id": sandboxID, "mode": w.runMode, "simulated": true})
+		}
 	}
 	w.emitStreamEvent(ctx, run, "run_started", map[string]any{"run_id": run.ID, "status": "running"})
 
@@ -585,4 +638,121 @@ func envIntOrDefault(key string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func envBoolOrDefault(key string, fallback bool) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	switch value {
+	case "1", "t", "true", "yes", "y", "on":
+		return true
+	case "0", "f", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func initDynamicClient() (dynamic.Interface, error) {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		kubeconfig := strings.TrimSpace(os.Getenv("KUBECONFIG"))
+		if kubeconfig == "" {
+			home, homeErr := os.UserHomeDir()
+			if homeErr == nil {
+				kubeconfig = home + "/.kube/config"
+			}
+		}
+		if kubeconfig != "" {
+			cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return dynamic.NewForConfig(cfg)
+}
+
+func (w *Worker) allocateSandboxClaim(ctx context.Context, runID string) (string, error) {
+	if w.dynamic == nil {
+		return "", errors.New("dynamic kubernetes client unavailable")
+	}
+	name := sandboxClaimName(runID)
+	resource := schema.GroupVersionResource{
+		Group:    "extensions.agents.x-k8s.io",
+		Version:  "v1alpha1",
+		Resource: "sandboxclaims",
+	}
+	obj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "extensions.agents.x-k8s.io/v1alpha1",
+			"kind":       "SandboxClaim",
+			"metadata": map[string]any{
+				"name": name,
+			},
+			"spec": map[string]any{
+				"sandboxTemplateRef": map[string]any{
+					"name": w.sandboxTemplate,
+				},
+			},
+		},
+	}
+	_, err := w.dynamic.Resource(resource).Namespace(w.sandboxNamespace).Create(ctx, obj, metav1.CreateOptions{})
+	if err != nil && !k8serrors.IsAlreadyExists(err) {
+		return "", err
+	}
+	return name, nil
+}
+
+func sandboxClaimName(runID string) string {
+	base := strings.ToLower(runID)
+	base = strings.ReplaceAll(base, "_", "-")
+	var b strings.Builder
+	for _, ch := range base {
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' {
+			b.WriteRune(ch)
+		}
+	}
+	clean := strings.Trim(b.String(), "-")
+	if clean == "" {
+		clean = contracts.NewID("sandbox")
+		clean = strings.ReplaceAll(strings.ToLower(clean), "_", "-")
+	}
+	name := "run-" + clean
+	if len(name) > 63 {
+		name = name[:63]
+		name = strings.TrimRight(name, "-")
+	}
+	return name
+}
+
+func (w *Worker) observeQueueDepth(ctx context.Context) {
+	if w.redis == nil {
+		return
+	}
+	depth, err := w.redis.LLen(ctx, w.cfg.QueueKey).Result()
+	if err != nil {
+		return
+	}
+	workerQueueDepthGauge.Set(float64(depth))
+}
+
+func initWorkerMetrics() {
+	workerMetricsOnce.Do(func() {
+		workerQueueDepthGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "langopen_worker_queue_depth",
+			Help: "Current pending wakeup queue depth observed by worker.",
+		})
+		workerActiveRunsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "langopen_worker_active_runs",
+			Help: "Number of currently executing runs in worker process.",
+		})
+		sandboxAllocationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "langopen_worker_sandbox_allocations_total",
+			Help: "Total sandbox allocation attempts by outcome.",
+		}, []string{"result"})
+		prometheus.MustRegister(workerQueueDepthGauge, workerActiveRunsGauge, sandboxAllocationsTotal)
+	})
 }

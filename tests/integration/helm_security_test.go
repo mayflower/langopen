@@ -55,4 +55,7 @@ func TestBuilderHasJobRBAC(t *testing.T) {
 	if !strings.Contains(rendered, "kind: RoleBinding") || !strings.Contains(rendered, "-builder") {
 		t.Fatalf("expected builder role binding in rendered chart")
 	}
+	if !strings.Contains(rendered, "name: WORKER_METRICS_ADDR") || !strings.Contains(rendered, "containerPort: 9091") {
+		t.Fatalf("expected worker metrics endpoint wiring in rendered chart")
+	}
 }

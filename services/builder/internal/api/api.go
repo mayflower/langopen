@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -265,6 +266,7 @@ func (a *API) getBuild(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()
 	if rec, ok := a.builds[buildID]; ok {
 		a.mu.RUnlock()
+		rec = a.refreshBuildRuntimeStatus(r.Context(), rec)
 		writeJSON(w, http.StatusOK, rec)
 		return
 	}
@@ -284,6 +286,7 @@ func (a *API) getBuild(w http.ResponseWriter, r *http.Request) {
 		contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 		return
 	}
+	rec = a.refreshBuildRuntimeStatus(r.Context(), rec)
 	writeJSON(w, http.StatusOK, rec)
 }
 
@@ -295,8 +298,21 @@ func (a *API) getBuildLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.mu.RLock()
+	rec, recOK := a.builds[buildID]
 	logs, ok := a.logs[buildID]
 	a.mu.RUnlock()
+	if recOK && a.kube != nil {
+		if namespace, jobName, hasJob := parseK8sJobRef(rec, a.buildNamespace); hasJob {
+			jobLogs, err := a.fetchJobLogs(r.Context(), namespace, jobName)
+			if err == nil && strings.TrimSpace(jobLogs) != "" {
+				a.mu.Lock()
+				a.logs[buildID] = jobLogs
+				a.mu.Unlock()
+				writeJSON(w, http.StatusOK, map[string]any{"build_id": buildID, "logs_ref": rec.LogsRef, "logs": jobLogs})
+				return
+			}
+		}
+	}
 	if ok {
 		writeJSON(w, http.StatusOK, map[string]any{"build_id": buildID, "logs": logs})
 		return
@@ -315,6 +331,19 @@ func (a *API) getBuildLogs(w http.ResponseWriter, r *http.Request) {
 		}
 		contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 		return
+	}
+	rec = a.refreshBuildRuntimeStatus(r.Context(), rec)
+	if a.kube != nil {
+		if namespace, jobName, hasJob := parseK8sJobRef(rec, a.buildNamespace); hasJob {
+			jobLogs, err := a.fetchJobLogs(r.Context(), namespace, jobName)
+			if err == nil && strings.TrimSpace(jobLogs) != "" {
+				a.mu.Lock()
+				a.logs[buildID] = jobLogs
+				a.mu.Unlock()
+				writeJSON(w, http.StatusOK, map[string]any{"build_id": buildID, "logs_ref": rec.LogsRef, "logs": jobLogs})
+				return
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"build_id": rec.ID,
@@ -335,7 +364,123 @@ func (a *API) getBuildFromPostgres(ctx context.Context, buildID string) (buildRe
 		}
 		return buildRecord{}, err
 	}
+	if _, jobName, ok := parseLogsRef(rec.LogsRef); ok {
+		rec.JobName = jobName
+		rec.JobSubmitted = true
+	}
 	return rec, nil
+}
+
+func (a *API) refreshBuildRuntimeStatus(ctx context.Context, rec buildRecord) buildRecord {
+	if a.kube == nil {
+		return rec
+	}
+	namespace, jobName, ok := parseK8sJobRef(rec, a.buildNamespace)
+	if !ok {
+		return rec
+	}
+
+	nextStatus, err := a.lookupJobStatus(ctx, namespace, jobName)
+	if err != nil {
+		a.logger.Warn("builder_job_status_lookup_failed", "build_id", rec.ID, "namespace", namespace, "job_name", jobName, "error", err)
+		return rec
+	}
+	if nextStatus == "" || nextStatus == rec.Status {
+		return rec
+	}
+
+	rec.Status = nextStatus
+	rec.JobName = jobName
+	rec.JobSubmitted = true
+	rec.UpdatedAt = time.Now().UTC()
+	a.mu.Lock()
+	a.builds[rec.ID] = rec
+	a.mu.Unlock()
+	if a.pg != nil {
+		_, _ = a.pg.Exec(ctx, `UPDATE builds SET status=$2, updated_at=$3 WHERE id=$1`, rec.ID, rec.Status, rec.UpdatedAt)
+	}
+	return rec
+}
+
+func (a *API) lookupJobStatus(ctx context.Context, namespace, jobName string) (string, error) {
+	job, err := a.kube.BatchV1().Jobs(namespace).Get(ctx, jobName, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	if job.Status.Succeeded > 0 {
+		return "succeeded", nil
+	}
+	if job.Status.Failed > 0 {
+		return "failed", nil
+	}
+	for _, cond := range job.Status.Conditions {
+		if cond.Type == batchv1.JobComplete && cond.Status == corev1.ConditionTrue {
+			return "succeeded", nil
+		}
+		if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
+			return "failed", nil
+		}
+	}
+	if job.Status.Active > 0 {
+		return "running", nil
+	}
+	return "queued", nil
+}
+
+func (a *API) fetchJobLogs(ctx context.Context, namespace, jobName string) (string, error) {
+	pods, err := a.kube.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "job-name=" + jobName,
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(pods.Items) == 0 {
+		return "", errors.New("job pod not found")
+	}
+	pod := pods.Items[0]
+	logOptions := &corev1.PodLogOptions{Container: "buildkit"}
+	stream, err := a.kube.CoreV1().Pods(namespace).GetLogs(pod.Name, logOptions).Stream(ctx)
+	if err != nil {
+		logOptions.Container = ""
+		stream, err = a.kube.CoreV1().Pods(namespace).GetLogs(pod.Name, logOptions).Stream(ctx)
+		if err != nil {
+			return "", err
+		}
+	}
+	defer stream.Close()
+	raw, err := io.ReadAll(stream)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+func parseK8sJobRef(rec buildRecord, fallbackNamespace string) (string, string, bool) {
+	if rec.JobName != "" {
+		namespace := fallbackNamespace
+		if ns, _, ok := parseLogsRef(rec.LogsRef); ok {
+			namespace = ns
+		}
+		return namespace, rec.JobName, true
+	}
+	return parseLogsRef(rec.LogsRef)
+}
+
+func parseLogsRef(logsRef string) (string, string, bool) {
+	if !strings.HasPrefix(logsRef, "k8s://") {
+		return "", "", false
+	}
+	trimmed := strings.TrimPrefix(logsRef, "k8s://")
+	parts := strings.Split(trimmed, "/jobs/")
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	namespace := strings.TrimSpace(parts[0])
+	jobName := strings.TrimSpace(parts[1])
+	if namespace == "" || jobName == "" {
+		return "", "", false
+	}
+	return namespace, jobName, true
 }
 
 func (a *API) submitBuildJob(ctx context.Context, jobSpec map[string]any) (string, error) {

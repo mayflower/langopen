@@ -34,6 +34,11 @@ apiServer:
 
 worker:
   replicas: 1
+  runMode: mode_a
+  sandboxEnabled: false
+  sandboxNamespace: langopen
+  sandboxTemplateName: langopen-default
+  metricsAddr: ":9091"
 
 controlPlane:
   enabled: true

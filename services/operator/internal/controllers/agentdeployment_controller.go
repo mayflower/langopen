@@ -177,7 +177,15 @@ func desiredWorkerDeployment(dep *v1alpha1.AgentDeployment, image, runtimeClass 
 	labels := map[string]string{"app": dep.Name, "component": "worker"}
 	env := []corev1.EnvVar{{Name: "RUN_MODE", Value: mode}}
 	if mode == "mode_b" {
-		env = append(env, corev1.EnvVar{Name: "SANDBOX_ENABLED", Value: "true"})
+		templateName := strings.TrimSpace(dep.Spec.SandboxTemplate)
+		if templateName == "" {
+			templateName = dep.Name + "-sandbox-template"
+		}
+		env = append(env,
+			corev1.EnvVar{Name: "SANDBOX_ENABLED", Value: "true"},
+			corev1.EnvVar{Name: "SANDBOX_TEMPLATE_NAME", Value: templateName},
+			corev1.EnvVar{Name: "SANDBOX_NAMESPACE", Value: dep.Namespace},
+		)
 	}
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: dep.Name + "-worker", Namespace: dep.Namespace},

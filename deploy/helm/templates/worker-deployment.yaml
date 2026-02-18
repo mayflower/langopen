@@ -1,0 +1,85 @@
+{{- if .Values.worker.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "langopen.fullname" . }}-worker
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      {{- include "langopen.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "langopen.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+    spec:
+      {{- if .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      {{- if .Values.worker.runtimeClassName }}
+      runtimeClassName: {{ .Values.worker.runtimeClassName }}
+      {{- end }}
+      automountServiceAccountToken: false
+      containers:
+        - name: worker
+          image: {{ include "langopen.image" (dict "Values" .Values "component" "worker") | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - containerPort: 9091
+              name: metrics
+          env:
+            - name: POSTGRES_DSN
+              value: {{ .Values.env.postgresDsn | quote }}
+            - name: REDIS_ADDR
+              value: {{ .Values.env.redisAddr | quote }}
+            - name: RUN_WAKEUP_LIST
+              value: {{ .Values.env.runWakeupList | quote }}
+            - name: RUN_CANCEL_KEY_PREFIX
+              value: {{ .Values.env.runCancelKeyPrefix | quote }}
+            - name: RUN_CANCEL_CHANNEL_PREFIX
+              value: {{ .Values.env.runCancelChannelPrefix | quote }}
+            - name: RUN_STREAM_CHANNEL_PREFIX
+              value: {{ .Values.env.runStreamChannelPrefix | quote }}
+            - name: RUN_STREAM_BUFFER_PREFIX
+              value: {{ .Values.env.runStreamBufferPrefix | quote }}
+            - name: RUN_STREAM_BUFFER_TTL_SECONDS
+              value: {{ .Values.env.runStreamBufferTtlSeconds | quote }}
+            - name: RUN_MODE
+              value: {{ .Values.worker.runMode | quote }}
+            - name: SANDBOX_ENABLED
+              value: {{ ternary "true" "false" .Values.worker.sandboxEnabled | quote }}
+            - name: SANDBOX_NAMESPACE
+              value: {{ default .Release.Namespace .Values.worker.sandboxNamespace | quote }}
+            - name: SANDBOX_TEMPLATE_NAME
+              value: {{ .Values.worker.sandboxTemplateName | quote }}
+            - name: WORKER_METRICS_ADDR
+              value: {{ .Values.worker.metricsAddr | quote }}
+          {{- range .Values.extraEnv.worker }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+          {{- end }}
+          {{- if or .Values.global.envFromSecret (gt (len .Values.extraEnvFrom.worker) 0) }}
+          envFrom:
+            {{- if .Values.global.envFromSecret }}
+            - secretRef:
+                name: {{ .Values.global.envFromSecret }}
+            {{- end }}
+            {{- with .Values.extraEnvFrom.worker }}
+{{ toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+{{- end }}
