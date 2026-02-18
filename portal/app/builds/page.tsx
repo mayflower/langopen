@@ -1,4 +1,6 @@
-import { fetchControl } from "../../lib/platform";
+"use client";
+
+import { useEffect, useState } from "react";
 
 type Build = {
   id: string;
@@ -10,19 +12,61 @@ type Build = {
   created_at: string;
 };
 
-export default async function BuildsPage() {
-  let builds: Build[] = [];
-  let error = "";
-  try {
-    builds = await fetchControl<Build[]>("/internal/v1/builds");
-  } catch (err) {
-    error = err instanceof Error ? err.message : "failed to load builds";
+export default function BuildsPage() {
+  const [builds, setBuilds] = useState<Build[]>([]);
+  const [selectedBuildID, setSelectedBuildID] = useState("");
+  const [logs, setLogs] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    void loadBuilds();
+  }, []);
+
+  async function loadBuilds() {
+    setLoading(true);
+    setError("");
+    try {
+      const resp = await fetch("/api/platform/control/internal/v1/builds", { cache: "no-store" });
+      if (!resp.ok) {
+        throw new Error(`load builds failed (${resp.status})`);
+      }
+      const data = (await resp.json()) as Build[];
+      setBuilds(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "failed to load builds");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadBuildLogs(buildID: string) {
+    setLoading(true);
+    setError("");
+    setSelectedBuildID(buildID);
+    setLogs("");
+    try {
+      const resp = await fetch(`/api/platform/control/internal/v1/builds/${encodeURIComponent(buildID)}/logs`, { cache: "no-store" });
+      if (!resp.ok) {
+        const body = await resp.text();
+        throw new Error(`load build logs failed (${resp.status}) ${body}`);
+      }
+      const body = (await resp.json()) as { logs?: string; logs_ref?: string };
+      setLogs(body.logs || body.logs_ref || "no logs");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "failed to load build logs");
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
     <main className="hero">
       <h2>Builds</h2>
-      <p>BuildKit rootless jobs with commit-tagged image digests.</p>
+      <p>BuildKit rootless jobs with commit-tagged image digests and inline log view.</p>
+      <div className="row">
+        <button disabled={loading} type="button" onClick={() => void loadBuilds()}>Refresh</button>
+      </div>
       {error ? <p className="warn">{error}</p> : null}
       {!error && builds.length === 0 ? <p>No builds found.</p> : null}
       {builds.length > 0 ? (
@@ -46,9 +90,7 @@ export default async function BuildsPage() {
                 <td>{b.status}</td>
                 <td>{b.image_digest || "-"}</td>
                 <td>
-                  <a href={`/api/platform/control/internal/v1/builds/${encodeURIComponent(b.id)}/logs`} target="_blank" rel="noreferrer">
-                    View Logs
-                  </a>
+                  <button disabled={loading} type="button" onClick={() => void loadBuildLogs(b.id)}>View</button>
                   {b.logs_ref ? <> ({b.logs_ref})</> : null}
                 </td>
               </tr>
@@ -56,6 +98,7 @@ export default async function BuildsPage() {
           </tbody>
         </table>
       ) : null}
+      <pre className="card">{selectedBuildID ? `build=${selectedBuildID}\n${logs || "loading..."}` : "Select a build to view logs."}</pre>
     </main>
   );
 }
