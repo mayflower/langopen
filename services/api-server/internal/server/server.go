@@ -375,6 +375,27 @@ func hashAPIKey(key string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func (s *Server) writeDataPlaneAudit(ctx context.Context, projectID, eventType string, payload map[string]any) {
+	if s.pg == nil {
+		return
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		s.logger.Warn("audit_payload_marshal_failed", "event_type", eventType, "error", err)
+		return
+	}
+	var projectArg any
+	if strings.TrimSpace(projectID) != "" {
+		projectArg = strings.TrimSpace(projectID)
+	}
+	if _, err := s.pg.Exec(ctx, `
+		INSERT INTO audit_logs (id, project_id, actor_id, event_type, payload, created_at)
+		VALUES ($1, $2, $3, $4, $5, NOW())
+	`, contracts.NewID("audit"), projectArg, "agent-server", eventType, raw); err != nil {
+		s.logger.Warn("audit_write_failed", "event_type", eventType, "project_id", projectID, "error", err)
+	}
+}
+
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
@@ -1273,7 +1294,8 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.pg != nil {
-		if err := s.cancelRunInPostgres(r.Context(), projectIDFromContext(r.Context()), runID, action); err != nil {
+		projectID := projectIDFromContext(r.Context())
+		if err := s.cancelRunInPostgres(r.Context(), projectID, runID, action); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				contracts.WriteError(w, http.StatusNotFound, "run_not_found", "run not found", observability.RequestIDFromContext(r.Context()))
 				return
@@ -1284,6 +1306,10 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 		if action == "rollback" && s.redis != nil {
 			_ = s.redis.Del(r.Context(), s.cfg.StreamBufferPrefix+runID).Err()
 		}
+		s.writeDataPlaneAudit(r.Context(), projectID, "run.cancelled", map[string]any{
+			"run_id": runID,
+			"action": action,
+		})
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "action": action})
 		return
 	}
