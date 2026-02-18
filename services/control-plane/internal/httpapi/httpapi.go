@@ -287,11 +287,19 @@ func (a *API) validateSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listDeployments(w http.ResponseWriter, r *http.Request) {
+	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
 	if a.pg != nil {
-		rows, err := a.pg.Query(r.Context(), `
+		query := `
 			SELECT id, project_id, repo_url, git_ref, repo_path, runtime_profile, mode, COALESCE(current_image_digest,''), created_at, updated_at
-			FROM deployments ORDER BY updated_at DESC LIMIT 500
-		`)
+			FROM deployments
+		`
+		args := []any{}
+		if projectID != "" {
+			query += " WHERE project_id=$1"
+			args = append(args, projectID)
+		}
+		query += " ORDER BY updated_at DESC LIMIT 500"
+		rows, err := a.pg.Query(r.Context(), query, args...)
 		if err != nil {
 			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
@@ -312,7 +320,17 @@ func (a *API) listDeployments(w http.ResponseWriter, r *http.Request) {
 
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	writeJSON(w, http.StatusOK, a.state.Deployments)
+	if projectID == "" {
+		writeJSON(w, http.StatusOK, a.state.Deployments)
+		return
+	}
+	out := make([]map[string]any, 0)
+	for _, dep := range a.state.Deployments {
+		if pid, _ := dep["project_id"].(string); pid == projectID {
+			out = append(out, dep)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (a *API) getDeploymentByID(w http.ResponseWriter, r *http.Request) {
@@ -544,11 +562,22 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listBuilds(w http.ResponseWriter, r *http.Request) {
+	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
 	if a.pg != nil {
-		rows, err := a.pg.Query(r.Context(), `
-			SELECT id, deployment_id, status, commit_sha, COALESCE(image_digest,''), COALESCE(logs_ref,''), created_at, updated_at
-			FROM builds ORDER BY created_at DESC LIMIT 500
-		`)
+		query := `
+			SELECT b.id, b.deployment_id, b.status, b.commit_sha, COALESCE(b.image_digest,''), COALESCE(b.logs_ref,''), b.created_at, b.updated_at
+			FROM builds b
+		`
+		args := []any{}
+		if projectID != "" {
+			query += `
+				JOIN deployments d ON d.id = b.deployment_id
+				WHERE d.project_id=$1
+			`
+			args = append(args, projectID)
+		}
+		query += " ORDER BY b.created_at DESC LIMIT 500"
+		rows, err := a.pg.Query(r.Context(), query, args...)
 		if err != nil {
 			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
@@ -569,7 +598,27 @@ func (a *API) listBuilds(w http.ResponseWriter, r *http.Request) {
 
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	writeJSON(w, http.StatusOK, a.state.Builds)
+	if projectID == "" {
+		writeJSON(w, http.StatusOK, a.state.Builds)
+		return
+	}
+	allowedDeployments := map[string]struct{}{}
+	for _, dep := range a.state.Deployments {
+		if pid, _ := dep["project_id"].(string); pid != projectID {
+			continue
+		}
+		if id, _ := dep["id"].(string); id != "" {
+			allowedDeployments[id] = struct{}{}
+		}
+	}
+	filtered := make([]map[string]any, 0)
+	for _, build := range a.state.Builds {
+		deploymentID, _ := build["deployment_id"].(string)
+		if _, ok := allowedDeployments[deploymentID]; ok {
+			filtered = append(filtered, build)
+		}
+	}
+	writeJSON(w, http.StatusOK, filtered)
 }
 
 func (a *API) getBuild(w http.ResponseWriter, r *http.Request) {

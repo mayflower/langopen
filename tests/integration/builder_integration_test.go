@@ -371,6 +371,107 @@ func TestControlPlaneDeploymentGetAndUpdate(t *testing.T) {
 	}
 }
 
+func TestControlPlaneListFiltersByProject(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://example.invalid")
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createDep := func(projectID string) string {
+		resp := doControlPlaneReq(t, ts.URL+"/internal/v1/deployments", map[string]any{
+			"project_id": projectID,
+			"repo_url":   "https://github.com/acme/agent",
+			"git_ref":    "main",
+			"repo_path":  ".",
+		})
+		if resp.StatusCode != http.StatusCreated {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 201, got %d body=%s", resp.StatusCode, string(b))
+		}
+		var created map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		depID, _ := created["id"].(string)
+		if depID == "" {
+			t.Fatal("missing deployment id")
+		}
+		return depID
+	}
+
+	depA := createDep("proj_a")
+	depB := createDep("proj_b")
+
+	buildA := doControlPlaneReq(t, ts.URL+"/internal/v1/builds", map[string]any{
+		"deployment_id": depA,
+		"commit_sha":    "aaaa1111",
+		"image_name":    "ghcr.io/acme/agent-a",
+	})
+	if buildA.StatusCode != http.StatusAccepted {
+		b, _ := io.ReadAll(buildA.Body)
+		t.Fatalf("expected 202 for build A, got %d body=%s", buildA.StatusCode, string(b))
+	}
+	buildA.Body.Close()
+
+	buildB := doControlPlaneReq(t, ts.URL+"/internal/v1/builds", map[string]any{
+		"deployment_id": depB,
+		"commit_sha":    "bbbb2222",
+		"image_name":    "ghcr.io/acme/agent-b",
+	})
+	if buildB.StatusCode != http.StatusAccepted {
+		b, _ := io.ReadAll(buildB.Body)
+		t.Fatalf("expected 202 for build B, got %d body=%s", buildB.StatusCode, string(b))
+	}
+	buildB.Body.Close()
+
+	listDepsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/deployments?project_id=proj_a", nil)
+	listDepsResp, err := http.DefaultClient.Do(listDepsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listDepsResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(listDepsResp.Body)
+		t.Fatalf("expected 200 for deployment list filter, got %d body=%s", listDepsResp.StatusCode, string(b))
+	}
+	var deps []map[string]any
+	if err := json.NewDecoder(listDepsResp.Body).Decode(&deps); err != nil {
+		t.Fatal(err)
+	}
+	listDepsResp.Body.Close()
+	if len(deps) != 1 {
+		t.Fatalf("expected 1 deployment for proj_a, got %d", len(deps))
+	}
+	if id, _ := deps[0]["id"].(string); id != depA {
+		t.Fatalf("expected deployment %s for proj_a, got %s", depA, id)
+	}
+
+	listBuildsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/builds?project_id=proj_a", nil)
+	listBuildsResp, err := http.DefaultClient.Do(listBuildsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listBuildsResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(listBuildsResp.Body)
+		t.Fatalf("expected 200 for build list filter, got %d body=%s", listBuildsResp.StatusCode, string(b))
+	}
+	var builds []map[string]any
+	if err := json.NewDecoder(listBuildsResp.Body).Decode(&builds); err != nil {
+		t.Fatal(err)
+	}
+	listBuildsResp.Body.Close()
+	if len(builds) == 0 {
+		t.Fatalf("expected at least one build for proj_a")
+	}
+	for _, build := range builds {
+		if gotDep, _ := build["deployment_id"].(string); gotDep != depA {
+			t.Fatalf("expected only deployment %s builds for proj_a filter, got deployment_id=%s", depA, gotDep)
+		}
+	}
+}
+
 func TestControlPlaneSourceValidate(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", "")
 
