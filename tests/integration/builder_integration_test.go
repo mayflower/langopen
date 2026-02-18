@@ -364,6 +364,39 @@ func TestControlPlaneSecretBindingLifecycle(t *testing.T) {
 	if len(bindings) == 0 {
 		t.Fatal("expected at least one secret binding")
 	}
+	bindingID, _ := bindings[0]["id"].(string)
+	if bindingID == "" {
+		t.Fatal("missing binding id")
+	}
+
+	deleteReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/internal/v1/secrets/bindings/"+bindingID, nil)
+	deleteResp, err := http.DefaultClient.Do(deleteReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(deleteResp.Body)
+		t.Fatalf("expected 200, got %d body=%s", deleteResp.StatusCode, string(b))
+	}
+	deleteResp.Body.Close()
+
+	listAfterReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/secrets/bindings?deployment_id="+depID, nil)
+	listAfterResp, err := http.DefaultClient.Do(listAfterReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listAfterResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(listAfterResp.Body)
+		t.Fatalf("expected 200, got %d body=%s", listAfterResp.StatusCode, string(b))
+	}
+	var after []map[string]any
+	if err := json.NewDecoder(listAfterResp.Body).Decode(&after); err != nil {
+		t.Fatal(err)
+	}
+	listAfterResp.Body.Close()
+	if len(after) != 0 {
+		t.Fatalf("expected no bindings after delete, got %d", len(after))
+	}
 }
 
 func TestControlPlaneRBAC(t *testing.T) {

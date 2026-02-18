@@ -124,6 +124,7 @@ func New(logger *slog.Logger) *API {
 		v1.Post("/policies/runtime", a.setRuntimePolicy)
 		v1.Post("/secrets/bind", a.bindSecret)
 		v1.Get("/secrets/bindings", a.listSecretBindings)
+		v1.Delete("/secrets/bindings/{binding_id}", a.deleteSecretBinding)
 		v1.Get("/audit", a.listAudit)
 	})
 	a.router = r
@@ -805,6 +806,66 @@ func (a *API) listSecretBindings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *API) deleteSecretBinding(w http.ResponseWriter, r *http.Request) {
+	bindingID := strings.TrimSpace(chi.URLParam(r, "binding_id"))
+	if bindingID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_binding_id", "binding_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	if a.pg != nil {
+		var deploymentID string
+		err := a.pg.QueryRow(r.Context(), `
+			DELETE FROM deployment_secret_bindings
+			WHERE id=$1
+			RETURNING deployment_id
+		`, bindingID).Scan(&deploymentID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "secret_binding_not_found", "secret binding not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_delete_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+
+		projectID := "proj_default"
+		if dep, err := a.getDeployment(r.Context(), deploymentID); err == nil {
+			projectID = dep.ProjectID
+		}
+		_ = a.writeAudit(r.Context(), projectID, "secret.unbound", map[string]any{
+			"binding_id":    bindingID,
+			"deployment_id": deploymentID,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "binding_id": bindingID})
+		return
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	next := make([]map[string]any, 0, len(a.state.Secrets))
+	found := false
+	for _, item := range a.state.Secrets {
+		id, _ := item["id"].(string)
+		if id == bindingID {
+			found = true
+			continue
+		}
+		next = append(next, item)
+	}
+	if !found {
+		contracts.WriteError(w, http.StatusNotFound, "secret_binding_not_found", "secret binding not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	a.state.Secrets = next
+	a.state.Audit = append(a.state.Audit, map[string]any{
+		"event":      "secret.unbound",
+		"timestamp":  time.Now().UTC(),
+		"binding_id": bindingID,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "binding_id": bindingID})
 }
 
 func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {
