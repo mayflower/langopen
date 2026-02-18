@@ -1,0 +1,298 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "LangOpen Agent Server API",
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "/api/v1"
+    }
+  ],
+  "paths": {
+    "/assistants": {
+      "get": {
+        "summary": "List assistants",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create assistant",
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        }
+      }
+    },
+    "/threads": {
+      "get": {
+        "summary": "List threads",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create thread",
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        }
+      }
+    },
+    "/threads/{thread_id}/runs/stream": {
+      "post": {
+        "summary": "Create run and stream SSE output",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream"
+          }
+        }
+      }
+    },
+    "/threads/{thread_id}/runs/{run_id}/stream": {
+      "get": {
+        "summary": "Join run stream",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream"
+          }
+        }
+      }
+    },
+    "/threads/{thread_id}/runs/{run_id}/cancel": {
+      "post": {
+        "summary": "Cancel run",
+        "responses": {
+          "200": {
+            "description": "Cancel accepted"
+          }
+        }
+      }
+    },
+    "/runs/stream": {
+      "post": {
+        "summary": "Create stateless run and stream SSE output",
+        "responses": {
+          "200": {
+            "description": "SSE stream"
+          }
+        }
+      }
+    },
+    "/runs/{run_id}/stream": {
+      "get": {
+        "summary": "Join stateless run stream",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream"
+          }
+        }
+      }
+    },
+    "/runs/{run_id}/cancel": {
+      "post": {
+        "summary": "Cancel stateless run",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancel accepted"
+          }
+        }
+      }
+    },
+    "/runs/{run_id}": {
+      "get": {
+        "summary": "Get run",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run response"
+          }
+        }
+      }
+    },
+    "/store/items": {
+      "get": {
+        "summary": "List store items",
+        "responses": {
+          "200": {
+            "description": "Store item list"
+          }
+        }
+      },
+      "post": {
+        "summary": "Upsert store item",
+        "responses": {
+          "201": {
+            "description": "Store item created"
+          }
+        }
+      }
+    },
+    "/store/items/{namespace}/{key}": {
+      "get": {
+        "summary": "Get store item",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Store item"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete store item",
+        "responses": {
+          "200": {
+            "description": "Store item deleted"
+          }
+        }
+      }
+    },
+    "/crons": {
+      "get": {
+        "summary": "List cron jobs",
+        "responses": {
+          "200": {
+            "description": "Cron list"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create cron job",
+        "responses": {
+          "201": {
+            "description": "Cron created"
+          }
+        }
+      }
+    },
+    "/system": {
+      "get": {
+        "summary": "System info",
+        "responses": {
+          "200": {
+            "description": "System info"
+          }
+        }
+      }
+    },
+    "/system/health": {
+      "get": {
+        "summary": "System health",
+        "responses": {
+          "200": {
+            "description": "Health check"
+          }
+        }
+      }
+    },
+    "/a2a/{assistant_id}": {
+      "post": {
+        "summary": "A2A JSON-RPC endpoint",
+        "responses": {
+          "200": {
+            "description": "JSON-RPC response"
+          }
+        }
+      }
+    },
+    "/mcp": {
+      "post": {
+        "summary": "MCP streamable HTTP endpoint",
+        "responses": {
+          "200": {
+            "description": "MCP response"
+          }
+        }
+      }
+    }
+  }
+}
