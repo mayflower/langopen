@@ -61,6 +61,7 @@ func TestDocsAndOpenAPI(t *testing.T) {
 		"/threads",
 		"/threads/{thread_id}",
 		"/threads/{thread_id}/runs",
+		"/threads/{thread_id}/runs/{run_id}",
 		"/threads/{thread_id}/runs/stream",
 		"/threads/{thread_id}/runs/{run_id}/stream",
 		"/runs",
@@ -319,6 +320,18 @@ func TestRunCreateAndListNonStream(t *testing.T) {
 	if threadRunID == "" {
 		t.Fatal("missing thread run id")
 	}
+
+	getThreadRunReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/threads/"+thread.ID+"/runs/"+threadRunID, nil)
+	getThreadRunReq.Header.Set("X-Api-Key", "test-key")
+	getThreadRunResp, err := client.Do(getThreadRunReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getThreadRunResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(getThreadRunResp.Body)
+		t.Fatalf("get thread run status=%d body=%s", getThreadRunResp.StatusCode, string(body))
+	}
+	getThreadRunResp.Body.Close()
 
 	listThreadRunsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/threads/"+thread.ID+"/runs", nil)
 	listThreadRunsReq.Header.Set("X-Api-Key", "test-key")

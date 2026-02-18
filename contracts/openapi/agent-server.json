@@ -255,6 +255,34 @@
         }
       }
     },
+    "/threads/{thread_id}/runs/{run_id}": {
+      "get": {
+        "summary": "Get run for thread",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run response"
+          }
+        }
+      }
+    },
     "/threads/{thread_id}/runs/{run_id}/cancel": {
       "post": {
         "summary": "Cancel run",

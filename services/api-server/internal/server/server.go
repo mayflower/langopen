@@ -170,6 +170,7 @@ func (s *Server) registerDataPlaneRoutes(api chi.Router) {
 	api.Get("/threads/{thread_id}/runs", s.listThreadRuns)
 	api.Post("/threads/{thread_id}/runs", s.createRun)
 	api.Post("/threads/{thread_id}/runs/stream", s.createRunStream)
+	api.Get("/threads/{thread_id}/runs/{run_id}", s.getThreadRun)
 	api.Get("/threads/{thread_id}/runs/{run_id}/stream", s.joinRunStream)
 	api.Post("/threads/{thread_id}/runs/{run_id}/cancel", s.cancelRun)
 	api.Get("/runs", s.listRuns)
@@ -1537,6 +1538,49 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	run, ok := s.store.runs[runID]
 	s.store.mu.RUnlock()
 	if !ok {
+		contracts.WriteError(w, http.StatusNotFound, "run_not_found", "run not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
+func (s *Server) getThreadRun(w http.ResponseWriter, r *http.Request) {
+	threadID := strings.TrimSpace(chi.URLParam(r, "thread_id"))
+	if threadID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_thread_id", "thread_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	runID := strings.TrimSpace(chi.URLParam(r, "run_id"))
+	if runID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_run_id", "run_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	var (
+		run contracts.Run
+		err error
+	)
+	if s.pg != nil {
+		run, err = s.getRunFromPostgres(r.Context(), projectIDFromContext(r.Context()), runID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "run_not_found", "run not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+	} else {
+		s.store.mu.RLock()
+		var ok bool
+		run, ok = s.store.runs[runID]
+		s.store.mu.RUnlock()
+		if !ok {
+			contracts.WriteError(w, http.StatusNotFound, "run_not_found", "run not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+	}
+	if run.ThreadID != threadID {
 		contracts.WriteError(w, http.StatusNotFound, "run_not_found", "run not found", observability.RequestIDFromContext(r.Context()))
 		return
 	}
