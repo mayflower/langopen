@@ -48,6 +48,37 @@ func TestDocsAndOpenAPI(t *testing.T) {
 	}
 }
 
+func TestDataPlaneRBAC(t *testing.T) {
+	ts, client := newClientServer(t)
+
+	viewerCreateReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/threads", bytes.NewReader([]byte(`{}`)))
+	viewerCreateReq.Header.Set("Content-Type", "application/json")
+	viewerCreateReq.Header.Set("X-Api-Key", "test-key")
+	viewerCreateReq.Header.Set("X-Project-Role", "viewer")
+	viewerCreateResp, err := client.Do(viewerCreateReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if viewerCreateResp.StatusCode != http.StatusForbidden {
+		body, _ := io.ReadAll(viewerCreateResp.Body)
+		t.Fatalf("expected 403 for viewer thread create, got %d body=%s", viewerCreateResp.StatusCode, string(body))
+	}
+	viewerCreateResp.Body.Close()
+
+	viewerListReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/threads", nil)
+	viewerListReq.Header.Set("X-Api-Key", "test-key")
+	viewerListReq.Header.Set("X-Project-Role", "viewer")
+	viewerListResp, err := client.Do(viewerListReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if viewerListResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(viewerListResp.Body)
+		t.Fatalf("expected 200 for viewer thread list, got %d body=%s", viewerListResp.StatusCode, string(body))
+	}
+	viewerListResp.Body.Close()
+}
+
 func TestRunStreamResumeAndReplay(t *testing.T) {
 	ts, client := newClientServer(t)
 

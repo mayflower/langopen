@@ -28,7 +28,10 @@ import (
 
 type contextKey string
 
-const projectIDContextKey contextKey = "project_id"
+const (
+	projectIDContextKey   contextKey = "project_id"
+	projectRoleContextKey contextKey = "project_role"
+)
 
 var errRunConflict = errors.New("run_conflict")
 
@@ -179,6 +182,11 @@ func projectIDFromContext(ctx context.Context) string {
 	return strings.TrimSpace(projectID)
 }
 
+func projectRoleFromContext(ctx context.Context) contracts.ProjectRole {
+	role, _ := ctx.Value(projectRoleContextKey).(contracts.ProjectRole)
+	return role
+}
+
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" || r.URL.Path == "/metrics" || r.URL.Path == "/docs" || r.URL.Path == "/openapi.json" {
@@ -196,6 +204,19 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			contracts.WriteError(w, http.StatusBadRequest, "invalid_auth_scheme", "X-Auth-Scheme must be langsmith-api-key when provided", observability.RequestIDFromContext(r.Context()))
 			return
 		}
+		role := contracts.ProjectRole(strings.TrimSpace(r.Header.Get(contracts.HeaderProjectRole)))
+		if role == "" {
+			role = contracts.RoleAdmin
+		}
+		if !contracts.IsValidProjectRole(role) {
+			contracts.WriteError(w, http.StatusBadRequest, "invalid_role", "X-Project-Role must be one of viewer, developer, operator, admin", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		required := requiredDataRoleFor(r.Method, r.URL.Path)
+		if !roleAtLeast(role, required) {
+			contracts.WriteError(w, http.StatusForbidden, "forbidden", "insufficient role for requested action", observability.RequestIDFromContext(r.Context()))
+			return
+		}
 
 		if s.pg != nil {
 			projectID, err := s.validateAPIKey(r.Context(), apiKey)
@@ -205,9 +226,39 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			}
 			r = r.WithContext(context.WithValue(r.Context(), projectIDContextKey, projectID))
 		}
+		r = r.WithContext(context.WithValue(r.Context(), projectRoleContextKey, role))
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func requiredDataRoleFor(method, path string) contracts.ProjectRole {
+	if method == http.MethodGet || method == http.MethodHead {
+		return contracts.RoleViewer
+	}
+	if strings.HasPrefix(path, "/api/v1/system") {
+		return contracts.RoleViewer
+	}
+	if strings.HasPrefix(path, "/api/v1/store/items") ||
+		strings.HasPrefix(path, "/api/v1/assistants") ||
+		strings.HasPrefix(path, "/api/v1/threads") ||
+		strings.HasPrefix(path, "/api/v1/runs") ||
+		strings.HasPrefix(path, "/api/v1/crons") ||
+		strings.HasPrefix(path, "/a2a/") ||
+		strings.HasPrefix(path, "/mcp") {
+		return contracts.RoleDeveloper
+	}
+	return contracts.RoleAdmin
+}
+
+func roleAtLeast(actual, required contracts.ProjectRole) bool {
+	rank := map[contracts.ProjectRole]int{
+		contracts.RoleViewer:    1,
+		contracts.RoleDeveloper: 2,
+		contracts.RoleOperator:  3,
+		contracts.RoleAdmin:     4,
+	}
+	return rank[actual] >= rank[required]
 }
 
 func (s *Server) validateAPIKey(ctx context.Context, apiKey string) (string, error) {
