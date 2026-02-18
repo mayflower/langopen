@@ -366,6 +366,44 @@ func TestControlPlaneSecretBindingLifecycle(t *testing.T) {
 	}
 }
 
+func TestControlPlaneRBAC(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://example.invalid")
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	viewerCreate := doControlPlaneReqWithHeaders(t, http.MethodPost, ts.URL+"/internal/v1/deployments", map[string]any{
+		"project_id": "proj_default",
+		"repo_url":   "https://github.com/acme/agent",
+		"git_ref":    "main",
+		"repo_path":  ".",
+	}, map[string]string{"X-Project-Role": "viewer"})
+	if viewerCreate.StatusCode != http.StatusForbidden {
+		b, _ := io.ReadAll(viewerCreate.Body)
+		t.Fatalf("expected 403 for viewer deploy create, got %d body=%s", viewerCreate.StatusCode, string(b))
+	}
+	viewerCreate.Body.Close()
+
+	viewerList := doControlPlaneReqWithHeaders(t, http.MethodGet, ts.URL+"/internal/v1/deployments", nil, map[string]string{"X-Project-Role": "viewer"})
+	if viewerList.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(viewerList.Body)
+		t.Fatalf("expected 200 for viewer deployments list, got %d body=%s", viewerList.StatusCode, string(b))
+	}
+	viewerList.Body.Close()
+
+	developerKeyCreate := doControlPlaneReqWithHeaders(t, http.MethodPost, ts.URL+"/internal/v1/api-keys", map[string]any{
+		"project_id": "proj_default",
+		"name":       "dev-try",
+	}, map[string]string{"X-Project-Role": "developer"})
+	if developerKeyCreate.StatusCode != http.StatusForbidden {
+		b, _ := io.ReadAll(developerKeyCreate.Body)
+		t.Fatalf("expected 403 for developer api-key create, got %d body=%s", developerKeyCreate.StatusCode, string(b))
+	}
+	developerKeyCreate.Body.Close()
+}
+
 func TestMigrationContainsRequiredIndexes(t *testing.T) {
 	root := filepath.Join("..", "..")
 	raw, err := os.ReadFile(filepath.Join(root, "db", "migrations", "001_init.sql"))
@@ -415,6 +453,27 @@ func doControlPlaneReq(t *testing.T, url string, body map[string]any) *http.Resp
 	b, _ := json.Marshal(body)
 	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func doControlPlaneReqWithHeaders(t *testing.T, method, url string, body map[string]any, headers map[string]string) *http.Response {
+	t.Helper()
+	var payload io.Reader
+	if body != nil {
+		b, _ := json.Marshal(body)
+		payload = bytes.NewReader(b)
+	}
+	req, _ := http.NewRequest(method, url, payload)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

@@ -57,8 +57,27 @@ type CronJob struct {
 	Enabled     bool   `json:"enabled"`
 }
 
+type ProjectRole string
+
 const (
-	HeaderAPIKey     = "X-Api-Key"
-	HeaderAuthScheme = "X-Auth-Scheme"
-	HeaderRequestID  = "X-Request-Id"
+	RoleViewer    ProjectRole = "viewer"
+	RoleDeveloper ProjectRole = "developer"
+	RoleOperator  ProjectRole = "operator"
+	RoleAdmin     ProjectRole = "admin"
+)
+
+func IsValidProjectRole(role ProjectRole) bool {
+	switch role {
+	case RoleViewer, RoleDeveloper, RoleOperator, RoleAdmin:
+		return true
+	default:
+		return false
+	}
+}
+
+const (
+	HeaderAPIKey      = "X-Api-Key"
+	HeaderAuthScheme  = "X-Auth-Scheme"
+	HeaderRequestID   = "X-Request-Id"
+	HeaderProjectRole = "X-Project-Role"
 )

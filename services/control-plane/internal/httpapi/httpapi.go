@@ -105,6 +105,7 @@ func New(logger *slog.Logger) *API {
 
 	r := chi.NewRouter()
 	r.Use(observability.CorrelationMiddleware(logger))
+	r.Use(a.rbacMiddleware)
 
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 	r.Handle("/metrics", observability.MetricsHandler())
@@ -130,6 +131,60 @@ func New(logger *slog.Logger) *API {
 }
 
 func (a *API) Router() http.Handler { return a.router }
+
+func (a *API) rbacMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		role := contracts.ProjectRole(strings.TrimSpace(r.Header.Get(contracts.HeaderProjectRole)))
+		if role == "" {
+			role = contracts.RoleAdmin
+		}
+		if !contracts.IsValidProjectRole(role) {
+			contracts.WriteError(w, http.StatusBadRequest, "invalid_role", "X-Project-Role must be one of viewer, developer, operator, admin", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+
+		required := requiredRoleFor(r.Method, r.URL.Path)
+		if !roleAtLeast(role, required) {
+			contracts.WriteError(w, http.StatusForbidden, "forbidden", "insufficient role for requested action", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func requiredRoleFor(method, path string) contracts.ProjectRole {
+	if method == http.MethodGet || method == http.MethodHead {
+		return contracts.RoleViewer
+	}
+	if strings.HasPrefix(path, "/internal/v1/api-keys") {
+		return contracts.RoleAdmin
+	}
+	if path == "/internal/v1/policies/runtime" {
+		return contracts.RoleOperator
+	}
+	if strings.HasPrefix(path, "/internal/v1/deployments") ||
+		strings.HasPrefix(path, "/internal/v1/builds") ||
+		strings.HasPrefix(path, "/internal/v1/sources/validate") ||
+		strings.HasPrefix(path, "/internal/v1/secrets/") {
+		return contracts.RoleDeveloper
+	}
+	return contracts.RoleAdmin
+}
+
+func roleAtLeast(actual, required contracts.ProjectRole) bool {
+	rank := map[contracts.ProjectRole]int{
+		contracts.RoleViewer:    1,
+		contracts.RoleDeveloper: 2,
+		contracts.RoleOperator:  3,
+		contracts.RoleAdmin:     4,
+	}
+	return rank[actual] >= rank[required]
+}
 
 func (a *API) createDeployment(w http.ResponseWriter, r *http.Request) {
 	var req struct {
