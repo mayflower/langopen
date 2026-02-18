@@ -114,6 +114,8 @@ func New(logger *slog.Logger) *API {
 		v1.Post("/sources/validate", a.validateSource)
 		v1.Post("/deployments", a.createDeployment)
 		v1.Get("/deployments", a.listDeployments)
+		v1.Get("/deployments/{deployment_id}", a.getDeploymentByID)
+		v1.Patch("/deployments/{deployment_id}", a.updateDeployment)
 		v1.Post("/builds", a.triggerBuild)
 		v1.Get("/builds", a.listBuilds)
 		v1.Get("/builds/{build_id}", a.getBuild)
@@ -311,6 +313,147 @@ func (a *API) listDeployments(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	writeJSON(w, http.StatusOK, a.state.Deployments)
+}
+
+func (a *API) getDeploymentByID(w http.ResponseWriter, r *http.Request) {
+	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
+	if deploymentID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	rec, err := a.getDeployment(r.Context(), deploymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
+}
+
+func (a *API) updateDeployment(w http.ResponseWriter, r *http.Request) {
+	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
+	if deploymentID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	var req struct {
+		RepoURL        *string `json:"repo_url"`
+		GitRef         *string `json:"git_ref"`
+		RepoPath       *string `json:"repo_path"`
+		RuntimeProfile *string `json:"runtime_profile"`
+		Mode           *string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if req.RepoURL == nil && req.GitRef == nil && req.RepoPath == nil && req.RuntimeProfile == nil && req.Mode == nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_update", "at least one updatable field is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	rec, err := a.getDeployment(r.Context(), deploymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if req.RepoURL != nil {
+		value := strings.TrimSpace(*req.RepoURL)
+		if value == "" {
+			contracts.WriteError(w, http.StatusBadRequest, "invalid_repo_url", "repo_url cannot be empty", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		rec.RepoURL = value
+	}
+	if req.GitRef != nil {
+		value := strings.TrimSpace(*req.GitRef)
+		if value == "" {
+			contracts.WriteError(w, http.StatusBadRequest, "invalid_git_ref", "git_ref cannot be empty", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		rec.GitRef = value
+	}
+	if req.RepoPath != nil {
+		value := strings.TrimSpace(*req.RepoPath)
+		if value == "" {
+			contracts.WriteError(w, http.StatusBadRequest, "invalid_repo_path", "repo_path cannot be empty", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		rec.RepoPath = value
+	}
+	if req.RuntimeProfile != nil {
+		value := strings.TrimSpace(*req.RuntimeProfile)
+		if value == "" {
+			contracts.WriteError(w, http.StatusBadRequest, "invalid_runtime_profile", "runtime_profile cannot be empty", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		rec.RuntimeProfile = value
+	}
+	if req.Mode != nil {
+		value := strings.TrimSpace(*req.Mode)
+		if value != "mode_a" && value != "mode_b" {
+			contracts.WriteError(w, http.StatusBadRequest, "invalid_mode", "mode must be mode_a or mode_b", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		rec.Mode = value
+	}
+	rec.UpdatedAt = time.Now().UTC()
+
+	if a.pg != nil {
+		tag, err := a.pg.Exec(r.Context(), `
+			UPDATE deployments
+			SET repo_url=$2, git_ref=$3, repo_path=$4, runtime_profile=$5, mode=$6, updated_at=$7
+			WHERE id=$1
+		`, rec.ID, rec.RepoURL, rec.GitRef, rec.RepoPath, rec.RuntimeProfile, rec.Mode, rec.UpdatedAt)
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_update_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		if tag.RowsAffected() == 0 {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		_ = a.writeAudit(r.Context(), rec.ProjectID, "deployment.updated", map[string]any{
+			"deployment_id":   rec.ID,
+			"repo_url":        rec.RepoURL,
+			"git_ref":         rec.GitRef,
+			"repo_path":       rec.RepoPath,
+			"runtime_profile": rec.RuntimeProfile,
+			"mode":            rec.Mode,
+		})
+		writeJSON(w, http.StatusOK, rec)
+		return
+	}
+
+	a.mu.Lock()
+	updated := false
+	for i, item := range a.state.Deployments {
+		if id, _ := item["id"].(string); id == rec.ID {
+			a.state.Deployments[i] = mapFromDeployment(rec)
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		a.mu.Unlock()
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	a.state.Audit = append(a.state.Audit, map[string]any{
+		"event":         "deployment.updated",
+		"timestamp":     rec.UpdatedAt,
+		"deployment_id": rec.ID,
+	})
+	a.mu.Unlock()
+	writeJSON(w, http.StatusOK, rec)
 }
 
 func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {

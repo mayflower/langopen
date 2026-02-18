@@ -307,6 +307,70 @@ func TestControlPlaneDeploymentAndBuildTrigger(t *testing.T) {
 	logsResp.Body.Close()
 }
 
+func TestControlPlaneDeploymentGetAndUpdate(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://example.invalid")
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doControlPlaneReq(t, ts.URL+"/internal/v1/deployments", map[string]any{
+		"project_id": "proj_default",
+		"repo_url":   "https://github.com/acme/agent",
+		"git_ref":    "main",
+		"repo_path":  ".",
+	})
+	if createResp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("expected 201, got %d body=%s", createResp.StatusCode, string(b))
+	}
+	var created map[string]any
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	createResp.Body.Close()
+	depID, _ := created["id"].(string)
+	if depID == "" {
+		t.Fatal("missing deployment id")
+	}
+
+	getReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/deployments/"+depID, nil)
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(getResp.Body)
+		t.Fatalf("expected 200 for get deployment, got %d body=%s", getResp.StatusCode, string(b))
+	}
+	getResp.Body.Close()
+
+	updateResp := doControlPlaneReqWithHeaders(t, http.MethodPatch, ts.URL+"/internal/v1/deployments/"+depID, map[string]any{
+		"git_ref":         "release/v1",
+		"runtime_profile": "kata-qemu",
+		"mode":            "mode_b",
+	}, map[string]string{})
+	if updateResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(updateResp.Body)
+		t.Fatalf("expected 200 for update deployment, got %d body=%s", updateResp.StatusCode, string(b))
+	}
+	var updated map[string]any
+	if err := json.NewDecoder(updateResp.Body).Decode(&updated); err != nil {
+		t.Fatal(err)
+	}
+	updateResp.Body.Close()
+	if got, _ := updated["git_ref"].(string); got != "release/v1" {
+		t.Fatalf("expected git_ref release/v1, got %q", got)
+	}
+	if got, _ := updated["runtime_profile"].(string); got != "kata-qemu" {
+		t.Fatalf("expected runtime_profile kata-qemu, got %q", got)
+	}
+	if got, _ := updated["mode"].(string); got != "mode_b" {
+		t.Fatalf("expected mode mode_b, got %q", got)
+	}
+}
+
 func TestControlPlaneSourceValidate(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", "")
 
