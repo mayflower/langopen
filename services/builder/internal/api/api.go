@@ -89,6 +89,7 @@ func New(logger *slog.Logger) *API {
 	r.Use(observability.CorrelationMiddleware(logger))
 
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	r.Handle("/metrics", observability.MetricsHandler())
 	r.Post("/internal/v1/builds/validate", a.validate)
 	r.Post("/internal/v1/builds/job", a.buildJob)
 	r.Post("/internal/v1/builds/trigger", a.triggerBuild)

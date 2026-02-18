@@ -85,6 +85,7 @@ func New(logger *slog.Logger) *API {
 	r.Use(observability.CorrelationMiddleware(logger))
 
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	r.Handle("/metrics", observability.MetricsHandler())
 
 	r.Route("/internal/v1", func(v1 chi.Router) {
 		v1.Post("/sources/validate", a.validateSource)

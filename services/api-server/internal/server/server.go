@@ -133,6 +133,7 @@ func New(logger *slog.Logger) (*Server, error) {
 	r.Use(s.authMiddleware)
 
 	r.Get("/healthz", s.healthz)
+	r.Handle("/metrics", observability.MetricsHandler())
 	r.Get("/docs", s.docs)
 	r.Get("/openapi.json", s.openapi)
 
@@ -169,7 +170,7 @@ func (s *Server) Router() http.Handler { return s.router }
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" || r.URL.Path == "/docs" || r.URL.Path == "/openapi.json" {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/metrics" || r.URL.Path == "/docs" || r.URL.Path == "/openapi.json" {
 			next.ServeHTTP(w, r)
 			return
 		}
