@@ -145,8 +145,13 @@ func New(logger *slog.Logger) (*Server, error) {
 	r.Route("/api/v1", func(api chi.Router) {
 		api.Get("/assistants", s.listAssistants)
 		api.Post("/assistants", s.createAssistant)
+		api.Get("/assistants/{assistant_id}", s.getAssistant)
+		api.Patch("/assistants/{assistant_id}", s.updateAssistant)
+		api.Delete("/assistants/{assistant_id}", s.deleteAssistant)
 		api.Get("/threads", s.listThreads)
 		api.Post("/threads", s.createThread)
+		api.Get("/threads/{thread_id}", s.getThread)
+		api.Delete("/threads/{thread_id}", s.deleteThread)
 		api.Post("/threads/{thread_id}/runs/stream", s.createRunStream)
 		api.Get("/threads/{thread_id}/runs/{run_id}/stream", s.joinRunStream)
 		api.Post("/threads/{thread_id}/runs/{run_id}/cancel", s.cancelRun)
@@ -530,6 +535,157 @@ func (s *Server) createAssistant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, in)
 }
 
+func (s *Server) getAssistant(w http.ResponseWriter, r *http.Request) {
+	assistantID := strings.TrimSpace(chi.URLParam(r, "assistant_id"))
+	if assistantID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_assistant_id", "assistant_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if s.pg != nil {
+		assistant, err := s.getAssistantFromPostgres(r.Context(), projectIDFromContext(r.Context()), assistantID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "assistant_not_found", "assistant not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		writeJSON(w, http.StatusOK, assistant)
+		return
+	}
+
+	s.store.mu.RLock()
+	assistant, ok := s.store.assistants[assistantID]
+	s.store.mu.RUnlock()
+	if !ok {
+		contracts.WriteError(w, http.StatusNotFound, "assistant_not_found", "assistant not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	writeJSON(w, http.StatusOK, assistant)
+}
+
+func (s *Server) updateAssistant(w http.ResponseWriter, r *http.Request) {
+	assistantID := strings.TrimSpace(chi.URLParam(r, "assistant_id"))
+	if assistantID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_assistant_id", "assistant_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	var req struct {
+		GraphID *string            `json:"graph_id"`
+		Config  *map[string]string `json:"config"`
+		Version *string            `json:"version"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if req.GraphID == nil && req.Config == nil && req.Version == nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_assistant_update", "at least one of graph_id, config, version is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	var (
+		graphID *string
+		version *string
+		config  map[string]string
+	)
+	if req.GraphID != nil {
+		v := strings.TrimSpace(*req.GraphID)
+		graphID = &v
+	}
+	if req.Version != nil {
+		v := strings.TrimSpace(*req.Version)
+		version = &v
+	}
+	if req.Config != nil {
+		config = *req.Config
+	}
+
+	if s.pg != nil {
+		assistant, err := s.updateAssistantInPostgres(r.Context(), projectIDFromContext(r.Context()), assistantID, graphID, version, req.Config != nil, config)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "assistant_not_found", "assistant not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusBadRequest, "db_update_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		writeJSON(w, http.StatusOK, assistant)
+		return
+	}
+
+	s.store.mu.Lock()
+	assistant, ok := s.store.assistants[assistantID]
+	if !ok {
+		s.store.mu.Unlock()
+		contracts.WriteError(w, http.StatusNotFound, "assistant_not_found", "assistant not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if graphID != nil && *graphID != "" {
+		assistant.GraphID = *graphID
+	}
+	if version != nil && *version != "" {
+		assistant.Version = *version
+	}
+	if req.Config != nil {
+		assistant.Config = map[string]string{}
+		for k, v := range config {
+			assistant.Config[k] = v
+		}
+	}
+	s.store.assistants[assistantID] = assistant
+	s.store.mu.Unlock()
+	writeJSON(w, http.StatusOK, assistant)
+}
+
+func (s *Server) deleteAssistant(w http.ResponseWriter, r *http.Request) {
+	assistantID := strings.TrimSpace(chi.URLParam(r, "assistant_id"))
+	if assistantID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_assistant_id", "assistant_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if s.pg != nil {
+		if err := s.deleteAssistantFromPostgres(r.Context(), projectIDFromContext(r.Context()), assistantID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "assistant_not_found", "assistant not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_delete_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
+
+	s.store.mu.Lock()
+	if _, ok := s.store.assistants[assistantID]; !ok {
+		s.store.mu.Unlock()
+		contracts.WriteError(w, http.StatusNotFound, "assistant_not_found", "assistant not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	delete(s.store.assistants, assistantID)
+	for threadID, thread := range s.store.threads {
+		if thread.AssistantID == assistantID {
+			delete(s.store.threads, threadID)
+		}
+	}
+	for runID, run := range s.store.runs {
+		if run.AssistantID == assistantID {
+			delete(s.store.runs, runID)
+			delete(s.store.events, runID)
+		}
+	}
+	for cronID, cron := range s.store.crons {
+		if cron.AssistantID == assistantID {
+			delete(s.store.crons, cronID)
+		}
+	}
+	s.store.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 func (s *Server) listThreads(w http.ResponseWriter, r *http.Request) {
 	if s.pg != nil {
 		projectID := projectIDFromContext(r.Context())
@@ -627,6 +783,72 @@ func (s *Server) createThread(w http.ResponseWriter, r *http.Request) {
 	s.store.threads[in.ID] = in
 	s.store.mu.Unlock()
 	writeJSON(w, http.StatusCreated, in)
+}
+
+func (s *Server) getThread(w http.ResponseWriter, r *http.Request) {
+	threadID := strings.TrimSpace(chi.URLParam(r, "thread_id"))
+	if threadID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_thread_id", "thread_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if s.pg != nil {
+		thread, err := s.getThreadFromPostgres(r.Context(), projectIDFromContext(r.Context()), threadID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "thread_not_found", "thread not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		writeJSON(w, http.StatusOK, thread)
+		return
+	}
+
+	s.store.mu.RLock()
+	thread, ok := s.store.threads[threadID]
+	s.store.mu.RUnlock()
+	if !ok {
+		contracts.WriteError(w, http.StatusNotFound, "thread_not_found", "thread not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	writeJSON(w, http.StatusOK, thread)
+}
+
+func (s *Server) deleteThread(w http.ResponseWriter, r *http.Request) {
+	threadID := strings.TrimSpace(chi.URLParam(r, "thread_id"))
+	if threadID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_thread_id", "thread_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if s.pg != nil {
+		if err := s.deleteThreadFromPostgres(r.Context(), projectIDFromContext(r.Context()), threadID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "thread_not_found", "thread not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_delete_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
+
+	s.store.mu.Lock()
+	if _, ok := s.store.threads[threadID]; !ok {
+		s.store.mu.Unlock()
+		contracts.WriteError(w, http.StatusNotFound, "thread_not_found", "thread not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	delete(s.store.threads, threadID)
+	for runID, run := range s.store.runs {
+		if run.ThreadID == threadID {
+			delete(s.store.runs, runID)
+			delete(s.store.events, runID)
+		}
+	}
+	s.store.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) createRunStream(w http.ResponseWriter, r *http.Request) {
@@ -1110,6 +1332,192 @@ func (s *Server) getRunFromPostgres(ctx context.Context, projectID, runID string
 	run.Status = contracts.RunStatus(status)
 	run.MultitaskStrategy = contracts.MultitaskStrategy(strategy)
 	return run, nil
+}
+
+func (s *Server) getAssistantFromPostgres(ctx context.Context, projectID, assistantID string) (contracts.Assistant, error) {
+	var (
+		assistant contracts.Assistant
+		raw       []byte
+	)
+	query := `SELECT a.id, a.deployment_id, a.graph_id, a.config, a.version FROM assistants a`
+	args := []any{assistantID}
+	if projectID == "" {
+		query += ` WHERE a.id=$1`
+	} else {
+		query += `
+			JOIN deployments d ON d.id = a.deployment_id
+			WHERE a.id=$1 AND d.project_id=$2
+		`
+		args = append(args, projectID)
+	}
+	err := s.pg.QueryRow(ctx, query, args...).Scan(&assistant.ID, &assistant.DeploymentID, &assistant.GraphID, &raw, &assistant.Version)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return contracts.Assistant{}, sql.ErrNoRows
+		}
+		return contracts.Assistant{}, err
+	}
+	assistant.Config = map[string]string{}
+	_ = json.Unmarshal(raw, &assistant.Config)
+	return assistant, nil
+}
+
+func (s *Server) updateAssistantInPostgres(ctx context.Context, projectID, assistantID string, graphID, version *string, configSet bool, config map[string]string) (contracts.Assistant, error) {
+	var (
+		configRaw []byte
+		err       error
+	)
+	if configSet {
+		configRaw, err = json.Marshal(config)
+		if err != nil {
+			return contracts.Assistant{}, err
+		}
+	}
+
+	query := `
+		UPDATE assistants a
+		SET graph_id = COALESCE(NULLIF($2,''), a.graph_id),
+		    version = COALESCE(NULLIF($3,''), a.version),
+		    config = CASE WHEN $4::boolean THEN $5::jsonb ELSE a.config END
+	`
+	args := []any{
+		assistantID,
+		nilString(graphID),
+		nilString(version),
+		configSet,
+		configRaw,
+	}
+	if projectID == "" {
+		query += ` WHERE a.id=$1`
+	} else {
+		query += `
+			FROM deployments d
+			WHERE a.id=$1 AND d.id = a.deployment_id AND d.project_id=$6
+		`
+		args = append(args, projectID)
+	}
+	if _, err := s.pg.Exec(ctx, query, args...); err != nil {
+		return contracts.Assistant{}, err
+	}
+	return s.getAssistantFromPostgres(ctx, projectID, assistantID)
+}
+
+func (s *Server) deleteAssistantFromPostgres(ctx context.Context, projectID, assistantID string) error {
+	tx, err := s.pg.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var exists bool
+	checkQuery := `SELECT EXISTS(SELECT 1 FROM assistants WHERE id=$1)`
+	checkArgs := []any{assistantID}
+	if projectID != "" {
+		checkQuery = `
+			SELECT EXISTS(
+				SELECT 1
+				FROM assistants a
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE a.id=$1 AND d.project_id=$2
+			)
+		`
+		checkArgs = append(checkArgs, projectID)
+	}
+	if err := tx.QueryRow(ctx, checkQuery, checkArgs...).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return sql.ErrNoRows
+	}
+
+	_, _ = tx.Exec(ctx, `DELETE FROM webhook_deliveries WHERE run_id IN (SELECT id FROM runs WHERE assistant_id=$1)`, assistantID)
+	_, _ = tx.Exec(ctx, `DELETE FROM checkpoints WHERE run_id IN (SELECT id FROM runs WHERE assistant_id=$1)`, assistantID)
+	_, _ = tx.Exec(ctx, `DELETE FROM checkpoints WHERE thread_id IN (SELECT id FROM threads WHERE assistant_id=$1)`, assistantID)
+	_, _ = tx.Exec(ctx, `DELETE FROM cron_executions WHERE cron_job_id IN (SELECT id FROM cron_jobs WHERE assistant_id=$1)`, assistantID)
+	_, _ = tx.Exec(ctx, `DELETE FROM cron_jobs WHERE assistant_id=$1`, assistantID)
+	_, _ = tx.Exec(ctx, `DELETE FROM runs WHERE assistant_id=$1`, assistantID)
+	_, _ = tx.Exec(ctx, `DELETE FROM threads WHERE assistant_id=$1`, assistantID)
+	_, err = tx.Exec(ctx, `DELETE FROM assistants WHERE id=$1`, assistantID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Server) getThreadFromPostgres(ctx context.Context, projectID, threadID string) (contracts.Thread, error) {
+	var (
+		thread contracts.Thread
+		raw    []byte
+	)
+	query := `SELECT t.id, t.assistant_id, t.metadata, t.updated_at FROM threads t`
+	args := []any{threadID}
+	if projectID == "" {
+		query += ` WHERE t.id=$1`
+	} else {
+		query += `
+			JOIN assistants a ON a.id = t.assistant_id
+			JOIN deployments d ON d.id = a.deployment_id
+			WHERE t.id=$1 AND d.project_id=$2
+		`
+		args = append(args, projectID)
+	}
+	err := s.pg.QueryRow(ctx, query, args...).Scan(&thread.ID, &thread.AssistantID, &raw, &thread.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return contracts.Thread{}, sql.ErrNoRows
+		}
+		return contracts.Thread{}, err
+	}
+	thread.Metadata = map[string]string{}
+	_ = json.Unmarshal(raw, &thread.Metadata)
+	return thread, nil
+}
+
+func (s *Server) deleteThreadFromPostgres(ctx context.Context, projectID, threadID string) error {
+	tx, err := s.pg.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var exists bool
+	checkQuery := `SELECT EXISTS(SELECT 1 FROM threads WHERE id=$1)`
+	checkArgs := []any{threadID}
+	if projectID != "" {
+		checkQuery = `
+			SELECT EXISTS(
+				SELECT 1
+				FROM threads t
+				JOIN assistants a ON a.id = t.assistant_id
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE t.id=$1 AND d.project_id=$2
+			)
+		`
+		checkArgs = append(checkArgs, projectID)
+	}
+	if err := tx.QueryRow(ctx, checkQuery, checkArgs...).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return sql.ErrNoRows
+	}
+
+	_, _ = tx.Exec(ctx, `DELETE FROM webhook_deliveries WHERE run_id IN (SELECT id FROM runs WHERE thread_id=$1)`, threadID)
+	_, _ = tx.Exec(ctx, `DELETE FROM checkpoints WHERE run_id IN (SELECT id FROM runs WHERE thread_id=$1)`, threadID)
+	_, _ = tx.Exec(ctx, `DELETE FROM checkpoints WHERE thread_id=$1`, threadID)
+	_, _ = tx.Exec(ctx, `DELETE FROM runs WHERE thread_id=$1`, threadID)
+	_, err = tx.Exec(ctx, `DELETE FROM threads WHERE id=$1`, threadID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func nilString(input *string) any {
+	if input == nil {
+		return nil
+	}
+	return *input
 }
 
 func (s *Server) listStoreItems(w http.ResponseWriter, r *http.Request) {
