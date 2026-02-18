@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	builderapi "langopen.dev/builder/api"
@@ -42,6 +43,97 @@ func TestValidateLanggraphAndRequirements(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(body))
+	}
+}
+
+func TestValidateRejectsInvalidGraphTarget(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "graph.py"), []byte("graph = object()\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "requirements.txt"), []byte("langgraph\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	langgraphJSON := map[string]any{
+		"graphs":       map[string]string{"default": "graph.py"},
+		"dependencies": []string{"."},
+	}
+	b, _ := json.Marshal(langgraphJSON)
+	if err := os.WriteFile(filepath.Join(tmp, "langgraph.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := builderapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	resp := doBuilderReq(t, ts.URL+"/internal/v1/builds/validate", map[string]any{"repo_path": tmp})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 422, got %d body=%s", resp.StatusCode, string(body))
+	}
+	var result map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result["valid"] != false {
+		t.Fatalf("expected valid=false, got %#v", result["valid"])
+	}
+	errorsList, _ := result["errors"].([]any)
+	found := false
+	for _, item := range errorsList {
+		if msg, _ := item.(string); strings.Contains(msg, "invalid target") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected invalid target error, got %#v", result["errors"])
+	}
+}
+
+func TestValidateRejectsDependencyTraversal(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "graph.py"), []byte("graph = object()\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	langgraphJSON := map[string]any{
+		"graphs":       map[string]string{"default": "graph.py:graph"},
+		"dependencies": []string{"../outside"},
+	}
+	b, _ := json.Marshal(langgraphJSON)
+	if err := os.WriteFile(filepath.Join(tmp, "langgraph.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := builderapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	resp := doBuilderReq(t, ts.URL+"/internal/v1/builds/validate", map[string]any{"repo_path": tmp})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 422, got %d body=%s", resp.StatusCode, string(body))
+	}
+	var result map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result["valid"] != false {
+		t.Fatalf("expected valid=false, got %#v", result["valid"])
+	}
+	errorsList, _ := result["errors"].([]any)
+	found := false
+	for _, item := range errorsList {
+		if msg, _ := item.(string); strings.Contains(msg, "dependency path must be within repo root") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected dependency traversal error, got %#v", result["errors"])
 	}
 }
 
