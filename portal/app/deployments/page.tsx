@@ -14,6 +14,14 @@ type Deployment = {
   updated_at: string;
 };
 
+type SecretBinding = {
+  id: string;
+  deployment_id: string;
+  secret_name: string;
+  target_key?: string;
+  created_at: string;
+};
+
 export default function DeploymentsPage() {
   const [deployments, setDeployments] = useState<Deployment[]>([]);
   const [error, setError] = useState("");
@@ -29,10 +37,21 @@ export default function DeploymentsPage() {
   const [deploymentID, setDeploymentID] = useState("");
   const [imageName, setImageName] = useState("ghcr.io/acme/agent");
   const [commitSHA, setCommitSHA] = useState("abcdef123456");
+  const [secretName, setSecretName] = useState("openai-secret");
+  const [targetKey, setTargetKey] = useState("OPENAI_API_KEY");
+  const [bindings, setBindings] = useState<SecretBinding[]>([]);
 
   useEffect(() => {
     void loadDeployments();
   }, []);
+
+  useEffect(() => {
+    if (deploymentID) {
+      void loadBindings(deploymentID);
+    } else {
+      setBindings([]);
+    }
+  }, [deploymentID]);
 
   async function loadDeployments() {
     try {
@@ -44,6 +63,19 @@ export default function DeploymentsPage() {
       setDeployments(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : "failed to load deployments");
+    }
+  }
+
+  async function loadBindings(depID: string) {
+    try {
+      const resp = await fetch(`/api/platform/control/internal/v1/secrets/bindings?deployment_id=${encodeURIComponent(depID)}`, { cache: "no-store" });
+      if (!resp.ok) {
+        throw new Error(`load bindings failed (${resp.status})`);
+      }
+      const data = (await resp.json()) as SecretBinding[];
+      setBindings(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "failed to load secret bindings");
     }
   }
 
@@ -136,6 +168,61 @@ export default function DeploymentsPage() {
     }
   }
 
+  async function bindSecret(e: FormEvent) {
+    e.preventDefault();
+    if (!deploymentID) {
+      setError("deployment_id is required");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    setStatus("");
+    try {
+      const resp = await fetch("/api/platform/control/internal/v1/secrets/bind", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          deployment_id: deploymentID,
+          secret_name: secretName,
+          target_key: targetKey
+        })
+      });
+      const body = await resp.json();
+      if (!resp.ok) {
+        throw new Error(JSON.stringify(body));
+      }
+      setStatus(`secret bound: ${secretName}`);
+      await loadBindings(deploymentID);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "bind secret failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function unbindSecret(bindingID: string) {
+    setLoading(true);
+    setError("");
+    setStatus("");
+    try {
+      const resp = await fetch(`/api/platform/control/internal/v1/secrets/bindings/${encodeURIComponent(bindingID)}`, {
+        method: "DELETE"
+      });
+      const body = await resp.json();
+      if (!resp.ok) {
+        throw new Error(JSON.stringify(body));
+      }
+      setStatus(`secret binding removed: ${bindingID}`);
+      if (deploymentID) {
+        await loadBindings(deploymentID);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "unbind secret failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
     <main className="hero">
       <h2>Deployments</h2>
@@ -164,6 +251,43 @@ export default function DeploymentsPage() {
           <input value={commitSHA} onChange={(e) => setCommitSHA(e.target.value)} placeholder="commit_sha" />
           <button disabled={loading} type="submit">Build</button>
         </div>
+      </form>
+
+      <form onSubmit={bindSecret} className="card">
+        <h3>Secret Bindings</h3>
+        <div className="row">
+          <input value={deploymentID} onChange={(e) => setDeploymentID(e.target.value)} placeholder="deployment_id" />
+          <input value={secretName} onChange={(e) => setSecretName(e.target.value)} placeholder="secret_name" />
+          <input value={targetKey} onChange={(e) => setTargetKey(e.target.value)} placeholder="target_key" />
+          <button disabled={loading} type="submit">Bind</button>
+          <button disabled={loading || !deploymentID} type="button" onClick={() => void loadBindings(deploymentID)}>Refresh Bindings</button>
+        </div>
+        {bindings.length === 0 ? <p className="muted">No bindings for selected deployment.</p> : (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Secret</th>
+                <th>Target</th>
+                <th>Created</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {bindings.map((b) => (
+                <tr key={b.id}>
+                  <td>{b.id}</td>
+                  <td>{b.secret_name}</td>
+                  <td>{b.target_key || "-"}</td>
+                  <td>{new Date(b.created_at).toLocaleString()}</td>
+                  <td>
+                    <button disabled={loading} type="button" onClick={() => void unbindSecret(b.id)}>Unbind</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </form>
 
       {error ? <p className="warn">{error}</p> : null}
