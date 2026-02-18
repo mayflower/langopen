@@ -20,6 +20,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -42,8 +43,15 @@ type API struct {
 
 	mu     sync.RWMutex
 	builds map[string]buildRecord
+	status map[string]string
 	logs   map[string]string
 }
+
+var (
+	builderMetricsOnce sync.Once
+	buildStatusGauge   *prometheus.GaugeVec
+	buildFailuresTotal prometheus.Counter
+)
 
 type buildRecord struct {
 	ID           string            `json:"id"`
@@ -64,10 +72,12 @@ func New(logger *slog.Logger) *API {
 	a := &API{
 		logger:         logger,
 		builds:         map[string]buildRecord{},
+		status:         map[string]string{},
 		logs:           map[string]string{},
 		executeJobs:    envBoolOrDefault("BUILDKIT_EXECUTE_JOBS", false),
 		buildNamespace: envOrDefault("BUILDKIT_NAMESPACE", "default"),
 	}
+	initBuilderMetrics()
 	if dsn := strings.TrimSpace(os.Getenv("POSTGRES_DSN")); dsn != "" {
 		pool, err := pgxpool.New(context.Background(), dsn)
 		if err != nil {
@@ -239,6 +249,7 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 
 	a.mu.Lock()
 	a.builds[buildID] = rec
+	a.updateBuildMetricsLocked(buildID, "", rec.Status)
 	a.logs[buildID] = logs
 	a.mu.Unlock()
 
@@ -267,6 +278,9 @@ func (a *API) getBuild(w http.ResponseWriter, r *http.Request) {
 	if rec, ok := a.builds[buildID]; ok {
 		a.mu.RUnlock()
 		rec = a.refreshBuildRuntimeStatus(r.Context(), rec)
+		a.mu.Lock()
+		a.updateBuildMetricsLocked(rec.ID, "", rec.Status)
+		a.mu.Unlock()
 		writeJSON(w, http.StatusOK, rec)
 		return
 	}
@@ -287,6 +301,9 @@ func (a *API) getBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec = a.refreshBuildRuntimeStatus(r.Context(), rec)
+	a.mu.Lock()
+	a.updateBuildMetricsLocked(rec.ID, "", rec.Status)
+	a.mu.Unlock()
 	writeJSON(w, http.StatusOK, rec)
 }
 
@@ -333,6 +350,9 @@ func (a *API) getBuildLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec = a.refreshBuildRuntimeStatus(r.Context(), rec)
+	a.mu.Lock()
+	a.updateBuildMetricsLocked(rec.ID, "", rec.Status)
+	a.mu.Unlock()
 	if a.kube != nil {
 		if namespace, jobName, hasJob := parseK8sJobRef(rec, a.buildNamespace); hasJob {
 			jobLogs, err := a.fetchJobLogs(r.Context(), namespace, jobName)
@@ -389,11 +409,13 @@ func (a *API) refreshBuildRuntimeStatus(ctx context.Context, rec buildRecord) bu
 		return rec
 	}
 
+	prevStatus := rec.Status
 	rec.Status = nextStatus
 	rec.JobName = jobName
 	rec.JobSubmitted = true
 	rec.UpdatedAt = time.Now().UTC()
 	a.mu.Lock()
+	a.updateBuildMetricsLocked(rec.ID, prevStatus, nextStatus)
 	a.builds[rec.ID] = rec
 	a.mu.Unlock()
 	if a.pg != nil {
@@ -566,6 +588,39 @@ func envBoolOrDefault(key string, fallback bool) bool {
 		return false
 	default:
 		return fallback
+	}
+}
+
+func initBuilderMetrics() {
+	builderMetricsOnce.Do(func() {
+		buildStatusGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "langopen_builds_status",
+			Help: "Current number of builds by status.",
+		}, []string{"status"})
+		buildFailuresTotal = prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "langopen_build_failures_total",
+			Help: "Total number of failed build outcomes.",
+		})
+		prometheus.MustRegister(buildStatusGauge, buildFailuresTotal)
+	})
+}
+
+func (a *API) updateBuildMetricsLocked(buildID, prevStatus, nextStatus string) {
+	if prevStatus == "" {
+		prevStatus = a.status[buildID]
+	}
+	if prevStatus == nextStatus {
+		return
+	}
+	if prevStatus != "" {
+		buildStatusGauge.WithLabelValues(prevStatus).Dec()
+	}
+	if nextStatus != "" {
+		buildStatusGauge.WithLabelValues(nextStatus).Inc()
+		if nextStatus == "failed" || nextStatus == "failed_validation" {
+			buildFailuresTotal.Inc()
+		}
+		a.status[buildID] = nextStatus
 	}
 }
 

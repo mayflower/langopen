@@ -59,3 +59,30 @@ func TestBuilderHasJobRBAC(t *testing.T) {
 		t.Fatalf("expected worker metrics endpoint wiring in rendered chart")
 	}
 }
+
+func TestObservabilityAlertRulesCoverage(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm not installed")
+	}
+
+	root := filepath.Join("..", "..")
+	cmd := exec.Command("helm", "template", "langopen", filepath.Join(root, "deploy", "helm"), "--set", "observability.alerts.enabled=true")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template failed: %v output=%s", err, string(out))
+	}
+	rendered := string(out)
+
+	requiredAlerts := []string{
+		"LangOpenStuckRuns",
+		"LangOpenBuildFailures",
+		"LangOpenWebhookDeadLetters",
+		"LangOpenWarmPoolDepleted",
+		"LangOpenBackendUnavailable",
+	}
+	for _, alertName := range requiredAlerts {
+		if !strings.Contains(rendered, "alert: "+alertName) {
+			t.Fatalf("missing required alert rule %s", alertName)
+		}
+	}
+}

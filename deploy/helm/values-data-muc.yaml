@@ -61,6 +61,7 @@ portal:
     platformDataApiBaseUrl: http://langopen-api-server
     platformControlApiBaseUrl: http://langopen-control-plane
     grafanaBaseUrl: https://grafana.data.mayflower.zone
+    grafanaDashboardUrl: https://grafana.data.mayflower.zone/d/langopen-overview/langopen-overview
   ingress:
     enabled: true
     className: traefik
@@ -79,3 +80,7 @@ portal:
 
 networkPolicy:
   enabled: true
+
+observability:
+  alerts:
+    enabled: true

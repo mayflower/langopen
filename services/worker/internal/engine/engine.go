@@ -36,6 +36,10 @@ var (
 	workerQueueDepthGauge   prometheus.Gauge
 	workerActiveRunsGauge   prometheus.Gauge
 	sandboxAllocationsTotal *prometheus.CounterVec
+	workerStuckRunsGauge    prometheus.Gauge
+	webhookDeadLettersGauge prometheus.Gauge
+	workerBackendUpGauge    *prometheus.GaugeVec
+	webhookDeliveriesTotal  *prometheus.CounterVec
 )
 
 type Config struct {
@@ -58,6 +62,7 @@ type Worker struct {
 	cronTickInterval    time.Duration
 	webhookPollInterval time.Duration
 	webhookMaxAttempts  int
+	stuckRunThreshold   time.Duration
 }
 
 type pendingRun struct {
@@ -102,6 +107,7 @@ func New(cfg Config, logger *slog.Logger) (*Worker, error) {
 		cronTickInterval:    time.Duration(envIntOrDefault("CRON_TICK_SECONDS", 30)) * time.Second,
 		webhookPollInterval: time.Duration(envIntOrDefault("WEBHOOK_POLL_SECONDS", 5)) * time.Second,
 		webhookMaxAttempts:  envIntOrDefault("WEBHOOK_MAX_ATTEMPTS", 6),
+		stuckRunThreshold:   time.Duration(envIntOrDefault("STUCK_RUN_SECONDS", 300)) * time.Second,
 	}
 	if cfg.PostgresDSN != "" {
 		pg, err := pgxpool.New(context.Background(), cfg.PostgresDSN)
@@ -235,6 +241,7 @@ func (w *Worker) runWebhookLoop(ctx context.Context) error {
 			if err := w.processWebhookOutbox(ctx, time.Now().UTC()); err != nil && !errors.Is(err, context.Canceled) {
 				w.logger.Error("process_webhook_outbox_failed", "error", err)
 			}
+			w.observeOperationalHealth(ctx)
 		}
 	}
 }
@@ -284,6 +291,7 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 				sandboxAllocationsTotal.WithLabelValues("failed").Inc()
 				w.logger.Error("sandbox_allocation_failed", "run_id", run.ID, "error", err)
 				_ = w.updateRunStatus(ctx, run.ID, contracts.RunStatusError)
+				_ = w.updateCronExecutionStatus(ctx, run.ID, "error")
 				w.emitStreamEvent(ctx, run, "run_sandbox_allocation_failed", map[string]any{"run_id": run.ID, "error": err.Error()})
 				if enqueueErr := w.enqueueWebhookForRun(ctx, run.ID); enqueueErr != nil {
 					w.logger.Error("enqueue_webhook_failed", "run_id", run.ID, "error", enqueueErr)
@@ -310,6 +318,7 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 			w.logger.Error("run_rollback_failed", "run_id", run.ID, "error", err)
 			return
 		}
+		_ = w.updateCronExecutionStatus(ctx, run.ID, "rolled_back")
 		w.emitStreamEvent(ctx, run, "run_rolled_back", map[string]any{"run_id": run.ID, "status": "rolled_back"})
 		_ = w.redis.Del(ctx, streamBufferPrefix()+run.ID).Err()
 	case "interrupt":
@@ -317,6 +326,7 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 			w.logger.Error("run_interrupt_failed", "run_id", run.ID, "error", err)
 			return
 		}
+		_ = w.updateCronExecutionStatus(ctx, run.ID, "interrupted")
 		w.emitStreamEvent(ctx, run, "run_interrupted", map[string]any{"run_id": run.ID, "status": "interrupted"})
 		if err := w.enqueueWebhookForRun(ctx, run.ID); err != nil {
 			w.logger.Error("enqueue_webhook_failed", "run_id", run.ID, "error", err)
@@ -326,6 +336,7 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 			w.logger.Error("run_complete_failed", "run_id", run.ID, "error", err)
 			return
 		}
+		_ = w.updateCronExecutionStatus(ctx, run.ID, "success")
 		w.emitStreamEvent(ctx, run, "token", map[string]any{"token": "hello"})
 		w.emitStreamEvent(ctx, run, "run_completed", map[string]any{"run_id": run.ID, "status": "success"})
 		if err := w.enqueueWebhookForRun(ctx, run.ID); err != nil {
@@ -355,6 +366,11 @@ func (w *Worker) rollbackRun(ctx context.Context, runID string) error {
 
 func (w *Worker) updateRunStatus(ctx context.Context, runID string, status contracts.RunStatus) error {
 	_, err := w.pg.Exec(ctx, `UPDATE runs SET status=$2, updated_at=NOW() WHERE id=$1`, runID, status)
+	return err
+}
+
+func (w *Worker) updateCronExecutionStatus(ctx context.Context, runID, status string) error {
+	_, err := w.pg.Exec(ctx, `UPDATE cron_executions SET status=$2 WHERE run_id=$1`, runID, status)
 	return err
 }
 
@@ -554,6 +570,7 @@ func (w *Worker) deliverWebhook(ctx context.Context, item webhookDelivery, now t
 
 	nextAttempts := item.Attempts + 1
 	if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		webhookDeliveriesTotal.WithLabelValues("success").Inc()
 		_, updateErr := w.pg.Exec(ctx, `
 			UPDATE webhook_deliveries
 			SET status='success', attempts=$2, last_error=NULL, updated_at=NOW()
@@ -564,8 +581,9 @@ func (w *Worker) deliverWebhook(ctx context.Context, item webhookDelivery, now t
 
 	status := "retry"
 	if nextAttempts >= w.webhookMaxAttempts {
-		status = "failed"
+		status = "dead_letter"
 	}
+	webhookDeliveriesTotal.WithLabelValues(status).Inc()
 	lastErr := "webhook delivery failed"
 	if err != nil {
 		lastErr = err.Error()
@@ -602,6 +620,35 @@ func backoffDuration(attempts int) time.Duration {
 		seconds = 300
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+func (w *Worker) observeOperationalHealth(ctx context.Context) {
+	if w.pg != nil {
+		var stuckCount int64
+		if err := w.pg.QueryRow(ctx, `
+			SELECT COUNT(1)
+			FROM runs
+			WHERE status='running' AND updated_at < NOW() - ($1::bigint * INTERVAL '1 second')
+		`, int64(w.stuckRunThreshold.Seconds())).Scan(&stuckCount); err != nil {
+			workerBackendUpGauge.WithLabelValues("postgres").Set(0)
+		} else {
+			workerBackendUpGauge.WithLabelValues("postgres").Set(1)
+			workerStuckRunsGauge.Set(float64(stuckCount))
+		}
+
+		var deadLetters int64
+		if err := w.pg.QueryRow(ctx, `SELECT COUNT(1) FROM webhook_deliveries WHERE status='dead_letter'`).Scan(&deadLetters); err == nil {
+			webhookDeadLettersGauge.Set(float64(deadLetters))
+		}
+	}
+
+	if w.redis != nil {
+		if err := w.redis.Ping(ctx).Err(); err != nil {
+			workerBackendUpGauge.WithLabelValues("redis").Set(0)
+		} else {
+			workerBackendUpGauge.WithLabelValues("redis").Set(1)
+		}
+	}
 }
 
 func cancelKeyPrefix() string {
@@ -753,6 +800,30 @@ func initWorkerMetrics() {
 			Name: "langopen_worker_sandbox_allocations_total",
 			Help: "Total sandbox allocation attempts by outcome.",
 		}, []string{"result"})
-		prometheus.MustRegister(workerQueueDepthGauge, workerActiveRunsGauge, sandboxAllocationsTotal)
+		workerStuckRunsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "langopen_worker_stuck_runs",
+			Help: "Count of running runs exceeding stuck threshold.",
+		})
+		webhookDeadLettersGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "langopen_worker_webhook_dead_letters",
+			Help: "Count of webhook deliveries in dead_letter status.",
+		})
+		workerBackendUpGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "langopen_worker_backend_up",
+			Help: "Backend connectivity status by backend (1=up, 0=down).",
+		}, []string{"backend"})
+		webhookDeliveriesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "langopen_worker_webhook_deliveries_total",
+			Help: "Total webhook delivery attempts by resulting state.",
+		}, []string{"result"})
+		prometheus.MustRegister(
+			workerQueueDepthGauge,
+			workerActiveRunsGauge,
+			sandboxAllocationsTotal,
+			workerStuckRunsGauge,
+			webhookDeadLettersGauge,
+			workerBackendUpGauge,
+			webhookDeliveriesTotal,
+		)
 	})
 }

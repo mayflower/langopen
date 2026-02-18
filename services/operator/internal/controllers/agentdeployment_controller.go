@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -22,6 +23,27 @@ import (
 
 	"langopen.dev/operator/internal/apis/v1alpha1"
 )
+
+var (
+	warmPoolConfigured = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "langopen_warm_pool_configured_replicas",
+			Help: "Configured warm pool replicas for mode_b deployments.",
+		},
+		[]string{"namespace", "deployment"},
+	)
+	warmPoolReady = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "langopen_warm_pool_ready_replicas",
+			Help: "Observed ready warm pool replicas for mode_b deployments.",
+		},
+		[]string{"namespace", "deployment"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(warmPoolConfigured, warmPoolReady)
+}
 
 type AgentDeploymentReconciler struct {
 	client.Client
@@ -94,6 +116,9 @@ func (r *AgentDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 			return ctrl.Result{}, err
 		}
+	} else {
+		warmPoolConfigured.WithLabelValues(dep.Namespace, dep.Name).Set(0)
+		warmPoolReady.WithLabelValues(dep.Namespace, dep.Name).Set(0)
 	}
 
 	dep.Status.Ready = true
@@ -304,7 +329,16 @@ func (r *AgentDeploymentReconciler) reconcileSandboxResources(ctx context.Contex
 		"sandboxTemplateRef": map[string]any{"name": templateName},
 		"replicas":           warmPoolReplicas,
 	}
-	return r.reconcileUnstructured(ctx, warmPool)
+	if err := r.reconcileUnstructured(ctx, warmPool); err != nil {
+		return err
+	}
+	ready := warmPoolReplicas
+	if statusReplicas, found, _ := unstructured.NestedInt64(warmPool.Object, "status", "readyReplicas"); found {
+		ready = int32(statusReplicas)
+	}
+	warmPoolConfigured.WithLabelValues(dep.Namespace, dep.Name).Set(float64(warmPoolReplicas))
+	warmPoolReady.WithLabelValues(dep.Namespace, dep.Name).Set(float64(ready))
+	return nil
 }
 
 func (r *AgentDeploymentReconciler) reconcileUnstructured(ctx context.Context, desired *unstructured.Unstructured) error {
@@ -312,7 +346,10 @@ func (r *AgentDeploymentReconciler) reconcileUnstructured(ctx context.Context, d
 	current.SetGroupVersionKind(desired.GroupVersionKind())
 	err := r.Get(ctx, client.ObjectKey{Name: desired.GetName(), Namespace: desired.GetNamespace()}, current)
 	if apierrors.IsNotFound(err) {
-		return r.Create(ctx, desired)
+		if createErr := r.Create(ctx, desired); createErr != nil {
+			return createErr
+		}
+		return r.Get(ctx, client.ObjectKey{Name: desired.GetName(), Namespace: desired.GetNamespace()}, desired)
 	}
 	if err != nil {
 		return err

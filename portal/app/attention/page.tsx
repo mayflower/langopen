@@ -36,7 +36,12 @@ export default async function AttentionPage() {
         <li>degraded dependencies: {degraded ? "yes" : "no"}</li>
       </ul>
       <p>
-        Deep links: {cfg.grafanaBase ? <a href={`${cfg.grafanaBase}/explore`} target="_blank" rel="noreferrer">Grafana Explore</a> : "set GRAFANA_BASE_URL"}
+        Deep links:{" "}
+        {cfg.grafanaExploreUrl ? <a href={cfg.grafanaExploreUrl} target="_blank" rel="noreferrer">Explore</a> : "set GRAFANA_*_URL"}
+        {" | "}
+        {cfg.grafanaTempoUrl ? <a href={cfg.grafanaTempoUrl} target="_blank" rel="noreferrer">Tempo</a> : "set GRAFANA_*_URL"}
+        {" | "}
+        {cfg.grafanaDashboardUrl ? <a href={cfg.grafanaDashboardUrl} target="_blank" rel="noreferrer">Dashboard</a> : "set GRAFANA_*_URL"}
       </p>
     </main>
   );

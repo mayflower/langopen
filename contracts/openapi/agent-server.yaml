@@ -153,6 +153,40 @@ paths:
       responses:
         '201':
           description: Cron created
+  /crons/{cron_id}:
+    get:
+      summary: Get cron job
+      parameters:
+        - in: path
+          name: cron_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Cron job
+    patch:
+      summary: Update cron job
+      parameters:
+        - in: path
+          name: cron_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Cron updated
+    delete:
+      summary: Delete cron job
+      parameters:
+        - in: path
+          name: cron_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Cron deleted
   /system:
     get:
       summary: System info

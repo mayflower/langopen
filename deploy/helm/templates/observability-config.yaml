@@ -43,6 +43,36 @@ data:
               "legendFormat": "queued_or_running"
             }
           ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Stuck Runs",
+          "targets": [
+            {
+              "expr": "sum(langopen_worker_stuck_runs)",
+              "legendFormat": "stuck_runs"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Webhook Dead Letters",
+          "targets": [
+            {
+              "expr": "sum(langopen_worker_webhook_dead_letters)",
+              "legendFormat": "dead_letters"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Warm Pool Health",
+          "targets": [
+            {
+              "expr": "sum(langopen_warm_pool_ready_replicas) / clamp_min(sum(langopen_warm_pool_configured_replicas), 1)",
+              "legendFormat": "ready_ratio"
+            }
+          ]
         }
       ]
     }
@@ -73,4 +103,39 @@ spec:
             severity: warning
           annotations:
             summary: "LangOpen p95 latency exceeds 2s"
+        - alert: LangOpenStuckRuns
+          expr: sum(langopen_worker_stuck_runs) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "LangOpen has stuck runs above SLA"
+        - alert: LangOpenBuildFailures
+          expr: increase(langopen_build_failures_total[15m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "LangOpen build failures detected"
+        - alert: LangOpenWebhookDeadLetters
+          expr: sum(langopen_worker_webhook_dead_letters) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "LangOpen webhook deliveries entered dead-letter state"
+        - alert: LangOpenWarmPoolDepleted
+          expr: sum(langopen_warm_pool_configured_replicas - langopen_warm_pool_ready_replicas) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "LangOpen warm pool ready replicas are below configured target"
+        - alert: LangOpenBackendUnavailable
+          expr: min(langopen_worker_backend_up{backend=~"postgres|redis"}) < 1
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "LangOpen worker backend connectivity degraded (Postgres/Redis)"
 {{- end }}

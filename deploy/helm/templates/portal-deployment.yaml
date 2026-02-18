@@ -50,6 +50,12 @@ spec:
               value: {{ .Values.portal.env.platformApiKey | quote }}
             - name: GRAFANA_BASE_URL
               value: {{ .Values.portal.env.grafanaBaseUrl | quote }}
+            - name: GRAFANA_EXPLORE_URL
+              value: {{ .Values.portal.env.grafanaExploreUrl | quote }}
+            - name: GRAFANA_TEMPO_URL
+              value: {{ .Values.portal.env.grafanaTempoUrl | quote }}
+            - name: GRAFANA_DASHBOARD_URL
+              value: {{ .Values.portal.env.grafanaDashboardUrl | quote }}
             - name: NODE_ENV
               value: production
           {{- range .Values.extraEnv.portal }}

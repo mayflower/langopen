@@ -43,14 +43,28 @@ export async function fetchControl<T>(path: string): Promise<T> {
 }
 
 export function portalRuntimeConfig() {
+  const grafanaBase = trimTrailingSlash(process.env.GRAFANA_BASE_URL || "");
+  const defaultExplore = grafanaBase ? `${grafanaBase}/explore` : "";
+  const defaultTempo = grafanaBase ? `${grafanaBase}/explore?left=%7B%22datasource%22:%22Tempo%22%7D` : "";
+  const defaultDashboard = grafanaBase ? `${grafanaBase}/d/langopen-overview/langopen-overview` : "";
   return {
     dataBase: DATA_BASE,
     controlBase: CONTROL_BASE,
     hasAPIKey: API_KEY.length > 0,
-    grafanaBase: process.env.GRAFANA_BASE_URL || ""
+    grafanaBase,
+    grafanaExploreUrl: process.env.GRAFANA_EXPLORE_URL || defaultExplore,
+    grafanaTempoUrl: process.env.GRAFANA_TEMPO_URL || defaultTempo,
+    grafanaDashboardUrl: process.env.GRAFANA_DASHBOARD_URL || defaultDashboard
   };
 }
 
 function ensureSlash(input: string): string {
   return input.endsWith("/") ? input : `${input}/`;
+}
+
+function trimTrailingSlash(input: string): string {
+  if (!input) {
+    return "";
+  }
+  return input.endsWith("/") ? input.slice(0, -1) : input;
 }

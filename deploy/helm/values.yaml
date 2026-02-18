@@ -101,6 +101,9 @@ portal:
     platformControlApiBaseUrl: "http://langopen-control-plane"
     platformApiKey: ""
     grafanaBaseUrl: ""
+    grafanaExploreUrl: ""
+    grafanaTempoUrl: ""
+    grafanaDashboardUrl: ""
   resources: {}
 
 networkPolicy:

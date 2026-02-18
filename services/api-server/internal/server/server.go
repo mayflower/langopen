@@ -155,6 +155,9 @@ func New(logger *slog.Logger) (*Server, error) {
 		api.Delete("/store/items/{namespace}/{key}", s.deleteStoreItem)
 		api.Get("/crons", s.listCrons)
 		api.Post("/crons", s.createCron)
+		api.Get("/crons/{cron_id}", s.getCron)
+		api.Patch("/crons/{cron_id}", s.updateCron)
+		api.Delete("/crons/{cron_id}", s.deleteCron)
 		api.Get("/system", s.systemInfo)
 		api.Get("/system/health", s.systemHealth)
 	})
@@ -1228,6 +1231,47 @@ func storeKey(namespace, key string) string {
 	return namespace + "\x00" + key
 }
 
+func (s *Server) getCronFromPostgres(ctx context.Context, cronID string) (contracts.CronJob, error) {
+	var cronJob contracts.CronJob
+	err := s.pg.QueryRow(ctx, `SELECT id, assistant_id, schedule, enabled FROM cron_jobs WHERE id=$1`, cronID).
+		Scan(&cronJob.ID, &cronJob.AssistantID, &cronJob.Schedule, &cronJob.Enabled)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return contracts.CronJob{}, sql.ErrNoRows
+		}
+		return contracts.CronJob{}, err
+	}
+	return cronJob, nil
+}
+
+func (s *Server) updateCronInPostgres(ctx context.Context, cronID string, schedule any, enabled any) (contracts.CronJob, error) {
+	var cronJob contracts.CronJob
+	err := s.pg.QueryRow(ctx, `
+		UPDATE cron_jobs
+		SET schedule=COALESCE($2, schedule), enabled=COALESCE($3, enabled), updated_at=NOW()
+		WHERE id=$1
+		RETURNING id, assistant_id, schedule, enabled
+	`, cronID, schedule, enabled).Scan(&cronJob.ID, &cronJob.AssistantID, &cronJob.Schedule, &cronJob.Enabled)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return contracts.CronJob{}, sql.ErrNoRows
+		}
+		return contracts.CronJob{}, err
+	}
+	return cronJob, nil
+}
+
+func (s *Server) deleteCronFromPostgres(ctx context.Context, cronID string) error {
+	tag, err := s.pg.Exec(ctx, `DELETE FROM cron_jobs WHERE id=$1`, cronID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *Server) listCrons(w http.ResponseWriter, r *http.Request) {
 	if s.pg != nil {
 		rows, err := s.pg.Query(r.Context(), `SELECT id, assistant_id, schedule, enabled FROM cron_jobs ORDER BY created_at DESC LIMIT 200`)
@@ -1259,16 +1303,34 @@ func (s *Server) listCrons(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createCron(w http.ResponseWriter, r *http.Request) {
-	var in contracts.CronJob
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	var req struct {
+		AssistantID string `json:"assistant_id"`
+		Schedule    string `json:"schedule"`
+		Enabled     *bool  `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
 		return
 	}
-	if in.AssistantID == "" {
-		in.AssistantID = "asst_default"
+	schedule := strings.TrimSpace(req.Schedule)
+	if schedule == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_cron", "schedule is required", observability.RequestIDFromContext(r.Context()))
+		return
 	}
-	in.ID = contracts.NewID("cron")
-	in.Enabled = true
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	assistantID := strings.TrimSpace(req.AssistantID)
+	if assistantID == "" {
+		assistantID = "asst_default"
+	}
+	in := contracts.CronJob{
+		ID:          contracts.NewID("cron"),
+		AssistantID: assistantID,
+		Schedule:    schedule,
+		Enabled:     enabled,
+	}
 
 	if s.pg != nil {
 		_, err := s.pg.Exec(r.Context(), `INSERT INTO cron_jobs (id, assistant_id, schedule, enabled, created_at, updated_at) VALUES ($1,$2,$3,$4,NOW(),NOW())`, in.ID, in.AssistantID, in.Schedule, in.Enabled)
@@ -1284,6 +1346,134 @@ func (s *Server) createCron(w http.ResponseWriter, r *http.Request) {
 	s.store.crons[in.ID] = in
 	s.store.mu.Unlock()
 	writeJSON(w, http.StatusCreated, in)
+}
+
+func (s *Server) getCron(w http.ResponseWriter, r *http.Request) {
+	cronID := strings.TrimSpace(chi.URLParam(r, "cron_id"))
+	if cronID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_cron_id", "cron_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	if s.pg != nil {
+		cronJob, err := s.getCronFromPostgres(r.Context(), cronID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "cron_not_found", "cron not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		writeJSON(w, http.StatusOK, cronJob)
+		return
+	}
+
+	s.store.mu.RLock()
+	cronJob, ok := s.store.crons[cronID]
+	s.store.mu.RUnlock()
+	if !ok {
+		contracts.WriteError(w, http.StatusNotFound, "cron_not_found", "cron not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	writeJSON(w, http.StatusOK, cronJob)
+}
+
+func (s *Server) updateCron(w http.ResponseWriter, r *http.Request) {
+	cronID := strings.TrimSpace(chi.URLParam(r, "cron_id"))
+	if cronID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_cron_id", "cron_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	var req struct {
+		Schedule *string `json:"schedule"`
+		Enabled  *bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if req.Schedule == nil && req.Enabled == nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_cron_update", "at least one of schedule or enabled is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	var schedule any
+	if req.Schedule != nil {
+		next := strings.TrimSpace(*req.Schedule)
+		if next == "" {
+			contracts.WriteError(w, http.StatusBadRequest, "invalid_cron_update", "schedule must be non-empty when provided", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		schedule = next
+	}
+	var enabled any
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+
+	if s.pg != nil {
+		cronJob, err := s.updateCronInPostgres(r.Context(), cronID, schedule, enabled)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "cron_not_found", "cron not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusBadRequest, "db_update_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		writeJSON(w, http.StatusOK, cronJob)
+		return
+	}
+
+	s.store.mu.Lock()
+	cronJob, ok := s.store.crons[cronID]
+	if !ok {
+		s.store.mu.Unlock()
+		contracts.WriteError(w, http.StatusNotFound, "cron_not_found", "cron not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if schedule != nil {
+		cronJob.Schedule = schedule.(string)
+	}
+	if enabled != nil {
+		cronJob.Enabled = enabled.(bool)
+	}
+	s.store.crons[cronID] = cronJob
+	s.store.mu.Unlock()
+	writeJSON(w, http.StatusOK, cronJob)
+}
+
+func (s *Server) deleteCron(w http.ResponseWriter, r *http.Request) {
+	cronID := strings.TrimSpace(chi.URLParam(r, "cron_id"))
+	if cronID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_cron_id", "cron_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	if s.pg != nil {
+		if err := s.deleteCronFromPostgres(r.Context(), cronID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "cron_not_found", "cron not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_delete_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
+
+	s.store.mu.Lock()
+	if _, ok := s.store.crons[cronID]; !ok {
+		s.store.mu.Unlock()
+		contracts.WriteError(w, http.StatusNotFound, "cron_not_found", "cron not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	delete(s.store.crons, cronID)
+	s.store.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) a2a(w http.ResponseWriter, r *http.Request) {

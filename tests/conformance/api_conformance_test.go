@@ -279,6 +279,111 @@ func TestStoreStatelessRunsAndSystem(t *testing.T) {
 	getRunResp.Body.Close()
 }
 
+func TestCronsCRUD(t *testing.T) {
+	ts, client := newClientServer(t)
+
+	createResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/crons", map[string]any{
+		"assistant_id": "asst_default",
+		"schedule":     "*/5 * * * *",
+		"enabled":      true,
+	}, "test-key")
+	if createResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("create cron status=%d body=%s", createResp.StatusCode, string(body))
+	}
+	var created map[string]any
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	createResp.Body.Close()
+	cronID, _ := created["id"].(string)
+	if cronID == "" {
+		t.Fatal("missing cron id")
+	}
+
+	getReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/crons/"+cronID, nil)
+	getReq.Header.Set("X-Api-Key", "test-key")
+	getResp, err := client.Do(getReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(getResp.Body)
+		t.Fatalf("get cron status=%d body=%s", getResp.StatusCode, string(body))
+	}
+	getResp.Body.Close()
+
+	patchResp := doJSON(t, client, http.MethodPatch, ts.URL+"/api/v1/crons/"+cronID, map[string]any{
+		"schedule": "*/10 * * * *",
+		"enabled":  false,
+	}, "test-key")
+	if patchResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(patchResp.Body)
+		t.Fatalf("patch cron status=%d body=%s", patchResp.StatusCode, string(body))
+	}
+	var patched map[string]any
+	if err := json.NewDecoder(patchResp.Body).Decode(&patched); err != nil {
+		t.Fatal(err)
+	}
+	patchResp.Body.Close()
+	if got, _ := patched["schedule"].(string); got != "*/10 * * * *" {
+		t.Fatalf("expected updated schedule, got %q", got)
+	}
+	if enabled, ok := patched["enabled"].(bool); !ok || enabled {
+		t.Fatalf("expected enabled=false, got %#v", patched["enabled"])
+	}
+
+	listReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/crons", nil)
+	listReq.Header.Set("X-Api-Key", "test-key")
+	listResp, err := client.Do(listReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(listResp.Body)
+		t.Fatalf("list crons status=%d body=%s", listResp.StatusCode, string(body))
+	}
+	var listed []map[string]any
+	if err := json.NewDecoder(listResp.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	listResp.Body.Close()
+	found := false
+	for _, item := range listed {
+		if id, _ := item["id"].(string); id == cronID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("cron %s not found in list", cronID)
+	}
+
+	deleteReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/crons/"+cronID, nil)
+	deleteReq.Header.Set("X-Api-Key", "test-key")
+	deleteResp, err := client.Do(deleteReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(deleteResp.Body)
+		t.Fatalf("delete cron status=%d body=%s", deleteResp.StatusCode, string(body))
+	}
+	deleteResp.Body.Close()
+
+	getAfterDeleteReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/crons/"+cronID, nil)
+	getAfterDeleteReq.Header.Set("X-Api-Key", "test-key")
+	getAfterDeleteResp, err := client.Do(getAfterDeleteReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getAfterDeleteResp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(getAfterDeleteResp.Body)
+		t.Fatalf("expected 404 after delete, got %d body=%s", getAfterDeleteResp.StatusCode, string(body))
+	}
+	getAfterDeleteResp.Body.Close()
+}
+
 func doJSON(t *testing.T, client *http.Client, method, url string, body map[string]any, apiKey string) *http.Response {
 	t.Helper()
 	b, _ := json.Marshal(body)
