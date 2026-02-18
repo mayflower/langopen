@@ -47,7 +47,7 @@ HEALTHZ="$(kcurl "$API_BASE/healthz")"
 kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" "$API_BASE/docs" >/dev/null
 OPENAPI_HEAD="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" "$API_BASE/openapi.json" | head -c 1)"
 [[ "$OPENAPI_HEAD" == "{" ]] || fail "openapi.json was not JSON"
-METRICS_HEAD="$(kcurl "$API_BASE/metrics" | head -n 1)"
+METRICS_HEAD="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" "$API_BASE/metrics" | head -n 1)"
 [[ "$METRICS_HEAD" == \#* ]] || fail "api metrics endpoint unavailable"
 
 THREAD_JSON="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{}' "$API_BASE/api/v1/threads")"

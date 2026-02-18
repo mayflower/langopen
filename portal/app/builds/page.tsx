@@ -45,7 +45,12 @@ export default async function BuildsPage() {
                 <td>{b.commit_sha}</td>
                 <td>{b.status}</td>
                 <td>{b.image_digest || "-"}</td>
-                <td>{b.logs_ref || "-"}</td>
+                <td>
+                  <a href={`/api/platform/control/internal/v1/builds/${encodeURIComponent(b.id)}/logs`} target="_blank" rel="noreferrer">
+                    View Logs
+                  </a>
+                  {b.logs_ref ? <> ({b.logs_ref})</> : null}
+                </td>
               </tr>
             ))}
           </tbody>

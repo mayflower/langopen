@@ -116,18 +116,33 @@ func TestControlPlaneDeploymentAndBuildTrigger(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", "")
 
 	builderMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/internal/v1/builds/trigger" {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/internal/v1/builds/trigger":
+			writeJSONResp(t, w, http.StatusAccepted, map[string]any{
+				"id":            "build_mock_1",
+				"deployment_id": "dep_mock_1",
+				"status":        "succeeded",
+				"commit_sha":    "abc123",
+				"image_digest":  "sha256:deadbeef",
+				"logs_ref":      "inline://builds/build_mock_1",
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/internal/v1/builds/build_mock_1":
+			writeJSONResp(t, w, http.StatusOK, map[string]any{
+				"id":            "build_mock_1",
+				"deployment_id": "dep_mock_1",
+				"status":        "succeeded",
+				"commit_sha":    "abc123",
+				"image_digest":  "sha256:deadbeef",
+				"logs_ref":      "inline://builds/build_mock_1",
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/internal/v1/builds/build_mock_1/logs":
+			writeJSONResp(t, w, http.StatusOK, map[string]any{
+				"build_id": "build_mock_1",
+				"logs":     "line1\nline2",
+			})
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		writeJSONResp(t, w, http.StatusAccepted, map[string]any{
-			"id":            "build_mock_1",
-			"deployment_id": "dep_mock_1",
-			"status":        "succeeded",
-			"commit_sha":    "abc123",
-			"image_digest":  "sha256:deadbeef",
-			"logs_ref":      "inline://builds/build_mock_1",
-		})
 	}))
 	defer builderMock.Close()
 	t.Setenv("BUILDER_URL", builderMock.URL)
@@ -162,11 +177,42 @@ func TestControlPlaneDeploymentAndBuildTrigger(t *testing.T) {
 		"image_name":    "ghcr.io/acme/agent",
 		"repo_path":     ".",
 	})
-	defer buildResp.Body.Close()
 	if buildResp.StatusCode != http.StatusAccepted {
 		b, _ := io.ReadAll(buildResp.Body)
 		t.Fatalf("expected 202, got %d body=%s", buildResp.StatusCode, string(b))
 	}
+	var build map[string]any
+	if err := json.NewDecoder(buildResp.Body).Decode(&build); err != nil {
+		t.Fatal(err)
+	}
+	buildResp.Body.Close()
+
+	buildID, _ := build["id"].(string)
+	if buildID == "" {
+		t.Fatal("missing build id")
+	}
+
+	statusReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/builds/"+buildID, nil)
+	statusResp, err := http.DefaultClient.Do(statusReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statusResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(statusResp.Body)
+		t.Fatalf("expected 200 for build status, got %d body=%s", statusResp.StatusCode, string(b))
+	}
+	statusResp.Body.Close()
+
+	logsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/builds/"+buildID+"/logs", nil)
+	logsResp, err := http.DefaultClient.Do(logsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logsResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(logsResp.Body)
+		t.Fatalf("expected 200 for build logs, got %d body=%s", logsResp.StatusCode, string(b))
+	}
+	logsResp.Body.Close()
 }
 
 func TestControlPlaneSourceValidate(t *testing.T) {
@@ -200,6 +246,126 @@ func TestControlPlaneSourceValidate(t *testing.T) {
 	}
 }
 
+func TestControlPlaneAPIKeyLifecycle(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://example.invalid")
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doControlPlaneReq(t, ts.URL+"/internal/v1/api-keys", map[string]any{
+		"project_id": "proj_default",
+		"name":       "integration",
+	})
+	if createResp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("expected 201, got %d body=%s", createResp.StatusCode, string(b))
+	}
+	var created map[string]any
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	createResp.Body.Close()
+	keyID, _ := created["id"].(string)
+	rawKey, _ := created["key"].(string)
+	if keyID == "" || rawKey == "" {
+		t.Fatalf("missing key id or plaintext key in create response: %#v", created)
+	}
+
+	listReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/api-keys?project_id=proj_default", nil)
+	listResp, err := http.DefaultClient.Do(listReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(listResp.Body)
+		t.Fatalf("expected 200, got %d body=%s", listResp.StatusCode, string(b))
+	}
+	var listed []map[string]any
+	if err := json.NewDecoder(listResp.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	listResp.Body.Close()
+	found := false
+	for _, item := range listed {
+		if id, _ := item["id"].(string); id == keyID {
+			if _, hasSecret := item["key"]; hasSecret {
+				t.Fatalf("list response must not include plaintext key")
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("created key %s not found in list", keyID)
+	}
+
+	revokeResp := doControlPlaneReq(t, ts.URL+"/internal/v1/api-keys/"+keyID+"/revoke", map[string]any{})
+	if revokeResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(revokeResp.Body)
+		t.Fatalf("expected 200, got %d body=%s", revokeResp.StatusCode, string(b))
+	}
+	revokeResp.Body.Close()
+}
+
+func TestControlPlaneSecretBindingLifecycle(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://example.invalid")
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doControlPlaneReq(t, ts.URL+"/internal/v1/deployments", map[string]any{
+		"project_id": "proj_default",
+		"repo_url":   "https://github.com/acme/agent",
+		"git_ref":    "main",
+		"repo_path":  ".",
+	})
+	if createResp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("expected 201, got %d body=%s", createResp.StatusCode, string(b))
+	}
+	var dep map[string]any
+	if err := json.NewDecoder(createResp.Body).Decode(&dep); err != nil {
+		t.Fatal(err)
+	}
+	createResp.Body.Close()
+	depID, _ := dep["id"].(string)
+	if depID == "" {
+		t.Fatal("missing deployment id")
+	}
+
+	bindResp := doControlPlaneReq(t, ts.URL+"/internal/v1/secrets/bind", map[string]any{
+		"deployment_id": depID,
+		"secret_name":   "openai-secret",
+		"target_key":    "OPENAI_API_KEY",
+	})
+	if bindResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(bindResp.Body)
+		t.Fatalf("expected 200, got %d body=%s", bindResp.StatusCode, string(b))
+	}
+	bindResp.Body.Close()
+
+	listReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/secrets/bindings?deployment_id="+depID, nil)
+	listResp, err := http.DefaultClient.Do(listReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(listResp.Body)
+		t.Fatalf("expected 200, got %d body=%s", listResp.StatusCode, string(b))
+	}
+	var bindings []map[string]any
+	if err := json.NewDecoder(listResp.Body).Decode(&bindings); err != nil {
+		t.Fatal(err)
+	}
+	listResp.Body.Close()
+	if len(bindings) == 0 {
+		t.Fatal("expected at least one secret binding")
+	}
+}
+
 func TestMigrationContainsRequiredIndexes(t *testing.T) {
 	root := filepath.Join("..", "..")
 	raw, err := os.ReadFile(filepath.Join(root, "db", "migrations", "001_init.sql"))
@@ -221,6 +387,14 @@ func TestMigrationContainsRequiredIndexes(t *testing.T) {
 	}
 	if len(content) == 0 {
 		t.Fatal("migration file is empty")
+	}
+
+	secretBindingsRaw, err := os.ReadFile(filepath.Join(root, "db", "migrations", "002_secret_bindings.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(secretBindingsRaw, []byte("deployment_secret_bindings")) {
+		t.Fatal("missing deployment_secret_bindings migration")
 	}
 }
 

@@ -3,13 +3,18 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -35,6 +40,7 @@ type API struct {
 type state struct {
 	Deployments []map[string]any
 	Builds      []map[string]any
+	APIKeys     []map[string]any
 	Audit       []map[string]any
 	Secrets     []map[string]any
 }
@@ -61,6 +67,22 @@ type buildRecord struct {
 	LogsRef      string    `json:"logs_ref,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type apiKeyRecord struct {
+	ID        string     `json:"id"`
+	ProjectID string     `json:"project_id"`
+	Name      string     `json:"name"`
+	CreatedAt time.Time  `json:"created_at"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+}
+
+type secretBindingRecord struct {
+	ID           string    `json:"id"`
+	DeploymentID string    `json:"deployment_id"`
+	SecretName   string    `json:"secret_name"`
+	TargetKey    string    `json:"target_key,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 func New(logger *slog.Logger) *API {
@@ -93,8 +115,14 @@ func New(logger *slog.Logger) *API {
 		v1.Get("/deployments", a.listDeployments)
 		v1.Post("/builds", a.triggerBuild)
 		v1.Get("/builds", a.listBuilds)
+		v1.Get("/builds/{build_id}", a.getBuild)
+		v1.Get("/builds/{build_id}/logs", a.getBuildLogs)
+		v1.Get("/api-keys", a.listAPIKeys)
+		v1.Post("/api-keys", a.createAPIKey)
+		v1.Post("/api-keys/{key_id}/revoke", a.revokeAPIKey)
 		v1.Post("/policies/runtime", a.setRuntimePolicy)
 		v1.Post("/secrets/bind", a.bindSecret)
+		v1.Get("/secrets/bindings", a.listSecretBindings)
 		v1.Get("/audit", a.listAudit)
 	})
 	a.router = r
@@ -345,6 +373,63 @@ func (a *API) listBuilds(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.state.Builds)
 }
 
+func (a *API) getBuild(w http.ResponseWriter, r *http.Request) {
+	buildID := strings.TrimSpace(chi.URLParam(r, "build_id"))
+	if buildID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_build_id", "build_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	builderPath := "/internal/v1/builds/" + url.PathEscape(buildID)
+	if resp, status, err := a.callBuilderMethod(r.Context(), http.MethodGet, builderPath, nil); err == nil {
+		writeJSON(w, status, resp)
+		return
+	}
+
+	if a.pg != nil {
+		var rec buildRecord
+		err := a.pg.QueryRow(r.Context(), `
+			SELECT id, deployment_id, status, commit_sha, COALESCE(image_digest,''), COALESCE(logs_ref,''), created_at, updated_at
+			FROM builds WHERE id=$1
+		`, buildID).Scan(&rec.ID, &rec.DeploymentID, &rec.Status, &rec.CommitSHA, &rec.ImageDigest, &rec.LogsRef, &rec.CreatedAt, &rec.UpdatedAt)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "build_not_found", "build not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		writeJSON(w, http.StatusOK, rec)
+		return
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, item := range a.state.Builds {
+		if id, _ := item["id"].(string); id == buildID {
+			writeJSON(w, http.StatusOK, item)
+			return
+		}
+	}
+	contracts.WriteError(w, http.StatusNotFound, "build_not_found", "build not found", observability.RequestIDFromContext(r.Context()))
+}
+
+func (a *API) getBuildLogs(w http.ResponseWriter, r *http.Request) {
+	buildID := strings.TrimSpace(chi.URLParam(r, "build_id"))
+	if buildID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_build_id", "build_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	builderPath := "/internal/v1/builds/" + url.PathEscape(buildID) + "/logs"
+	resp, status, err := a.callBuilderMethod(r.Context(), http.MethodGet, builderPath, nil)
+	if err != nil {
+		contracts.WriteError(w, http.StatusBadGateway, "build_logs_fetch_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	writeJSON(w, status, resp)
+}
+
 func (a *API) setRuntimePolicy(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DeploymentID   string `json:"deployment_id"`
@@ -392,30 +477,279 @@ func (a *API) setRuntimePolicy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "applied", "policy": req})
 }
 
-func (a *API) bindSecret(w http.ResponseWriter, r *http.Request) {
-	var req map[string]any
+func (a *API) listAPIKeys(w http.ResponseWriter, r *http.Request) {
+	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+	if projectID == "" {
+		projectID = "proj_default"
+	}
+
+	if a.pg != nil {
+		rows, err := a.pg.Query(r.Context(), `
+			SELECT id, project_id, name, created_at, revoked_at
+			FROM api_keys
+			WHERE project_id=$1
+			ORDER BY created_at DESC
+			LIMIT 500
+		`, projectID)
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		defer rows.Close()
+		out := make([]apiKeyRecord, 0)
+		for rows.Next() {
+			var rec apiKeyRecord
+			var revokedAt sql.NullTime
+			if err := rows.Scan(&rec.ID, &rec.ProjectID, &rec.Name, &rec.CreatedAt, &revokedAt); err != nil {
+				contracts.WriteError(w, http.StatusInternalServerError, "db_scan_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			if revokedAt.Valid {
+				rt := revokedAt.Time
+				rec.RevokedAt = &rt
+			}
+			out = append(out, rec)
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make([]map[string]any, 0)
+	for _, item := range a.state.APIKeys {
+		if p, _ := item["project_id"].(string); p == projectID {
+			out = append(out, map[string]any{
+				"id":         item["id"],
+				"project_id": item["project_id"],
+				"name":       item["name"],
+				"created_at": item["created_at"],
+				"revoked_at": item["revoked_at"],
+			})
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *API) createAPIKey(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ProjectID string `json:"project_id"`
+		Name      string `json:"name"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	projectID := strings.TrimSpace(req.ProjectID)
+	if projectID == "" {
+		projectID = "proj_default"
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = "api-key"
+	}
+
+	rawKey, err := generateAPIKey()
+	if err != nil {
+		contracts.WriteError(w, http.StatusInternalServerError, "api_key_generation_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	keyID := contracts.NewID("key")
+	now := time.Now().UTC()
+	keyHash := hashAPIKey(rawKey)
+
+	if a.pg != nil {
+		_, err := a.pg.Exec(r.Context(), `
+			INSERT INTO api_keys (id, project_id, name, key_hash, created_at, revoked_at)
+			VALUES ($1,$2,$3,$4,$5,NULL)
+		`, keyID, projectID, name, keyHash, now)
+		if err != nil {
+			contracts.WriteError(w, http.StatusBadRequest, "db_insert_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		_ = a.writeAudit(r.Context(), projectID, "api_key.created", map[string]any{"key_id": keyID, "name": name})
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"id":         keyID,
+			"project_id": projectID,
+			"name":       name,
+			"key":        rawKey,
+			"created_at": now,
+		})
+		return
+	}
+
+	entry := map[string]any{
+		"id":         keyID,
+		"project_id": projectID,
+		"name":       name,
+		"created_at": now,
+		"revoked_at": nil,
+		"key_hash":   keyHash,
+	}
+	a.mu.Lock()
+	a.state.APIKeys = append(a.state.APIKeys, entry)
+	a.mu.Unlock()
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":         keyID,
+		"project_id": projectID,
+		"name":       name,
+		"key":        rawKey,
+		"created_at": now,
+	})
+}
+
+func (a *API) revokeAPIKey(w http.ResponseWriter, r *http.Request) {
+	keyID := strings.TrimSpace(chi.URLParam(r, "key_id"))
+	if keyID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_key_id", "key_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	if a.pg != nil {
+		var projectID string
+		err := a.pg.QueryRow(r.Context(), `
+			UPDATE api_keys
+			SET revoked_at=NOW()
+			WHERE id=$1 AND revoked_at IS NULL
+			RETURNING project_id
+		`, keyID).Scan(&projectID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "api_key_not_found", "api key not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_update_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		_ = a.writeAudit(r.Context(), projectID, "api_key.revoked", map[string]any{"key_id": keyID})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "revoked", "key_id": keyID})
+		return
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, item := range a.state.APIKeys {
+		if id, _ := item["id"].(string); id == keyID {
+			now := time.Now().UTC()
+			item["revoked_at"] = now
+			writeJSON(w, http.StatusOK, map[string]any{"status": "revoked", "key_id": keyID})
+			return
+		}
+	}
+	contracts.WriteError(w, http.StatusNotFound, "api_key_not_found", "api key not found", observability.RequestIDFromContext(r.Context()))
+}
+
+func (a *API) bindSecret(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DeploymentID string `json:"deployment_id"`
+		SecretName   string `json:"secret_name"`
+		TargetKey    string `json:"target_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	req.DeploymentID = strings.TrimSpace(req.DeploymentID)
+	req.SecretName = strings.TrimSpace(req.SecretName)
+	req.TargetKey = strings.TrimSpace(req.TargetKey)
+	if req.DeploymentID == "" || req.SecretName == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_secret_binding", "deployment_id and secret_name are required", observability.RequestIDFromContext(r.Context()))
 		return
 	}
 
 	event := map[string]any{"event": "secret.bound", "timestamp": time.Now().UTC(), "binding": req}
 	if a.pg != nil {
-		projectID := "proj_default"
-		if deploymentID, ok := req["deployment_id"].(string); ok && deploymentID != "" {
-			dep, err := a.getDeployment(r.Context(), deploymentID)
-			if err == nil {
-				projectID = dep.ProjectID
-			}
+		_, err := a.pg.Exec(r.Context(), `
+			INSERT INTO deployment_secret_bindings (id, deployment_id, secret_name, target_key, created_at)
+			VALUES ($1,$2,$3,NULLIF($4,''),NOW())
+			ON CONFLICT (deployment_id, secret_name, target_key) DO NOTHING
+		`, contracts.NewID("sb"), req.DeploymentID, req.SecretName, req.TargetKey)
+		if err != nil {
+			contracts.WriteError(w, http.StatusBadRequest, "db_insert_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
 		}
-		_ = a.writeAudit(r.Context(), projectID, "secret.bound", req)
+
+		projectID := "proj_default"
+		if dep, err := a.getDeployment(r.Context(), req.DeploymentID); err == nil {
+			projectID = dep.ProjectID
+		}
+		_ = a.writeAudit(r.Context(), projectID, "secret.bound", map[string]any{
+			"deployment_id": req.DeploymentID,
+			"secret_name":   req.SecretName,
+			"target_key":    req.TargetKey,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "bound", "deployment_id": req.DeploymentID, "secret_name": req.SecretName})
+		return
 	} else {
 		a.mu.Lock()
-		a.state.Secrets = append(a.state.Secrets, req)
+		exists := false
+		for _, item := range a.state.Secrets {
+			if dep, _ := item["deployment_id"].(string); dep == req.DeploymentID {
+				if sec, _ := item["secret_name"].(string); sec == req.SecretName {
+					if key, _ := item["target_key"].(string); key == req.TargetKey {
+						exists = true
+						break
+					}
+				}
+			}
+		}
+		if !exists {
+			a.state.Secrets = append(a.state.Secrets, map[string]any{
+				"id":            contracts.NewID("sb"),
+				"deployment_id": req.DeploymentID,
+				"secret_name":   req.SecretName,
+				"target_key":    req.TargetKey,
+				"created_at":    time.Now().UTC(),
+			})
+		}
 		a.state.Audit = append(a.state.Audit, event)
 		a.mu.Unlock()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "bound"})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "bound", "deployment_id": req.DeploymentID, "secret_name": req.SecretName})
+}
+
+func (a *API) listSecretBindings(w http.ResponseWriter, r *http.Request) {
+	deploymentID := strings.TrimSpace(r.URL.Query().Get("deployment_id"))
+	if deploymentID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_request", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	if a.pg != nil {
+		rows, err := a.pg.Query(r.Context(), `
+			SELECT id, deployment_id, secret_name, COALESCE(target_key,''), created_at
+			FROM deployment_secret_bindings
+			WHERE deployment_id=$1
+			ORDER BY created_at DESC
+			LIMIT 200
+		`, deploymentID)
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		defer rows.Close()
+		out := make([]secretBindingRecord, 0)
+		for rows.Next() {
+			var rec secretBindingRecord
+			if err := rows.Scan(&rec.ID, &rec.DeploymentID, &rec.SecretName, &rec.TargetKey, &rec.CreatedAt); err != nil {
+				contracts.WriteError(w, http.StatusInternalServerError, "db_scan_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			out = append(out, rec)
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make([]map[string]any, 0)
+	for _, item := range a.state.Secrets {
+		if dep, _ := item["deployment_id"].(string); dep == deploymentID {
+			out = append(out, item)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {
@@ -484,16 +818,26 @@ func (a *API) getDeployment(ctx context.Context, deploymentID string) (deploymen
 }
 
 func (a *API) callBuilder(ctx context.Context, path string, payload map[string]any) (map[string]any, int, error) {
+	return a.callBuilderMethod(ctx, http.MethodPost, path, payload)
+}
+
+func (a *API) callBuilderMethod(ctx context.Context, method, path string, payload map[string]any) (map[string]any, int, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, 0, err
 	}
 	url := a.builder + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	var reader io.Reader
+	if payload != nil && (method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch) {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, reader)
 	if err != nil {
 		return nil, 0, err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if reader != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		return nil, 0, err
@@ -519,6 +863,19 @@ func (a *API) writeAudit(ctx context.Context, projectID, eventType string, paylo
 		VALUES ($1,$2,$3,$4,$5,NOW())
 	`, contracts.NewID("audit"), projectID, "system", eventType, raw)
 	return err
+}
+
+func generateAPIKey() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return "lko_" + base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+func hashAPIKey(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
 }
 
 func mapFromDeployment(rec deploymentRecord) map[string]any {
