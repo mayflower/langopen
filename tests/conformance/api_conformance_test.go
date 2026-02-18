@@ -306,6 +306,22 @@ func TestRunStreamResumeAndReplay(t *testing.T) {
 	if !strings.Contains(string(data), "id: 1") {
 		t.Fatalf("expected replay to include id 1, got: %s", string(data))
 	}
+
+	resumeReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/threads/"+thread.ID+"/runs/"+runID+"/stream", nil)
+	resumeReq.Header.Set("X-Api-Key", "test-key")
+	resumeReq.Header.Set("Last-Event-ID", "1")
+	resumeResp, err := client.Do(resumeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resumeResp.Body.Close()
+	resumed, _ := io.ReadAll(resumeResp.Body)
+	if strings.Contains(string(resumed), "id: 1") {
+		t.Fatalf("expected resume-from-1 to skip id 1, got: %s", string(resumed))
+	}
+	if !strings.Contains(string(resumed), "id: 2") {
+		t.Fatalf("expected resume-from-1 to include id 2, got: %s", string(resumed))
+	}
 }
 
 func TestCancelInterruptAndRollback(t *testing.T) {
@@ -328,11 +344,46 @@ func TestCancelInterruptAndRollback(t *testing.T) {
 	}
 	interrupt.Body.Close()
 
-	rollback := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/threads/"+thread.ID+"/runs/"+runID+"/cancel?action=rollback", map[string]any{}, "test-key")
+	getInterruptedReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/runs/"+runID, nil)
+	getInterruptedReq.Header.Set("X-Api-Key", "test-key")
+	getInterruptedResp, err := client.Do(getInterruptedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getInterruptedResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(getInterruptedResp.Body)
+		t.Fatalf("get interrupted run status=%d body=%s", getInterruptedResp.StatusCode, string(body))
+	}
+	var interruptedRun map[string]any
+	if err := json.NewDecoder(getInterruptedResp.Body).Decode(&interruptedRun); err != nil {
+		t.Fatal(err)
+	}
+	getInterruptedResp.Body.Close()
+	if status, _ := interruptedRun["status"].(string); status != "interrupted" {
+		t.Fatalf("expected interrupted status, got %q", status)
+	}
+
+	streamResp2 := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/threads/"+thread.ID+"/runs/stream", map[string]any{}, "test-key")
+	defer streamResp2.Body.Close()
+	runID2 := findRunID(t, streamResp2.Body)
+
+	rollback := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/threads/"+thread.ID+"/runs/"+runID2+"/cancel?action=rollback", map[string]any{}, "test-key")
 	if rollback.StatusCode != http.StatusOK {
 		t.Fatalf("rollback status=%d", rollback.StatusCode)
 	}
 	rollback.Body.Close()
+
+	getRolledBackReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/runs/"+runID2, nil)
+	getRolledBackReq.Header.Set("X-Api-Key", "test-key")
+	getRolledBackResp, err := client.Do(getRolledBackReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getRolledBackResp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(getRolledBackResp.Body)
+		t.Fatalf("expected 404 after rollback, got %d body=%s", getRolledBackResp.StatusCode, string(body))
+	}
+	getRolledBackResp.Body.Close()
 }
 
 func TestA2AAndMCP(t *testing.T) {
