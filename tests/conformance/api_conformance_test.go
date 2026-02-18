@@ -137,6 +137,22 @@ func TestA2AAndMCP(t *testing.T) {
 		t.Fatalf("expected a2a stream event, got: %s", string(streamBytes))
 	}
 
+	a2aCancelBody := map[string]any{"jsonrpc": "2.0", "id": "cancel1", "method": "tasks/cancel", "params": map[string]any{"taskId": "task_x"}}
+	a2aCancelResp := doJSON(t, client, http.MethodPost, ts.URL+"/a2a/asst_1", a2aCancelBody, "test-key")
+	if a2aCancelResp.StatusCode != http.StatusOK {
+		t.Fatalf("a2a cancel status=%d", a2aCancelResp.StatusCode)
+	}
+	var a2aCancelResult map[string]any
+	if err := json.NewDecoder(a2aCancelResp.Body).Decode(&a2aCancelResult); err != nil {
+		t.Fatal(err)
+	}
+	a2aCancelResp.Body.Close()
+	if errObj, ok := a2aCancelResult["error"].(map[string]any); !ok {
+		t.Fatalf("expected tasks/cancel error response, got %#v", a2aCancelResult)
+	} else if code, ok := errObj["code"].(float64); !ok || int(code) != -32001 {
+		t.Fatalf("unexpected tasks/cancel error code: %#v", errObj["code"])
+	}
+
 	mcpResp := doJSON(t, client, http.MethodPost, ts.URL+"/mcp", map[string]any{"jsonrpc": "2.0", "id": "1", "method": "initialize"}, "test-key")
 	if mcpResp.StatusCode != http.StatusOK {
 		t.Fatalf("mcp status=%d", mcpResp.StatusCode)

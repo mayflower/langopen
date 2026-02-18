@@ -105,6 +105,20 @@ func (r *AgentDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
+	if dep.Spec.IngressEnabled && strings.TrimSpace(dep.Spec.IngressHost) != "" {
+		ing := desiredIngress(&dep)
+		if err := ctrl.SetControllerReference(&dep, ing, r.Scheme); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.reconcileIngress(ctx, ing); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else {
+		if err := r.deleteIngressIfExists(ctx, dep.Namespace, dep.Name); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	if mode == "mode_b" {
 		if err := r.reconcileSandboxResources(ctx, &dep, runtimeClass); err != nil {
 			if apimeta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
@@ -170,6 +184,31 @@ func (r *AgentDeploymentReconciler) reconcileNetworkPolicy(ctx context.Context, 
 	}
 	current.Spec = desired.Spec
 	return r.Update(ctx, current)
+}
+
+func (r *AgentDeploymentReconciler) reconcileIngress(ctx context.Context, desired *networkingv1.Ingress) error {
+	current := &networkingv1.Ingress{}
+	err := r.Get(ctx, client.ObjectKey{Name: desired.Name, Namespace: desired.Namespace}, current)
+	if apierrors.IsNotFound(err) {
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+	current.Spec = desired.Spec
+	return r.Update(ctx, current)
+}
+
+func (r *AgentDeploymentReconciler) deleteIngressIfExists(ctx context.Context, namespace, name string) error {
+	ing := &networkingv1.Ingress{}
+	err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, ing)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return r.Delete(ctx, ing)
 }
 
 func desiredAPIDeployment(dep *v1alpha1.AgentDeployment, image, runtimeClass string, replicas int32) *appsv1.Deployment {
@@ -284,6 +323,42 @@ func desiredNetworkPolicy(dep *v1alpha1.AgentDeployment) *networkingv1.NetworkPo
 	}
 }
 
+func desiredIngress(dep *v1alpha1.AgentDeployment) *networkingv1.Ingress {
+	pathType := networkingv1.PathTypePrefix
+	spec := networkingv1.IngressSpec{
+		Rules: []networkingv1.IngressRule{{
+			Host: dep.Spec.IngressHost,
+			IngressRuleValue: networkingv1.IngressRuleValue{
+				HTTP: &networkingv1.HTTPIngressRuleValue{
+					Paths: []networkingv1.HTTPIngressPath{{
+						Path:     "/",
+						PathType: &pathType,
+						Backend: networkingv1.IngressBackend{
+							Service: &networkingv1.IngressServiceBackend{
+								Name: dep.Name,
+								Port: networkingv1.ServiceBackendPort{Number: 80},
+							},
+						},
+					}},
+				},
+			},
+		}},
+	}
+	if className := strings.TrimSpace(dep.Spec.IngressClassName); className != "" {
+		spec.IngressClassName = &className
+	}
+	if tlsSecret := strings.TrimSpace(dep.Spec.IngressTLSSecretRef); tlsSecret != "" {
+		spec.TLS = []networkingv1.IngressTLS{{
+			Hosts:      []string{dep.Spec.IngressHost},
+			SecretName: tlsSecret,
+		}}
+	}
+	return &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Name: dep.Name, Namespace: dep.Namespace},
+		Spec:       spec,
+	}
+}
+
 func (r *AgentDeploymentReconciler) reconcileSandboxResources(ctx context.Context, dep *v1alpha1.AgentDeployment, runtimeClass string) error {
 	groupVersion := schema.GroupVersion{Group: "extensions.agents.x-k8s.io", Version: "v1alpha1"}
 	templateName := strings.TrimSpace(dep.Spec.SandboxTemplate)
@@ -394,6 +469,7 @@ func (r *AgentDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&networkingv1.NetworkPolicy{}).
+		Owns(&networkingv1.Ingress{}).
 		Complete(r)
 }
 

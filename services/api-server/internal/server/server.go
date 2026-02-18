@@ -1520,6 +1520,17 @@ func (s *Server) a2a(w http.ResponseWriter, r *http.Request) {
 		streamSSE(w, r, events, startFrom)
 		return
 	}
+	if req.Method == "tasks/cancel" && !envBoolOrDefault("A2A_TASKS_CANCEL_SUPPORTED", false) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"error": map[string]any{
+				"code":    -32001,
+				"message": "tasks/cancel unsupported",
+			},
+		})
+		return
+	}
 
 	result := map[string]any{
 		"accepted":  true,

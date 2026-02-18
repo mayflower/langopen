@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -83,6 +84,32 @@ func TestObservabilityAlertRulesCoverage(t *testing.T) {
 	for _, alertName := range requiredAlerts {
 		if !strings.Contains(rendered, "alert: "+alertName) {
 			t.Fatalf("missing required alert rule %s", alertName)
+		}
+	}
+}
+
+func TestAgentDeploymentCRDIncludesIngressFields(t *testing.T) {
+	root := filepath.Join("..", "..")
+	paths := []string{
+		filepath.Join(root, "deploy", "k8s", "crds", "agentdeployment.yaml"),
+		filepath.Join(root, "deploy", "helm", "crds", "agentdeployment.yaml"),
+	}
+	required := []string{
+		"ingressEnabled:",
+		"ingressHost:",
+		"ingressClassName:",
+		"ingressTLSSecretRef:",
+	}
+	for _, p := range paths {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		content := string(raw)
+		for _, needle := range required {
+			if !strings.Contains(content, needle) {
+				t.Fatalf("missing %q in %s", needle, p)
+			}
 		}
 	}
 }

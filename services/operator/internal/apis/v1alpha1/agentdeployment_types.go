@@ -6,14 +6,18 @@ import (
 )
 
 type AgentDeploymentSpec struct {
-	Image            string   `json:"image"`
-	RollbackImage    string   `json:"rollbackImage,omitempty"`
-	Replicas         *int32   `json:"replicas,omitempty"`
-	RuntimeClassName string   `json:"runtimeClassName,omitempty"`
-	Mode             string   `json:"mode,omitempty"`
-	EgressAllowlist  []string `json:"egressAllowlist,omitempty"`
-	SandboxTemplate  string   `json:"sandboxTemplate,omitempty"`
-	WarmPoolReplicas *int32   `json:"warmPoolReplicas,omitempty"`
+	Image               string   `json:"image"`
+	RollbackImage       string   `json:"rollbackImage,omitempty"`
+	Replicas            *int32   `json:"replicas,omitempty"`
+	RuntimeClassName    string   `json:"runtimeClassName,omitempty"`
+	Mode                string   `json:"mode,omitempty"`
+	EgressAllowlist     []string `json:"egressAllowlist,omitempty"`
+	IngressEnabled      bool     `json:"ingressEnabled,omitempty"`
+	IngressHost         string   `json:"ingressHost,omitempty"`
+	IngressClassName    string   `json:"ingressClassName,omitempty"`
+	IngressTLSSecretRef string   `json:"ingressTLSSecretRef,omitempty"`
+	SandboxTemplate     string   `json:"sandboxTemplate,omitempty"`
+	WarmPoolReplicas    *int32   `json:"warmPoolReplicas,omitempty"`
 }
 
 type AgentDeploymentStatus struct {
