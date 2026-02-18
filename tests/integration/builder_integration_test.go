@@ -369,6 +369,28 @@ func TestControlPlaneDeploymentGetAndUpdate(t *testing.T) {
 	if got, _ := updated["mode"].(string); got != "mode_b" {
 		t.Fatalf("expected mode mode_b, got %q", got)
 	}
+
+	deleteReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/internal/v1/deployments/"+depID, nil)
+	deleteResp, err := http.DefaultClient.Do(deleteReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(deleteResp.Body)
+		t.Fatalf("expected 200 for delete deployment, got %d body=%s", deleteResp.StatusCode, string(b))
+	}
+	deleteResp.Body.Close()
+
+	getAfterDeleteReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/deployments/"+depID, nil)
+	getAfterDeleteResp, err := http.DefaultClient.Do(getAfterDeleteReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getAfterDeleteResp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(getAfterDeleteResp.Body)
+		t.Fatalf("expected 404 after delete, got %d body=%s", getAfterDeleteResp.StatusCode, string(b))
+	}
+	getAfterDeleteResp.Body.Close()
 }
 
 func TestControlPlaneListFiltersByProject(t *testing.T) {

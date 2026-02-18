@@ -116,6 +116,7 @@ func New(logger *slog.Logger) *API {
 		v1.Get("/deployments", a.listDeployments)
 		v1.Get("/deployments/{deployment_id}", a.getDeploymentByID)
 		v1.Patch("/deployments/{deployment_id}", a.updateDeployment)
+		v1.Delete("/deployments/{deployment_id}", a.deleteDeployment)
 		v1.Post("/builds", a.triggerBuild)
 		v1.Get("/builds", a.listBuilds)
 		v1.Get("/builds/{build_id}", a.getBuild)
@@ -472,6 +473,105 @@ func (a *API) updateDeployment(w http.ResponseWriter, r *http.Request) {
 	})
 	a.mu.Unlock()
 	writeJSON(w, http.StatusOK, rec)
+}
+
+func (a *API) deleteDeployment(w http.ResponseWriter, r *http.Request) {
+	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
+	if deploymentID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	rec, err := a.getDeployment(r.Context(), deploymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	if a.pg != nil {
+		tx, err := a.pg.BeginTx(r.Context(), pgx.TxOptions{})
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_begin_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		defer func() { _ = tx.Rollback(r.Context()) }()
+
+		_, _ = tx.Exec(r.Context(), `DELETE FROM webhook_deliveries WHERE run_id IN (SELECT r.id FROM runs r JOIN assistants a ON a.id = r.assistant_id WHERE a.deployment_id=$1)`, deploymentID)
+		_, _ = tx.Exec(r.Context(), `DELETE FROM checkpoints WHERE run_id IN (SELECT r.id FROM runs r JOIN assistants a ON a.id = r.assistant_id WHERE a.deployment_id=$1)`, deploymentID)
+		_, _ = tx.Exec(r.Context(), `DELETE FROM checkpoints WHERE thread_id IN (SELECT t.id FROM threads t JOIN assistants a ON a.id = t.assistant_id WHERE a.deployment_id=$1)`, deploymentID)
+		_, _ = tx.Exec(r.Context(), `DELETE FROM cron_executions WHERE cron_job_id IN (SELECT cj.id FROM cron_jobs cj JOIN assistants a ON a.id = cj.assistant_id WHERE a.deployment_id=$1)`, deploymentID)
+		_, _ = tx.Exec(r.Context(), `DELETE FROM cron_jobs WHERE assistant_id IN (SELECT id FROM assistants WHERE deployment_id=$1)`, deploymentID)
+		_, _ = tx.Exec(r.Context(), `DELETE FROM runs WHERE assistant_id IN (SELECT id FROM assistants WHERE deployment_id=$1)`, deploymentID)
+		_, _ = tx.Exec(r.Context(), `DELETE FROM threads WHERE assistant_id IN (SELECT id FROM assistants WHERE deployment_id=$1)`, deploymentID)
+		_, _ = tx.Exec(r.Context(), `DELETE FROM assistants WHERE deployment_id=$1`, deploymentID)
+		_, _ = tx.Exec(r.Context(), `DELETE FROM builds WHERE deployment_id=$1`, deploymentID)
+		_, _ = tx.Exec(r.Context(), `DELETE FROM deployment_secret_bindings WHERE deployment_id=$1`, deploymentID)
+		tag, err := tx.Exec(r.Context(), `DELETE FROM deployments WHERE id=$1`, deploymentID)
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_delete_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		if tag.RowsAffected() == 0 {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		if err := tx.Commit(r.Context()); err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_commit_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		_ = a.writeAudit(r.Context(), rec.ProjectID, "deployment.deleted", map[string]any{
+			"deployment_id": rec.ID,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "deployment_id": deploymentID})
+		return
+	}
+
+	a.mu.Lock()
+	remainingDeployments := make([]map[string]any, 0, len(a.state.Deployments))
+	found := false
+	for _, dep := range a.state.Deployments {
+		if id, _ := dep["id"].(string); id == deploymentID {
+			found = true
+			continue
+		}
+		remainingDeployments = append(remainingDeployments, dep)
+	}
+	if !found {
+		a.mu.Unlock()
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	a.state.Deployments = remainingDeployments
+
+	remainingBuilds := make([]map[string]any, 0, len(a.state.Builds))
+	for _, build := range a.state.Builds {
+		if depID, _ := build["deployment_id"].(string); depID == deploymentID {
+			continue
+		}
+		remainingBuilds = append(remainingBuilds, build)
+	}
+	a.state.Builds = remainingBuilds
+
+	remainingSecrets := make([]map[string]any, 0, len(a.state.Secrets))
+	for _, secret := range a.state.Secrets {
+		if depID, _ := secret["deployment_id"].(string); depID == deploymentID {
+			continue
+		}
+		remainingSecrets = append(remainingSecrets, secret)
+	}
+	a.state.Secrets = remainingSecrets
+
+	a.state.Audit = append(a.state.Audit, map[string]any{
+		"event":         "deployment.deleted",
+		"timestamp":     time.Now().UTC(),
+		"deployment_id": deploymentID,
+	})
+	a.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "deployment_id": deploymentID})
 }
 
 func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
