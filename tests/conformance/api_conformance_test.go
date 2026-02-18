@@ -46,6 +46,31 @@ func TestDocsAndOpenAPI(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("/openapi.json status = %d", resp.StatusCode)
 	}
+	var spec map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&spec); err != nil {
+		t.Fatalf("decode openapi: %v", err)
+	}
+	paths, _ := spec["paths"].(map[string]any)
+	required := []string{
+		"/assistants",
+		"/assistants/{assistant_id}",
+		"/threads",
+		"/threads/{thread_id}",
+		"/threads/{thread_id}/runs/stream",
+		"/threads/{thread_id}/runs/{run_id}/stream",
+		"/runs/stream",
+		"/runs/{run_id}",
+		"/store/items",
+		"/crons",
+		"/a2a/{assistant_id}",
+		"/mcp",
+		"/system/attention",
+	}
+	for _, path := range required {
+		if _, ok := paths[path]; !ok {
+			t.Fatalf("openapi missing required path %s", path)
+		}
+	}
 }
 
 func TestDataPlaneRBAC(t *testing.T) {
@@ -77,6 +102,114 @@ func TestDataPlaneRBAC(t *testing.T) {
 		t.Fatalf("expected 200 for viewer thread list, got %d body=%s", viewerListResp.StatusCode, string(body))
 	}
 	viewerListResp.Body.Close()
+}
+
+func TestAssistantsAndThreadsCRUD(t *testing.T) {
+	ts, client := newClientServer(t)
+
+	createAssistantResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/assistants", map[string]any{
+		"deployment_id": "dep_default",
+		"graph_id":      "graph_1",
+		"config":        map[string]any{"mode": "test"},
+		"version":       "v1",
+	}, "test-key")
+	if createAssistantResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(createAssistantResp.Body)
+		t.Fatalf("create assistant status=%d body=%s", createAssistantResp.StatusCode, string(body))
+	}
+	var assistant map[string]any
+	if err := json.NewDecoder(createAssistantResp.Body).Decode(&assistant); err != nil {
+		t.Fatal(err)
+	}
+	createAssistantResp.Body.Close()
+	assistantID, _ := assistant["id"].(string)
+	if assistantID == "" {
+		t.Fatal("missing assistant id")
+	}
+
+	getAssistantReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/assistants/"+assistantID, nil)
+	getAssistantReq.Header.Set("X-Api-Key", "test-key")
+	getAssistantResp, err := client.Do(getAssistantReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getAssistantResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(getAssistantResp.Body)
+		t.Fatalf("get assistant status=%d body=%s", getAssistantResp.StatusCode, string(body))
+	}
+	getAssistantResp.Body.Close()
+
+	updateAssistantResp := doJSON(t, client, http.MethodPatch, ts.URL+"/api/v1/assistants/"+assistantID, map[string]any{
+		"graph_id": "graph_2",
+		"version":  "v2",
+		"config":   map[string]any{"mode": "prod"},
+	}, "test-key")
+	if updateAssistantResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(updateAssistantResp.Body)
+		t.Fatalf("update assistant status=%d body=%s", updateAssistantResp.StatusCode, string(body))
+	}
+	var updatedAssistant map[string]any
+	if err := json.NewDecoder(updateAssistantResp.Body).Decode(&updatedAssistant); err != nil {
+		t.Fatal(err)
+	}
+	updateAssistantResp.Body.Close()
+	if got, _ := updatedAssistant["graph_id"].(string); got != "graph_2" {
+		t.Fatalf("expected graph_id=graph_2 got %q", got)
+	}
+
+	createThreadResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/threads", map[string]any{
+		"assistant_id": assistantID,
+		"metadata":     map[string]any{"source": "conformance"},
+	}, "test-key")
+	if createThreadResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(createThreadResp.Body)
+		t.Fatalf("create thread status=%d body=%s", createThreadResp.StatusCode, string(body))
+	}
+	var thread map[string]any
+	if err := json.NewDecoder(createThreadResp.Body).Decode(&thread); err != nil {
+		t.Fatal(err)
+	}
+	createThreadResp.Body.Close()
+	threadID, _ := thread["id"].(string)
+	if threadID == "" {
+		t.Fatal("missing thread id")
+	}
+
+	getThreadReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/threads/"+threadID, nil)
+	getThreadReq.Header.Set("X-Api-Key", "test-key")
+	getThreadResp, err := client.Do(getThreadReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getThreadResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(getThreadResp.Body)
+		t.Fatalf("get thread status=%d body=%s", getThreadResp.StatusCode, string(body))
+	}
+	getThreadResp.Body.Close()
+
+	deleteThreadReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/threads/"+threadID, nil)
+	deleteThreadReq.Header.Set("X-Api-Key", "test-key")
+	deleteThreadResp, err := client.Do(deleteThreadReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteThreadResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(deleteThreadResp.Body)
+		t.Fatalf("delete thread status=%d body=%s", deleteThreadResp.StatusCode, string(body))
+	}
+	deleteThreadResp.Body.Close()
+
+	deleteAssistantReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/assistants/"+assistantID, nil)
+	deleteAssistantReq.Header.Set("X-Api-Key", "test-key")
+	deleteAssistantResp, err := client.Do(deleteAssistantReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteAssistantResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(deleteAssistantResp.Body)
+		t.Fatalf("delete assistant status=%d body=%s", deleteAssistantResp.StatusCode, string(body))
+	}
+	deleteAssistantResp.Body.Close()
 }
 
 func TestRunStreamResumeAndReplay(t *testing.T) {
