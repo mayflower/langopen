@@ -169,6 +169,37 @@ func TestControlPlaneDeploymentAndBuildTrigger(t *testing.T) {
 	}
 }
 
+func TestControlPlaneSourceValidate(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+
+	builderMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/internal/v1/builds/validate" {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSONResp(t, w, http.StatusOK, map[string]any{
+			"valid":    true,
+			"errors":   []string{},
+			"warnings": []string{},
+		})
+	}))
+	defer builderMock.Close()
+	t.Setenv("BUILDER_URL", builderMock.URL)
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	resp := doControlPlaneReq(t, ts.URL+"/internal/v1/sources/validate", map[string]any{
+		"repo_path": ".",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(b))
+	}
+}
+
 func TestMigrationContainsRequiredIndexes(t *testing.T) {
 	root := filepath.Join("..", "..")
 	raw, err := os.ReadFile(filepath.Join(root, "db", "migrations", "001_init.sql"))

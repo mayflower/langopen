@@ -42,6 +42,8 @@ controlPlane:
 builder:
   enabled: true
   replicas: 1
+  executeJobs: true
+  buildNamespace: langopen
 
 operator:
   enabled: true

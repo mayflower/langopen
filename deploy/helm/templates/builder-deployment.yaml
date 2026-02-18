@@ -1,0 +1,122 @@
+{{- if .Values.builder.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "langopen.fullname" . }}-builder
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: builder
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "langopen.fullname" . }}-builder
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: builder
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "langopen.fullname" . }}-builder
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: builder
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "langopen.fullname" . }}-builder
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "langopen.fullname" . }}-builder
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "langopen.fullname" . }}-builder
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: builder
+spec:
+  replicas: {{ .Values.builder.replicas }}
+  selector:
+    matchLabels:
+      {{- include "langopen.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: builder
+  template:
+    metadata:
+      labels:
+        {{- include "langopen.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: builder
+    spec:
+      {{- if .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      {{- if .Values.builder.runtimeClassName }}
+      runtimeClassName: {{ .Values.builder.runtimeClassName }}
+      {{- end }}
+      serviceAccountName: {{ include "langopen.fullname" . }}-builder
+      automountServiceAccountToken: false
+      containers:
+        - name: builder
+          image: {{ include "langopen.image" (dict "Values" .Values "component" "builder") | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.builder.service.targetPort }}
+              name: http
+          env:
+            - name: POSTGRES_DSN
+              value: {{ .Values.env.postgresDsn | quote }}
+            - name: BUILDKIT_EXECUTE_JOBS
+              value: {{ ternary "true" "false" .Values.builder.executeJobs | quote }}
+            - name: BUILDKIT_NAMESPACE
+              value: {{ default .Release.Namespace .Values.builder.buildNamespace | quote }}
+          {{- range .Values.extraEnv.builder }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+          {{- end }}
+          {{- if or .Values.global.envFromSecret (gt (len .Values.extraEnvFrom.builder) 0) }}
+          envFrom:
+            {{- if .Values.global.envFromSecret }}
+            - secretRef:
+                name: {{ .Values.global.envFromSecret }}
+            {{- end }}
+            {{- with .Values.extraEnvFrom.builder }}
+{{ toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          resources:
+            {{- toYaml .Values.builder.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "langopen.fullname" . }}-builder
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: builder
+spec:
+  type: {{ .Values.builder.service.type }}
+  selector:
+    {{- include "langopen.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: builder
+  ports:
+    - name: http
+      port: {{ .Values.builder.service.port }}
+      targetPort: {{ .Values.builder.service.targetPort }}
+{{- end }}

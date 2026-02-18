@@ -19,15 +19,25 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"langopen.dev/builder/internal/langgraph"
 	"langopen.dev/pkg/contracts"
 	"langopen.dev/pkg/observability"
 )
 
 type API struct {
-	logger *slog.Logger
-	router chi.Router
-	pg     *pgxpool.Pool
+	logger         *slog.Logger
+	router         chi.Router
+	pg             *pgxpool.Pool
+	executeJobs    bool
+	buildNamespace string
+	kube           kubernetes.Interface
 
 	mu     sync.RWMutex
 	builds map[string]buildRecord
@@ -41,6 +51,8 @@ type buildRecord struct {
 	CommitSHA    string            `json:"commit_sha"`
 	ImageName    string            `json:"image_name,omitempty"`
 	ImageDigest  string            `json:"image_digest,omitempty"`
+	JobName      string            `json:"job_name,omitempty"`
+	JobSubmitted bool              `json:"job_submitted"`
 	LogsRef      string            `json:"logs_ref,omitempty"`
 	LokiLabels   map[string]string `json:"loki_labels,omitempty"`
 	CreatedAt    time.Time         `json:"created_at"`
@@ -49,9 +61,11 @@ type buildRecord struct {
 
 func New(logger *slog.Logger) *API {
 	a := &API{
-		logger: logger,
-		builds: map[string]buildRecord{},
-		logs:   map[string]string{},
+		logger:         logger,
+		builds:         map[string]buildRecord{},
+		logs:           map[string]string{},
+		executeJobs:    envBoolOrDefault("BUILDKIT_EXECUTE_JOBS", false),
+		buildNamespace: envOrDefault("BUILDKIT_NAMESPACE", "default"),
 	}
 	if dsn := strings.TrimSpace(os.Getenv("POSTGRES_DSN")); dsn != "" {
 		pool, err := pgxpool.New(context.Background(), dsn)
@@ -59,6 +73,15 @@ func New(logger *slog.Logger) *API {
 			logger.Error("builder_postgres_connect_failed", "error", err)
 		} else {
 			a.pg = pool
+		}
+	}
+	if a.executeJobs {
+		kube, err := initKubeClient()
+		if err != nil {
+			logger.Error("builder_kube_client_init_failed", "error", err)
+			a.executeJobs = false
+		} else {
+			a.kube = kube
 		}
 	}
 
@@ -157,6 +180,27 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 	buildID := contracts.NewID("build")
 	now := time.Now().UTC()
 	digest := digestFor(req.ImageName, req.CommitSHA)
+	buildStatus := "succeeded"
+	jobName := ""
+	jobSubmitted := false
+	logsRef := "inline://builds/" + buildID
+
+	if a.executeJobs {
+		jobSpec, err := langgraph.BuildKitJobSpec(req.RepoURL, req.GitRef, req.ImageName, req.CommitSHA)
+		if err != nil {
+			contracts.WriteError(w, http.StatusBadRequest, "invalid_request", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		jobName, err = a.submitBuildJob(r.Context(), jobSpec)
+		if err != nil {
+			contracts.WriteError(w, http.StatusBadGateway, "build_job_submit_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		buildStatus = "queued"
+		jobSubmitted = true
+		logsRef = fmt.Sprintf("k8s://%s/jobs/%s", a.buildNamespace, jobName)
+	}
+
 	labels := map[string]string{
 		"service":       "builder",
 		"build_id":      buildID,
@@ -164,22 +208,27 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		"commit_sha":    req.CommitSHA,
 	}
 	logLines := []string{
-		fmt.Sprintf("build_id=%s status=queued", buildID),
+		fmt.Sprintf("build_id=%s status=%s", buildID, buildStatus),
 		"builder=buildkit-rootless image=moby/buildkit:rootless",
 		fmt.Sprintf("source repo=%s ref=%s", req.RepoURL, req.GitRef),
 		fmt.Sprintf("target image=%s:%s digest=%s", req.ImageName, req.CommitSHA, digest),
-		"status=succeeded",
+	}
+	if jobSubmitted {
+		logLines = append(logLines, fmt.Sprintf("job_submitted namespace=%s name=%s", a.buildNamespace, jobName))
+	} else {
+		logLines = append(logLines, "status=succeeded")
 	}
 	logs := strings.Join(logLines, "\n")
-	logsRef := "inline://builds/" + buildID
 
 	rec := buildRecord{
 		ID:           buildID,
 		DeploymentID: req.DeploymentID,
-		Status:       "succeeded",
+		Status:       buildStatus,
 		CommitSHA:    req.CommitSHA,
 		ImageName:    req.ImageName,
 		ImageDigest:  digest,
+		JobName:      jobName,
+		JobSubmitted: jobSubmitted,
 		LogsRef:      logsRef,
 		LokiLabels:   labels,
 		CreatedAt:    now,
@@ -288,9 +337,90 @@ func (a *API) getBuildFromPostgres(ctx context.Context, buildID string) (buildRe
 	return rec, nil
 }
 
+func (a *API) submitBuildJob(ctx context.Context, jobSpec map[string]any) (string, error) {
+	if a.kube == nil {
+		return "", errors.New("kubernetes client is not configured")
+	}
+	raw, err := json.Marshal(jobSpec)
+	if err != nil {
+		return "", err
+	}
+	var job batchv1.Job
+	if err := json.Unmarshal(raw, &job); err != nil {
+		return "", fmt.Errorf("decode job spec: %w", err)
+	}
+	if job.Namespace == "" {
+		job.Namespace = a.buildNamespace
+	}
+	if job.Spec.Template.Spec.RestartPolicy == "" {
+		job.Spec.Template.Spec.RestartPolicy = corev1.RestartPolicyNever
+	}
+	if job.Name != "" {
+		job.GenerateName = job.Name + "-"
+		job.Name = ""
+	}
+
+	created, err := a.kube.BatchV1().Jobs(job.Namespace).Create(ctx, &job, metav1.CreateOptions{})
+	if err != nil {
+		if k8serrors.IsAlreadyExists(err) {
+			job.Name = ""
+			if job.GenerateName == "" {
+				job.GenerateName = "buildkit-"
+			}
+			created, err = a.kube.BatchV1().Jobs(job.Namespace).Create(ctx, &job, metav1.CreateOptions{})
+		}
+	}
+	if err != nil {
+		return "", err
+	}
+	return created.Name, nil
+}
+
+func initKubeClient() (kubernetes.Interface, error) {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		kubeconfig := strings.TrimSpace(os.Getenv("KUBECONFIG"))
+		if kubeconfig == "" {
+			home, homeErr := os.UserHomeDir()
+			if homeErr == nil {
+				kubeconfig = filepath.Join(home, ".kube", "config")
+			}
+		}
+		if kubeconfig != "" {
+			cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return kubernetes.NewForConfig(cfg)
+}
+
 func digestFor(imageName, commitSHA string) string {
 	sum := sha256.Sum256([]byte(imageName + "@" + commitSHA))
 	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func envOrDefault(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func envBoolOrDefault(key string, fallback bool) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	switch value {
+	case "1", "t", "true", "yes", "y", "on":
+		return true
+	case "0", "f", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

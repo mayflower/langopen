@@ -12,6 +12,8 @@ type AgentDeploymentSpec struct {
 	RuntimeClassName string   `json:"runtimeClassName,omitempty"`
 	Mode             string   `json:"mode,omitempty"`
 	EgressAllowlist  []string `json:"egressAllowlist,omitempty"`
+	SandboxTemplate  string   `json:"sandboxTemplate,omitempty"`
+	WarmPoolReplicas *int32   `json:"warmPoolReplicas,omitempty"`
 }
 
 type AgentDeploymentStatus struct {
@@ -51,6 +53,10 @@ func (in *AgentDeployment) DeepCopyObject() runtime.Object {
 	}
 	if len(in.Spec.EgressAllowlist) > 0 {
 		out.Spec.EgressAllowlist = append([]string(nil), in.Spec.EgressAllowlist...)
+	}
+	if in.Spec.WarmPoolReplicas != nil {
+		replicas := *in.Spec.WarmPoolReplicas
+		out.Spec.WarmPoolReplicas = &replicas
 	}
 	return out
 }

@@ -60,6 +60,8 @@ builder:
   enabled: true
   replicas: 1
   runtimeClassName: gvisor
+  executeJobs: false
+  buildNamespace: ""
   service:
     type: ClusterIP
     port: 80

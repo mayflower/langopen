@@ -40,6 +40,11 @@ spec:
                   type: array
                   items:
                     type: string
+                sandboxTemplate:
+                  type: string
+                warmPoolReplicas:
+                  type: integer
+                  minimum: 0
             status:
               type: object
               properties:

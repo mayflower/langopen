@@ -5,13 +5,17 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -77,6 +81,19 @@ func (r *AgentDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 	if err := r.reconcileNetworkPolicy(ctx, np); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	if mode == "mode_b" {
+		if err := r.reconcileSandboxResources(ctx, &dep, runtimeClass); err != nil {
+			if apimeta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+				dep.Status.Ready = false
+				dep.Status.ObservedGeneration = dep.Generation
+				dep.Status.Message = "sandbox CRDs missing; install Agent Sandbox CRDs for mode_b"
+				_ = r.Status().Update(ctx, &dep)
+				return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+			}
+			return ctrl.Result{}, err
+		}
 	}
 
 	dep.Status.Ready = true
@@ -232,6 +249,68 @@ func desiredNetworkPolicy(dep *v1alpha1.AgentDeployment) *networkingv1.NetworkPo
 			Egress:      egressRules,
 		},
 	}
+}
+
+func (r *AgentDeploymentReconciler) reconcileSandboxResources(ctx context.Context, dep *v1alpha1.AgentDeployment, runtimeClass string) error {
+	groupVersion := schema.GroupVersion{Group: "extensions.agents.x-k8s.io", Version: "v1alpha1"}
+	templateName := strings.TrimSpace(dep.Spec.SandboxTemplate)
+	if templateName == "" {
+		templateName = dep.Name + "-sandbox-template"
+	}
+
+	template := &unstructured.Unstructured{}
+	template.SetGroupVersionKind(groupVersion.WithKind("SandboxTemplate"))
+	template.SetNamespace(dep.Namespace)
+	template.SetName(templateName)
+	template.Object["spec"] = map[string]any{
+		"podTemplate": map[string]any{
+			"spec": map[string]any{
+				"runtimeClassName":             runtimeClass,
+				"automountServiceAccountToken": false,
+				"containers": []map[string]any{{
+					"name":    "sandbox",
+					"image":   dep.Spec.Image,
+					"command": []string{"/bin/sh", "-c", "sleep infinity"},
+					"securityContext": map[string]any{
+						"runAsNonRoot":             true,
+						"allowPrivilegeEscalation": false,
+						"readOnlyRootFilesystem":   true,
+					},
+				}},
+			},
+		},
+	}
+	if err := r.reconcileUnstructured(ctx, template); err != nil {
+		return err
+	}
+
+	warmPoolReplicas := int32(1)
+	if dep.Spec.WarmPoolReplicas != nil {
+		warmPoolReplicas = *dep.Spec.WarmPoolReplicas
+	}
+	warmPool := &unstructured.Unstructured{}
+	warmPool.SetGroupVersionKind(groupVersion.WithKind("SandboxWarmPool"))
+	warmPool.SetNamespace(dep.Namespace)
+	warmPool.SetName(dep.Name + "-warm-pool")
+	warmPool.Object["spec"] = map[string]any{
+		"sandboxTemplateRef": map[string]any{"name": templateName},
+		"replicas":           warmPoolReplicas,
+	}
+	return r.reconcileUnstructured(ctx, warmPool)
+}
+
+func (r *AgentDeploymentReconciler) reconcileUnstructured(ctx context.Context, desired *unstructured.Unstructured) error {
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(desired.GroupVersionKind())
+	err := r.Get(ctx, client.ObjectKey{Name: desired.GetName(), Namespace: desired.GetNamespace()}, current)
+	if apierrors.IsNotFound(err) {
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+	current.Object["spec"] = desired.Object["spec"]
+	return r.Update(ctx, current)
 }
 
 func podSecurityContext() *corev1.PodSecurityContext {

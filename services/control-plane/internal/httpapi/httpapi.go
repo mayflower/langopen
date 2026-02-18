@@ -87,6 +87,7 @@ func New(logger *slog.Logger) *API {
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 
 	r.Route("/internal/v1", func(v1 chi.Router) {
+		v1.Post("/sources/validate", a.validateSource)
 		v1.Post("/deployments", a.createDeployment)
 		v1.Get("/deployments", a.listDeployments)
 		v1.Post("/builds", a.triggerBuild)
@@ -170,6 +171,32 @@ func (a *API) createDeployment(w http.ResponseWriter, r *http.Request) {
 	a.state.Audit = append(a.state.Audit, map[string]any{"event": "deployment.created", "timestamp": now, "deployment_id": rec.ID})
 	a.mu.Unlock()
 	writeJSON(w, http.StatusCreated, rec)
+}
+
+func (a *API) validateSource(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RepoPath      string `json:"repo_path"`
+		LanggraphPath string `json:"langgraph_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if strings.TrimSpace(req.RepoPath) == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_source", "repo_path is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	payload := map[string]any{
+		"repo_path":      req.RepoPath,
+		"langgraph_path": req.LanggraphPath,
+	}
+	resp, status, err := a.callBuilder(r.Context(), "/internal/v1/builds/validate", payload)
+	if err != nil {
+		contracts.WriteError(w, http.StatusBadGateway, "source_validation_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	writeJSON(w, status, resp)
 }
 
 func (a *API) listDeployments(w http.ResponseWriter, r *http.Request) {
@@ -257,6 +284,18 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		a.mu.Unlock()
 		_ = a.writeAudit(r.Context(), dep.ProjectID, "build.triggered", map[string]any{"deployment_id": dep.ID, "build_id": fallback["id"], "fallback": true})
 		writeJSON(w, http.StatusAccepted, fallback)
+		return
+	}
+	if status >= 400 {
+		if a.pg != nil {
+			_ = a.writeAudit(r.Context(), dep.ProjectID, "build.trigger_failed", map[string]any{
+				"deployment_id": dep.ID,
+				"commit_sha":    req.CommitSHA,
+				"status":        status,
+				"response":      builderResp,
+			})
+		}
+		writeJSON(w, status, builderResp)
 		return
 	}
 
@@ -465,12 +504,6 @@ func (a *API) callBuilder(ctx context.Context, path string, payload map[string]a
 		if err := json.Unmarshal(raw, &out); err != nil {
 			return nil, resp.StatusCode, fmt.Errorf("decode builder response: %w", err)
 		}
-	}
-	if resp.StatusCode >= 400 {
-		if msg, ok := out["message"].(string); ok && msg != "" {
-			return nil, resp.StatusCode, errors.New(msg)
-		}
-		return nil, resp.StatusCode, fmt.Errorf("builder returned status %d", resp.StatusCode)
 	}
 	return out, resp.StatusCode, nil
 }
