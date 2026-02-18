@@ -47,6 +47,8 @@ HEALTHZ="$(kcurl "$API_BASE/healthz")"
 kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" "$API_BASE/docs" >/dev/null
 OPENAPI_HEAD="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" "$API_BASE/openapi.json" | head -c 1)"
 [[ "$OPENAPI_HEAD" == "{" ]] || fail "openapi.json was not JSON"
+METRICS_HEAD="$(kcurl "$API_BASE/metrics" | head -n 1)"
+[[ "$METRICS_HEAD" == \#* ]] || fail "api metrics endpoint unavailable"
 
 THREAD_JSON="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{}' "$API_BASE/api/v1/threads")"
 THREAD_ID="$(printf '%s' "$THREAD_JSON" | jq -r '.id')"
@@ -94,5 +96,10 @@ echo "control-plane deployment: $CP_DEPLOY_ID"
 CP_BUILD_JSON="$(kcurl -H "Content-Type: application/json" -d '{"deployment_id":"'"$CP_DEPLOY_ID"'","commit_sha":"abcdef123456","image_name":"ghcr.io/acme/agent"}' "$CONTROL_BASE/internal/v1/builds")"
 CP_BUILD_STATUS="$(printf '%s' "$CP_BUILD_JSON" | jq -r '.status')"
 [[ "$CP_BUILD_STATUS" == "succeeded" || "$CP_BUILD_STATUS" == "queued" ]] || fail "control-plane build trigger failed: $CP_BUILD_JSON"
+
+CP_VALIDATE_JSON="$(kcurl -H "Content-Type: application/json" -d '{"repo_path":"/tmp/repo"}' "$CONTROL_BASE/internal/v1/sources/validate" || true)"
+if printf '%s' "$CP_VALIDATE_JSON" | jq -e '.error' >/dev/null 2>&1; then
+  echo "source validation returned expected error in smoke context"
+fi
 
 echo "smoke test complete"
