@@ -1,0 +1,12 @@
+go 1.25.0
+
+use (
+	./pkg
+	./services/api-server
+	./services/worker
+	./services/control-plane
+	./services/builder
+	./services/operator
+	./tests/conformance
+	./tests/integration
+)

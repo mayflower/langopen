@@ -584,11 +584,6 @@
       }
     },
     "/a2a/{assistant_id}": {
-      "servers": [
-        {
-          "url": "/"
-        }
-      ],
       "post": {
         "summary": "A2A JSON-RPC endpoint",
         "responses": {
@@ -599,11 +594,14 @@
       }
     },
     "/mcp": {
-      "servers": [
-        {
-          "url": "/"
+      "get": {
+        "summary": "MCP streamable HTTP endpoint",
+        "responses": {
+          "200": {
+            "description": "MCP response"
+          }
         }
-      ],
+      },
       "post": {
         "summary": "MCP streamable HTTP endpoint",
         "responses": {

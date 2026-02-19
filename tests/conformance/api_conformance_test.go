@@ -109,6 +109,20 @@ func TestDataPlaneRBAC(t *testing.T) {
 		t.Fatalf("expected 200 for viewer thread list, got %d body=%s", viewerListResp.StatusCode, string(body))
 	}
 	viewerListResp.Body.Close()
+
+	viewerMCPReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/mcp", bytes.NewReader([]byte(`{"jsonrpc":"2.0","id":"1","method":"initialize"}`)))
+	viewerMCPReq.Header.Set("Content-Type", "application/json")
+	viewerMCPReq.Header.Set("X-Api-Key", "test-key")
+	viewerMCPReq.Header.Set("X-Project-Role", "viewer")
+	viewerMCPResp, err := client.Do(viewerMCPReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if viewerMCPResp.StatusCode != http.StatusForbidden {
+		body, _ := io.ReadAll(viewerMCPResp.Body)
+		t.Fatalf("expected 403 for viewer mcp post, got %d body=%s", viewerMCPResp.StatusCode, string(body))
+	}
+	viewerMCPResp.Body.Close()
 }
 
 func TestAuthSchemeCompatibility(t *testing.T) {
@@ -712,6 +726,33 @@ func TestA2AAndMCP(t *testing.T) {
 		t.Fatalf("expected compatibility no-op, got %q", compatibility)
 	}
 	mcpTerminate.Body.Close()
+
+	a2aV1Resp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/a2a/asst_1", a2aBody, "test-key")
+	if a2aV1Resp.StatusCode != http.StatusOK {
+		t.Fatalf("api/v1 a2a status=%d", a2aV1Resp.StatusCode)
+	}
+	var a2aV1Result map[string]any
+	if err := json.NewDecoder(a2aV1Resp.Body).Decode(&a2aV1Result); err != nil {
+		t.Fatal(err)
+	}
+	a2aV1Resp.Body.Close()
+	a2aV1Obj, _ := a2aV1Result["result"].(map[string]any)
+	if got, _ := a2aV1Obj["thread_id"].(string); got != "thread_x" {
+		t.Fatalf("expected api/v1 thread_id=thread_x, got %q", got)
+	}
+
+	mcpV1Resp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/mcp", map[string]any{"jsonrpc": "2.0", "id": "v1", "method": "initialize"}, "test-key")
+	if mcpV1Resp.StatusCode != http.StatusOK {
+		t.Fatalf("api/v1 mcp status=%d", mcpV1Resp.StatusCode)
+	}
+	var mcpV1Result map[string]any
+	if err := json.NewDecoder(mcpV1Resp.Body).Decode(&mcpV1Result); err != nil {
+		t.Fatal(err)
+	}
+	mcpV1Resp.Body.Close()
+	if _, ok := mcpV1Result["result"].(map[string]any); !ok {
+		t.Fatalf("expected api/v1 mcp result object, got %#v", mcpV1Result)
+	}
 }
 
 func TestStoreStatelessRunsAndSystem(t *testing.T) {

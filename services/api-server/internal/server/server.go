@@ -147,10 +147,6 @@ func New(logger *slog.Logger) (*Server, error) {
 	r.Route("/api/v1", s.registerDataPlaneRoutes)
 	r.Group(s.registerDataPlaneRoutes)
 
-	r.Post("/a2a/{assistant_id}", s.a2a)
-	r.Get("/mcp", s.mcp)
-	r.Post("/mcp", s.mcp)
-
 	s.router = r
 	return s, nil
 }
@@ -194,6 +190,9 @@ func (s *Server) registerDataPlaneRoutes(api chi.Router) {
 	api.Get("/system", s.systemInfo)
 	api.Get("/system/health", s.systemHealth)
 	api.Get("/system/attention", s.systemAttention)
+	api.Post("/a2a/{assistant_id}", s.a2a)
+	api.Get("/mcp", s.mcp)
+	api.Post("/mcp", s.mcp)
 }
 
 func projectIDFromContext(ctx context.Context) string {
@@ -267,8 +266,8 @@ func requiredDataRoleFor(method, path string) contracts.ProjectRole {
 		strings.HasPrefix(normalizedPath, "/threads") ||
 		strings.HasPrefix(normalizedPath, "/runs") ||
 		strings.HasPrefix(normalizedPath, "/crons") ||
-		strings.HasPrefix(path, "/a2a/") ||
-		strings.HasPrefix(path, "/mcp") {
+		strings.HasPrefix(normalizedPath, "/a2a/") ||
+		strings.HasPrefix(normalizedPath, "/mcp") {
 		return contracts.RoleDeveloper
 	}
 	return contracts.RoleAdmin

@@ -1,0 +1,60 @@
+name: Build and Push Images
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker-build-push:
+    runs-on: mayflower-k8s-runners
+    env:
+      REGISTRY: registry.data.mayflower.zone/data/langopen
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry.data.mayflower.zone
+        uses: docker/login-action@v3
+        with:
+          registry: registry.data.mayflower.zone
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="${GITHUB_SHA::12}"
+          fi
+          echo "TAG=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Using TAG=${TAG}"
+
+      - name: Build and push all component images
+        env:
+          TAG: ${{ steps.tag.outputs.TAG }}
+        run: |
+          ./scripts/build-and-push.sh
+
+      - name: Publish summary
+        env:
+          TAG: ${{ steps.tag.outputs.TAG }}
+        run: |
+          {
+            echo "## Published Images"
+            echo
+            for component in api-server worker control-plane builder operator portal; do
+              echo "- ${REGISTRY}/${component}:${TAG}"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

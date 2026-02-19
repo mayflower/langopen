@@ -353,16 +353,17 @@ paths:
         '200':
           description: Operational attention counters
   /a2a/{assistant_id}:
-    servers:
-      - url: /
     post:
       summary: A2A JSON-RPC endpoint
       responses:
         '200':
           description: JSON-RPC response
   /mcp:
-    servers:
-      - url: /
+    get:
+      summary: MCP streamable HTTP endpoint
+      responses:
+        '200':
+          description: MCP response
     post:
       summary: MCP streamable HTTP endpoint
       responses:

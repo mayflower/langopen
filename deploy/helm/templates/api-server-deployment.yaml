@@ -1,0 +1,148 @@
+{{- if .Values.apiServer.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "langopen.fullname" . }}-api-server
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api-server
+spec:
+  replicas: {{ .Values.apiServer.replicas }}
+  selector:
+    matchLabels:
+      {{- include "langopen.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api-server
+  template:
+    metadata:
+      labels:
+        {{- include "langopen.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: api-server
+    spec:
+      {{- if .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      {{- if .Values.apiServer.runtimeClassName }}
+      runtimeClassName: {{ .Values.apiServer.runtimeClassName }}
+      {{- end }}
+      automountServiceAccountToken: false
+      containers:
+        - name: api-server
+          image: {{ include "langopen.image" (dict "Values" .Values "component" "api-server") | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.apiServer.service.targetPort }}
+              name: http
+          env:
+            - name: POSTGRES_DSN
+              value: {{ .Values.env.postgresDsn | quote }}
+            - name: REDIS_ADDR
+              value: {{ .Values.env.redisAddr | quote }}
+            - name: BOOTSTRAP_API_KEY
+              value: {{ .Values.env.bootstrapApiKey | quote }}
+            - name: OPENAPI_SPEC_PATH
+              value: {{ .Values.env.openapiSpecPath | quote }}
+            - name: MIGRATIONS_DIR
+              value: {{ .Values.env.migrationsDir | quote }}
+            - name: MIGRATIONS_AUTO_APPLY
+              value: {{ ternary "true" "false" .Values.apiServer.autoMigrate | quote }}
+            - name: RUN_WAKEUP_LIST
+              value: {{ .Values.env.runWakeupList | quote }}
+            - name: RUN_CANCEL_KEY_PREFIX
+              value: {{ .Values.env.runCancelKeyPrefix | quote }}
+            - name: RUN_CANCEL_CHANNEL_PREFIX
+              value: {{ .Values.env.runCancelChannelPrefix | quote }}
+            - name: RUN_STREAM_CHANNEL_PREFIX
+              value: {{ .Values.env.runStreamChannelPrefix | quote }}
+            - name: RUN_STREAM_BUFFER_PREFIX
+              value: {{ .Values.env.runStreamBufferPrefix | quote }}
+            - name: RUN_STREAM_BUFFER_TTL_SECONDS
+              value: {{ .Values.env.runStreamBufferTtlSeconds | quote }}
+          {{- range .Values.extraEnv.apiServer }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+          {{- end }}
+          {{- if or .Values.global.envFromSecret (gt (len .Values.extraEnvFrom.apiServer) 0) }}
+          envFrom:
+            {{- if .Values.global.envFromSecret }}
+            - secretRef:
+                name: {{ .Values.global.envFromSecret }}
+            {{- end }}
+            {{- with .Values.extraEnvFrom.apiServer }}
+{{ toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          resources:
+            {{- toYaml .Values.apiServer.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "langopen.fullname" . }}-api-server
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api-server
+spec:
+  type: {{ .Values.apiServer.service.type }}
+  selector:
+    {{- include "langopen.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: api-server
+  ports:
+    - name: http
+      port: {{ .Values.apiServer.service.port }}
+      targetPort: {{ .Values.apiServer.service.targetPort }}
+---
+{{- if .Values.apiServer.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "langopen.fullname" . }}-api-server
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+  {{- if .Values.apiServer.ingress.annotations }}
+  annotations:
+    {{- toYaml .Values.apiServer.ingress.annotations | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.apiServer.ingress.className }}
+  ingressClassName: {{ .Values.apiServer.ingress.className }}
+  {{- end }}
+  rules:
+    {{- range .Values.apiServer.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "langopen.fullname" $ }}-api-server
+                port:
+                  number: {{ $.Values.apiServer.service.port }}
+          {{- end }}
+    {{- end }}
+  {{- if .Values.apiServer.ingress.tls }}
+  tls:
+    {{- toYaml .Values.apiServer.ingress.tls | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: List
+items:
+  - apiVersion: extensions.agents.x-k8s.io/v1alpha1
+    kind: SandboxTemplate
+    metadata:
+      name: langopen-default
+    spec:
+      podTemplate:
+        spec:
+          runtimeClassName: gvisor
+          automountServiceAccountToken: false
+          containers:
+            - name: sandbox
+              image: registry.data.mayflower.zone/nicolaka/netshoot:latest
+              command: ["/bin/sh", "-c", "sleep infinity"]
+              securityContext:
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+  - apiVersion: extensions.agents.x-k8s.io/v1alpha1
+    kind: SandboxWarmPool
+    metadata:
+      name: langopen-default-warm-pool
+    spec:
+      sandboxTemplateRef:
+        name: langopen-default
+      replicas: 2
