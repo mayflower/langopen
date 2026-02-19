@@ -532,6 +532,39 @@ func TestRunStreamResumeAndReplay(t *testing.T) {
 	if !strings.Contains(string(resumed), "id: 2") {
 		t.Fatalf("expected resume-from-1 to include id 2, got: %s", string(resumed))
 	}
+
+	otherThreadResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/threads", map[string]any{}, "test-key")
+	defer otherThreadResp.Body.Close()
+	var otherThread struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(otherThreadResp.Body).Decode(&otherThread); err != nil {
+		t.Fatal(err)
+	}
+
+	wrongThreadJoinReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/threads/"+otherThread.ID+"/runs/"+runID+"/stream", nil)
+	wrongThreadJoinReq.Header.Set("X-Api-Key", "test-key")
+	wrongThreadJoinResp, err := client.Do(wrongThreadJoinReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wrongThreadJoinResp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(wrongThreadJoinResp.Body)
+		t.Fatalf("expected 404 for wrong-thread stream join, got %d body=%s", wrongThreadJoinResp.StatusCode, string(body))
+	}
+	wrongThreadJoinResp.Body.Close()
+
+	missingRunJoinReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/runs/run_missing/stream", nil)
+	missingRunJoinReq.Header.Set("X-Api-Key", "test-key")
+	missingRunJoinResp, err := client.Do(missingRunJoinReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missingRunJoinResp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(missingRunJoinResp.Body)
+		t.Fatalf("expected 404 for missing run stream join, got %d body=%s", missingRunJoinResp.StatusCode, string(body))
+	}
+	missingRunJoinResp.Body.Close()
 }
 
 func TestCancelInterruptAndRollback(t *testing.T) {

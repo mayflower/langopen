@@ -1360,7 +1360,36 @@ func (s *Server) createRunInPostgres(ctx context.Context, projectID, threadID, a
 
 func (s *Server) joinRunStream(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "run_id")
+	threadID := strings.TrimSpace(chi.URLParam(r, "thread_id"))
 	startFrom := parseStartFrom(r.Header.Get("Last-Event-ID"))
+	if runID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_run_id", "run_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	if s.pg != nil {
+		run, err := s.getRunFromPostgres(r.Context(), projectIDFromContext(r.Context()), runID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "run_not_found", "run not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		if threadID != "" && run.ThreadID != threadID {
+			contracts.WriteError(w, http.StatusNotFound, "run_not_found", "run not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+	} else {
+		s.store.mu.RLock()
+		run, ok := s.store.runs[runID]
+		s.store.mu.RUnlock()
+		if !ok || (threadID != "" && run.ThreadID != threadID) {
+			contracts.WriteError(w, http.StatusNotFound, "run_not_found", "run not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+	}
 
 	events := s.loadEvents(r.Context(), runID)
 	streamSSE(w, r, events, startFrom)
