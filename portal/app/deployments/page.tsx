@@ -224,6 +224,31 @@ export default function DeploymentsPage() {
     }
   }
 
+  async function deleteDeployment(id: string) {
+    setLoading(true);
+    setError("");
+    setStatus("");
+    try {
+      const resp = await fetch(`/api/platform/control/internal/v1/deployments/${encodeURIComponent(id)}`, {
+        method: "DELETE"
+      });
+      const body = await resp.json();
+      if (!resp.ok) {
+        throw new Error(JSON.stringify(body));
+      }
+      if (deploymentID === id) {
+        setDeploymentID("");
+        setBindings([]);
+      }
+      setStatus(`deployment deleted: ${id}`);
+      await loadDeployments();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "delete deployment failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
     <main className="hero">
       <h2>Deployments</h2>
@@ -307,6 +332,7 @@ export default function DeploymentsPage() {
               <th>Runtime</th>
               <th>Mode</th>
               <th>Updated</th>
+              <th>Action</th>
             </tr>
           </thead>
           <tbody>
@@ -319,6 +345,9 @@ export default function DeploymentsPage() {
                 <td>{d.runtime_profile}</td>
                 <td>{d.mode}</td>
                 <td>{new Date(d.updated_at).toLocaleString()}</td>
+                <td>
+                  <button disabled={loading} type="button" onClick={() => void deleteDeployment(d.id)}>Delete</button>
+                </td>
               </tr>
             ))}
           </tbody>
