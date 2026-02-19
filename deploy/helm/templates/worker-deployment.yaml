@@ -52,6 +52,10 @@ spec:
               value: {{ .Values.env.runStreamBufferTtlSeconds | quote }}
             - name: RUN_MODE
               value: {{ .Values.worker.runMode | quote }}
+            - name: LANGOPEN_EXECUTOR
+              value: {{ .Values.worker.executor | quote }}
+            - name: RUNTIME_RUNNER_URL
+              value: {{ default (printf "http://%s-runtime-runner" (include "langopen.fullname" .)) .Values.worker.runtimeRunnerUrl | quote }}
             - name: SANDBOX_ENABLED
               value: {{ ternary "true" "false" .Values.worker.sandboxEnabled | quote }}
             - name: SANDBOX_NAMESPACE

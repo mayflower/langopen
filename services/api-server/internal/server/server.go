@@ -62,16 +62,27 @@ type createRunRequest struct {
 	MultitaskStrategy string `json:"multitask_strategy"`
 	StreamResumable   *bool  `json:"stream_resumable"`
 	WebhookURL        string `json:"webhook_url"`
+	Input             any    `json:"input,omitempty"`
+	Command           any    `json:"command,omitempty"`
+	Configurable      any    `json:"configurable,omitempty"`
+	Metadata          any    `json:"metadata,omitempty"`
+	StreamMode        any    `json:"stream_mode,omitempty"`
+	CheckpointID      string `json:"checkpoint_id,omitempty"`
+	OnDisconnect      string `json:"on_disconnect,omitempty"`
+	InterruptBefore   []any  `json:"interrupt_before,omitempty"`
+	InterruptAfter    []any  `json:"interrupt_after,omitempty"`
 }
 
 type memoryStore struct {
-	mu         sync.RWMutex
-	assistants map[string]contracts.Assistant
-	threads    map[string]contracts.Thread
-	runs       map[string]contracts.Run
-	events     map[string][]streamEvent
-	crons      map[string]contracts.CronJob
-	storeItems map[string]storeRecord
+	mu           sync.RWMutex
+	assistants   map[string]contracts.Assistant
+	threads      map[string]contracts.Thread
+	runs         map[string]contracts.Run
+	events       map[string][]streamEvent
+	crons        map[string]contracts.CronJob
+	storeItems   map[string]storeRecord
+	threadStates map[string][]threadStateRecord
+	a2aTasks     map[string]a2aTaskRecord
 }
 
 type streamEvent struct {
@@ -89,16 +100,35 @@ type storeRecord struct {
 	CreatedAt time.Time      `json:"created_at"`
 }
 
+type threadStateRecord struct {
+	ID            string         `json:"id"`
+	ThreadID      string         `json:"thread_id"`
+	CheckpointID  string         `json:"checkpoint_id,omitempty"`
+	ParentStateID string         `json:"parent_state_id,omitempty"`
+	Values        map[string]any `json:"values"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
+	CreatedAt     time.Time      `json:"created_at"`
+}
+
+type a2aTaskRecord struct {
+	ID        string    `json:"id"`
+	ThreadID  string    `json:"thread_id"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 func New(logger *slog.Logger) (*Server, error) {
 	s := &Server{
 		logger: logger,
 		store: &memoryStore{
-			assistants: map[string]contracts.Assistant{},
-			threads:    map[string]contracts.Thread{},
-			runs:       map[string]contracts.Run{},
-			events:     map[string][]streamEvent{},
-			crons:      map[string]contracts.CronJob{},
-			storeItems: map[string]storeRecord{},
+			assistants:   map[string]contracts.Assistant{},
+			threads:      map[string]contracts.Thread{},
+			runs:         map[string]contracts.Run{},
+			events:       map[string][]streamEvent{},
+			crons:        map[string]contracts.CronJob{},
+			storeItems:   map[string]storeRecord{},
+			threadStates: map[string][]threadStateRecord{},
+			a2aTasks:     map[string]a2aTaskRecord{},
 		},
 		cfg: serverConfig{
 			QueueKey:            envOrDefault("RUN_WAKEUP_LIST", "langopen:runs:wakeup"),
@@ -156,26 +186,33 @@ func (s *Server) Router() http.Handler { return s.router }
 func (s *Server) registerDataPlaneRoutes(api chi.Router) {
 	api.Get("/assistants", s.listAssistants)
 	api.Post("/assistants", s.createAssistant)
+	api.Post("/assistants/search", s.searchAssistants)
 	api.Get("/assistants/{assistant_id}", s.getAssistant)
 	api.Patch("/assistants/{assistant_id}", s.updateAssistant)
 	api.Delete("/assistants/{assistant_id}", s.deleteAssistant)
 	api.Get("/threads", s.listThreads)
 	api.Post("/threads", s.createThread)
+	api.Post("/threads/search", s.searchThreads)
 	api.Get("/threads/{thread_id}", s.getThread)
 	api.Patch("/threads/{thread_id}", s.updateThread)
 	api.Delete("/threads/{thread_id}", s.deleteThread)
+	api.Get("/threads/{thread_id}/history", s.getThreadHistory)
+	api.Post("/threads/{thread_id}/state", s.updateThreadState)
 	api.Get("/threads/{thread_id}/runs", s.listThreadRuns)
 	api.Post("/threads/{thread_id}/runs", s.createRun)
 	api.Post("/threads/{thread_id}/runs/stream", s.createRunStream)
+	api.Post("/threads/{thread_id}/runs/wait", s.createRunWait)
 	api.Get("/threads/{thread_id}/runs/{run_id}", s.getThreadRun)
 	api.Delete("/threads/{thread_id}/runs/{run_id}", s.deleteThreadRun)
 	api.Get("/threads/{thread_id}/runs/{run_id}/stream", s.joinRunStream)
 	api.Post("/threads/{thread_id}/runs/{run_id}/cancel", s.cancelRun)
 	api.Get("/runs", s.listRuns)
 	api.Post("/runs", s.createStatelessRun)
+	api.Post("/runs/wait", s.createStatelessRunWait)
 	api.Delete("/runs/{run_id}", s.deleteRun)
 	api.Post("/runs/stream", s.createStatelessRunStream)
 	api.Get("/runs/{run_id}/stream", s.joinRunStream)
+	api.Post("/runs/{run_id}/wait", s.waitForExistingRun)
 	api.Post("/runs/{run_id}/cancel", s.cancelRun)
 	api.Get("/runs/{run_id}", s.getRun)
 	api.Get("/store/items", s.listStoreItems)
@@ -191,6 +228,7 @@ func (s *Server) registerDataPlaneRoutes(api chi.Router) {
 	api.Get("/system/health", s.systemHealth)
 	api.Get("/system/attention", s.systemAttention)
 	api.Post("/a2a/{assistant_id}", s.a2a)
+	api.Get("/a2a/{assistant_id}/.well-known/agent-card.json", s.a2aAgentCard)
 	api.Get("/mcp", s.mcp)
 	api.Post("/mcp", s.mcp)
 }
@@ -564,6 +602,93 @@ func (s *Server) listAssistants(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+func (s *Server) searchAssistants(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Query string   `json:"query"`
+		IDs   []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	query := strings.ToLower(strings.TrimSpace(req.Query))
+	ids := map[string]struct{}{}
+	for _, id := range req.IDs {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			ids[id] = struct{}{}
+		}
+	}
+
+	assistants, err := s.listAssistantsFiltered(r.Context(), projectIDFromContext(r.Context()))
+	if err != nil {
+		contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	out := make([]contracts.Assistant, 0, len(assistants))
+	for _, assistant := range assistants {
+		if len(ids) > 0 {
+			if _, ok := ids[assistant.ID]; !ok {
+				continue
+			}
+		}
+		if query != "" {
+			payload := strings.ToLower(assistant.ID + " " + assistant.GraphID + " " + assistant.Version + " " + assistant.DeploymentID)
+			if !strings.Contains(payload, query) {
+				continue
+			}
+		}
+		out = append(out, assistant)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": out, "total": len(out)})
+}
+
+func (s *Server) listAssistantsFiltered(ctx context.Context, projectID string) ([]contracts.Assistant, error) {
+	if s.pg != nil {
+		var (
+			rows pgx.Rows
+			err  error
+		)
+		if projectID == "" {
+			rows, err = s.pg.Query(ctx, `SELECT id, deployment_id, graph_id, config, version FROM assistants ORDER BY created_at DESC LIMIT 500`)
+		} else {
+			rows, err = s.pg.Query(ctx, `
+				SELECT a.id, a.deployment_id, a.graph_id, a.config, a.version
+				FROM assistants a
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE d.project_id=$1
+				ORDER BY a.created_at DESC
+				LIMIT 500
+			`, projectID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		out := make([]contracts.Assistant, 0, 64)
+		for rows.Next() {
+			var a contracts.Assistant
+			var raw []byte
+			if err := rows.Scan(&a.ID, &a.DeploymentID, &a.GraphID, &raw, &a.Version); err != nil {
+				return nil, err
+			}
+			a.Config = map[string]string{}
+			_ = json.Unmarshal(raw, &a.Config)
+			out = append(out, a)
+		}
+		return out, rows.Err()
+	}
+
+	s.store.mu.RLock()
+	defer s.store.mu.RUnlock()
+	out := make([]contracts.Assistant, 0, len(s.store.assistants))
+	for _, a := range s.store.assistants {
+		out = append(out, a)
+	}
+	return out, nil
+}
+
 func (s *Server) createAssistant(w http.ResponseWriter, r *http.Request) {
 	var in contracts.Assistant
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -813,6 +938,121 @@ func (s *Server) listThreads(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+func (s *Server) searchThreads(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Query       string            `json:"query"`
+		IDs         []string          `json:"ids"`
+		Metadata    map[string]string `json:"metadata"`
+		AssistantID string            `json:"assistant_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	query := strings.ToLower(strings.TrimSpace(req.Query))
+	assistantID := strings.TrimSpace(req.AssistantID)
+	ids := map[string]struct{}{}
+	for _, id := range req.IDs {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			ids[id] = struct{}{}
+		}
+	}
+
+	threads, err := s.listThreadsFiltered(r.Context(), projectIDFromContext(r.Context()))
+	if err != nil {
+		contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	out := make([]contracts.Thread, 0, len(threads))
+	for _, thread := range threads {
+		if len(ids) > 0 {
+			if _, ok := ids[thread.ID]; !ok {
+				continue
+			}
+		}
+		if assistantID != "" && thread.AssistantID != assistantID {
+			continue
+		}
+		if query != "" {
+			payload := strings.ToLower(thread.ID + " " + thread.AssistantID)
+			if !strings.Contains(payload, query) {
+				match := false
+				for k, v := range thread.Metadata {
+					if strings.Contains(strings.ToLower(k+" "+v), query) {
+						match = true
+						break
+					}
+				}
+				if !match {
+					continue
+				}
+			}
+		}
+		matchesMetadata := true
+		for k, v := range req.Metadata {
+			if thread.Metadata[k] != v {
+				matchesMetadata = false
+				break
+			}
+		}
+		if !matchesMetadata {
+			continue
+		}
+		out = append(out, thread)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"items": out, "total": len(out)})
+}
+
+func (s *Server) listThreadsFiltered(ctx context.Context, projectID string) ([]contracts.Thread, error) {
+	if s.pg != nil {
+		var (
+			rows pgx.Rows
+			err  error
+		)
+		if projectID == "" {
+			rows, err = s.pg.Query(ctx, `SELECT id, assistant_id, metadata, updated_at FROM threads ORDER BY updated_at DESC LIMIT 500`)
+		} else {
+			rows, err = s.pg.Query(ctx, `
+				SELECT t.id, t.assistant_id, t.metadata, t.updated_at
+				FROM threads t
+				JOIN assistants a ON a.id = t.assistant_id
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE d.project_id=$1
+				ORDER BY t.updated_at DESC
+				LIMIT 500
+			`, projectID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		out := make([]contracts.Thread, 0, 64)
+		for rows.Next() {
+			var t contracts.Thread
+			var raw []byte
+			if err := rows.Scan(&t.ID, &t.AssistantID, &raw, &t.UpdatedAt); err != nil {
+				return nil, err
+			}
+			t.Metadata = map[string]string{}
+			_ = json.Unmarshal(raw, &t.Metadata)
+			out = append(out, t)
+		}
+		return out, rows.Err()
+	}
+
+	s.store.mu.RLock()
+	defer s.store.mu.RUnlock()
+	out := make([]contracts.Thread, 0, len(s.store.threads))
+	for _, t := range s.store.threads {
+		out = append(out, t)
+	}
+	return out, nil
+}
+
 func (s *Server) createThread(w http.ResponseWriter, r *http.Request) {
 	var in contracts.Thread
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil && err.Error() != "EOF" {
@@ -942,6 +1182,156 @@ func (s *Server) updateThread(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, thread)
 }
 
+func (s *Server) getThreadHistory(w http.ResponseWriter, r *http.Request) {
+	threadID := strings.TrimSpace(chi.URLParam(r, "thread_id"))
+	if threadID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_thread_id", "thread_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	if s.pg != nil {
+		if err := s.ensureThreadScoped(r.Context(), projectIDFromContext(r.Context()), threadID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "thread_not_found", "thread not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		rows, err := s.pg.Query(r.Context(), `
+			SELECT id, thread_id, COALESCE(checkpoint_id,''), COALESCE(parent_state_id,''), values_json, metadata_json, created_at
+			FROM thread_states
+			WHERE thread_id=$1
+			ORDER BY created_at DESC
+			LIMIT 200
+		`, threadID)
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		defer rows.Close()
+
+		out := make([]threadStateRecord, 0, 32)
+		for rows.Next() {
+			var item threadStateRecord
+			var rawValues []byte
+			var rawMeta []byte
+			if err := rows.Scan(&item.ID, &item.ThreadID, &item.CheckpointID, &item.ParentStateID, &rawValues, &rawMeta, &item.CreatedAt); err != nil {
+				contracts.WriteError(w, http.StatusInternalServerError, "db_scan_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			item.Values = map[string]any{}
+			item.Metadata = map[string]any{}
+			_ = json.Unmarshal(rawValues, &item.Values)
+			_ = json.Unmarshal(rawMeta, &item.Metadata)
+			out = append(out, item)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": out})
+		return
+	}
+
+	s.store.mu.RLock()
+	history := append([]threadStateRecord(nil), s.store.threadStates[threadID]...)
+	s.store.mu.RUnlock()
+	sort.Slice(history, func(i, j int) bool {
+		return history[i].CreatedAt.After(history[j].CreatedAt)
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"items": history})
+}
+
+func (s *Server) updateThreadState(w http.ResponseWriter, r *http.Request) {
+	threadID := strings.TrimSpace(chi.URLParam(r, "thread_id"))
+	if threadID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_thread_id", "thread_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	var req struct {
+		CheckpointID  string         `json:"checkpoint_id"`
+		ParentStateID string         `json:"parent_state_id"`
+		Values        map[string]any `json:"values"`
+		Metadata      map[string]any `json:"metadata"`
+		Reason        string         `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if req.Values == nil {
+		req.Values = map[string]any{}
+	}
+	if req.Metadata == nil {
+		req.Metadata = map[string]any{}
+	}
+	now := time.Now().UTC()
+	record := threadStateRecord{
+		ID:            contracts.NewID("state"),
+		ThreadID:      threadID,
+		CheckpointID:  strings.TrimSpace(req.CheckpointID),
+		ParentStateID: strings.TrimSpace(req.ParentStateID),
+		Values:        req.Values,
+		Metadata:      req.Metadata,
+		CreatedAt:     now,
+	}
+
+	if s.pg != nil {
+		if err := s.ensureThreadScoped(r.Context(), projectIDFromContext(r.Context()), threadID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "thread_not_found", "thread not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		tx, err := s.pg.BeginTx(r.Context(), pgx.TxOptions{})
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_begin_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		defer func() { _ = tx.Rollback(r.Context()) }()
+
+		parentStateID := record.ParentStateID
+		if parentStateID == "" {
+			_ = tx.QueryRow(r.Context(), `SELECT COALESCE(id,'') FROM thread_states WHERE thread_id=$1 ORDER BY created_at DESC LIMIT 1`, threadID).Scan(&parentStateID)
+		}
+		record.ParentStateID = strings.TrimSpace(parentStateID)
+		valuesRaw, _ := json.Marshal(record.Values)
+		metaRaw, _ := json.Marshal(record.Metadata)
+
+		if _, err := tx.Exec(r.Context(), `
+			INSERT INTO thread_states (id, thread_id, checkpoint_id, parent_state_id, values_json, metadata_json, created_at)
+			VALUES ($1,$2,$3,NULLIF($4,''),$5,$6,$7)
+		`, record.ID, record.ThreadID, record.CheckpointID, record.ParentStateID, valuesRaw, metaRaw, record.CreatedAt); err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_insert_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		if _, err := tx.Exec(r.Context(), `
+			INSERT INTO thread_state_transitions (id, thread_id, from_state_id, to_state_id, reason, created_at)
+			VALUES ($1,$2,NULLIF($3,''),$4,$5,$6)
+		`, contracts.NewID("state_tx"), record.ThreadID, record.ParentStateID, record.ID, strings.TrimSpace(req.Reason), record.CreatedAt); err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_insert_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		if err := tx.Commit(r.Context()); err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_commit_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		writeJSON(w, http.StatusOK, record)
+		return
+	}
+
+	s.store.mu.Lock()
+	parentStateID := record.ParentStateID
+	if parentStateID == "" {
+		if states := s.store.threadStates[threadID]; len(states) > 0 {
+			parentStateID = states[len(states)-1].ID
+		}
+	}
+	record.ParentStateID = parentStateID
+	s.store.threadStates[threadID] = append(s.store.threadStates[threadID], record)
+	s.store.mu.Unlock()
+	writeJSON(w, http.StatusOK, record)
+}
+
 func (s *Server) deleteThread(w http.ResponseWriter, r *http.Request) {
 	threadID := strings.TrimSpace(chi.URLParam(r, "thread_id"))
 	if threadID == "" {
@@ -1052,8 +1442,13 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		if s.redis != nil {
 			_ = s.redis.LPush(r.Context(), s.cfg.QueueKey, "wake").Err()
 		}
+		_ = s.persistRunRequestInPostgres(r.Context(), run.ID, req)
 	} else {
 		run = s.createRunInMemory(threadID, req.AssistantID, strategy, streamResumable)
+		applyRunRequestToRun(&run, req)
+		s.store.mu.Lock()
+		s.store.runs[run.ID] = run
+		s.store.mu.Unlock()
 	}
 	s.auditWebhookConfigured(r.Context(), projectID, run, webhookURL)
 	writeJSON(w, http.StatusCreated, run)
@@ -1100,12 +1495,74 @@ func (s *Server) createStatelessRun(w http.ResponseWriter, r *http.Request) {
 		if s.redis != nil {
 			_ = s.redis.LPush(r.Context(), s.cfg.QueueKey, "wake").Err()
 		}
+		_ = s.persistRunRequestInPostgres(r.Context(), run.ID, req)
 	} else {
 		run = s.createRunInMemory("", req.AssistantID, strategy, streamResumable)
+		applyRunRequestToRun(&run, req)
+		s.store.mu.Lock()
+		s.store.runs[run.ID] = run
+		s.store.mu.Unlock()
 	}
 	s.auditWebhookConfigured(r.Context(), projectID, run, webhookURL)
 
 	writeJSON(w, http.StatusCreated, run)
+}
+
+func (s *Server) createRunWait(w http.ResponseWriter, r *http.Request) {
+	threadID := chi.URLParam(r, "thread_id")
+	projectID := projectIDFromContext(r.Context())
+	var req createRunRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	run, statusCode, err := s.createRunRecord(r.Context(), projectID, threadID, req)
+	if err != nil {
+		contracts.WriteError(w, statusCode, "create_run_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	s.auditWebhookConfigured(r.Context(), projectID, run, strings.TrimSpace(req.WebhookURL))
+	finalRun, waitErr := s.waitForRunTerminal(r.Context(), projectID, run.ID, waitTimeout(r))
+	if waitErr != nil {
+		contracts.WriteError(w, http.StatusGatewayTimeout, "wait_timeout", waitErr.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	writeJSON(w, http.StatusOK, finalRun)
+}
+
+func (s *Server) createStatelessRunWait(w http.ResponseWriter, r *http.Request) {
+	projectID := projectIDFromContext(r.Context())
+	var req createRunRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	run, statusCode, err := s.createRunRecord(r.Context(), projectID, "", req)
+	if err != nil {
+		contracts.WriteError(w, statusCode, "create_run_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	s.auditWebhookConfigured(r.Context(), projectID, run, strings.TrimSpace(req.WebhookURL))
+	finalRun, waitErr := s.waitForRunTerminal(r.Context(), projectID, run.ID, waitTimeout(r))
+	if waitErr != nil {
+		contracts.WriteError(w, http.StatusGatewayTimeout, "wait_timeout", waitErr.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	writeJSON(w, http.StatusOK, finalRun)
+}
+
+func (s *Server) waitForExistingRun(w http.ResponseWriter, r *http.Request) {
+	runID := strings.TrimSpace(chi.URLParam(r, "run_id"))
+	if runID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_run_id", "run_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	finalRun, err := s.waitForRunTerminal(r.Context(), projectIDFromContext(r.Context()), runID, waitTimeout(r))
+	if err != nil {
+		contracts.WriteError(w, http.StatusGatewayTimeout, "wait_timeout", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	writeJSON(w, http.StatusOK, finalRun)
 }
 
 func (s *Server) createRunStream(w http.ResponseWriter, r *http.Request) {
@@ -1152,8 +1609,13 @@ func (s *Server) createRunStream(w http.ResponseWriter, r *http.Request) {
 		if s.redis != nil {
 			_ = s.redis.LPush(r.Context(), s.cfg.QueueKey, "wake").Err()
 		}
+		_ = s.persistRunRequestInPostgres(r.Context(), run.ID, req)
 	} else {
 		run = s.createRunInMemory(threadID, req.AssistantID, strategy, streamResumable)
+		applyRunRequestToRun(&run, req)
+		s.store.mu.Lock()
+		s.store.runs[run.ID] = run
+		s.store.mu.Unlock()
 	}
 	s.auditWebhookConfigured(r.Context(), projectID, run, webhookURL)
 
@@ -1174,6 +1636,7 @@ func (s *Server) createRunStream(w http.ResponseWriter, r *http.Request) {
 			mkEvent(3, "run_completed", map[string]string{"status": string(contracts.RunStatusSuccess), "id": run.ID}),
 		}
 		s.store.mu.Lock()
+		run.Output = map[string]any{"status": string(contracts.RunStatusSuccess)}
 		run.Status = contracts.RunStatusSuccess
 		run.UpdatedAt = time.Now().UTC()
 		s.store.runs[run.ID] = run
@@ -1230,8 +1693,13 @@ func (s *Server) createStatelessRunStream(w http.ResponseWriter, r *http.Request
 		if s.redis != nil {
 			_ = s.redis.LPush(r.Context(), s.cfg.QueueKey, "wake").Err()
 		}
+		_ = s.persistRunRequestInPostgres(r.Context(), run.ID, req)
 	} else {
 		run = s.createRunInMemory("", req.AssistantID, strategy, streamResumable)
+		applyRunRequestToRun(&run, req)
+		s.store.mu.Lock()
+		s.store.runs[run.ID] = run
+		s.store.mu.Unlock()
 	}
 	s.auditWebhookConfigured(r.Context(), projectID, run, webhookURL)
 
@@ -1258,6 +1726,7 @@ func (s *Server) createStatelessRunStream(w http.ResponseWriter, r *http.Request
 			mkEvent(3, "run_completed", map[string]string{"status": string(contracts.RunStatusSuccess), "id": run.ID}),
 		}
 		s.store.mu.Lock()
+		run.Output = map[string]any{"status": string(contracts.RunStatusSuccess)}
 		run.Status = contracts.RunStatusSuccess
 		run.UpdatedAt = time.Now().UTC()
 		s.store.runs[run.ID] = run
@@ -1271,6 +1740,161 @@ func (s *Server) createStatelessRunStream(w http.ResponseWriter, r *http.Request
 		return
 	}
 	streamSSE(w, r, events, 0)
+}
+
+func (s *Server) createRunRecord(ctx context.Context, projectID, threadID string, req createRunRequest) (contracts.Run, int, error) {
+	if req.AssistantID == "" {
+		req.AssistantID = "asst_default"
+	}
+	strategy := contracts.MultitaskStrategy(strings.TrimSpace(req.MultitaskStrategy))
+	if strategy == "" {
+		strategy = contracts.MultitaskEnqueue
+	}
+	if !isValidMultitaskStrategy(strategy) {
+		return contracts.Run{}, http.StatusBadRequest, fmt.Errorf("multitask_strategy must be reject, rollback, interrupt, enqueue")
+	}
+	streamResumable := true
+	if req.StreamResumable != nil {
+		streamResumable = *req.StreamResumable
+	}
+
+	if s.pg != nil {
+		var (
+			run contracts.Run
+			err error
+		)
+		if threadID == "" {
+			run, err = s.createStatelessRunInPostgres(ctx, projectID, req.AssistantID, strategy, streamResumable, strings.TrimSpace(req.WebhookURL))
+		} else {
+			run, err = s.createRunInPostgres(ctx, projectID, threadID, req.AssistantID, strategy, streamResumable, strings.TrimSpace(req.WebhookURL))
+		}
+		if err != nil {
+			if errors.Is(err, errRunConflict) {
+				return contracts.Run{}, http.StatusConflict, err
+			}
+			if errors.Is(err, errProjectScope) {
+				return contracts.Run{}, http.StatusForbidden, err
+			}
+			return contracts.Run{}, http.StatusInternalServerError, err
+		}
+		if s.redis != nil {
+			_ = s.redis.LPush(ctx, s.cfg.QueueKey, "wake").Err()
+		}
+		_ = s.persistRunRequestInPostgres(ctx, run.ID, req)
+		return run, http.StatusCreated, nil
+	}
+
+	run := s.createRunInMemory(threadID, req.AssistantID, strategy, streamResumable)
+	applyRunRequestToRun(&run, req)
+	s.store.mu.Lock()
+	s.store.runs[run.ID] = run
+	s.store.mu.Unlock()
+	return run, http.StatusCreated, nil
+}
+
+func (s *Server) persistRunRequestInPostgres(ctx context.Context, runID string, req createRunRequest) error {
+	if s.pg == nil {
+		return nil
+	}
+	metadata := runRequestMetadata(req)
+	inputRaw, _ := json.Marshal(req.Input)
+	metaRaw, _ := json.Marshal(metadata)
+	_, err := s.pg.Exec(ctx, `
+		UPDATE runs
+		SET input_json=COALESCE(NULLIF($2::text,''), '{}')::jsonb,
+		    metadata_json=COALESCE(NULLIF($3::text,''), '{}')::jsonb,
+		    checkpoint_id=NULLIF($4,''),
+		    updated_at=NOW()
+		WHERE id=$1
+	`, runID, string(inputRaw), string(metaRaw), strings.TrimSpace(req.CheckpointID))
+	return err
+}
+
+func runRequestMetadata(req createRunRequest) map[string]any {
+	metadata := map[string]any{
+		"configurable":     req.Configurable,
+		"stream_mode":      req.StreamMode,
+		"on_disconnect":    strings.TrimSpace(req.OnDisconnect),
+		"interrupt_before": req.InterruptBefore,
+		"interrupt_after":  req.InterruptAfter,
+		"command":          req.Command,
+	}
+	if req.Metadata != nil {
+		metadata["metadata"] = req.Metadata
+	}
+	return metadata
+}
+
+func applyRunRequestToRun(run *contracts.Run, req createRunRequest) {
+	if run == nil {
+		return
+	}
+	run.Input = req.Input
+	run.CheckpointID = strings.TrimSpace(req.CheckpointID)
+	run.Metadata = runRequestMetadata(req)
+}
+
+func waitTimeout(r *http.Request) time.Duration {
+	timeout := strings.TrimSpace(r.URL.Query().Get("timeout_seconds"))
+	if timeout == "" {
+		return 30 * time.Second
+	}
+	value, err := strconv.Atoi(timeout)
+	if err != nil || value <= 0 {
+		return 30 * time.Second
+	}
+	if value > 300 {
+		value = 300
+	}
+	return time.Duration(value) * time.Second
+}
+
+func (s *Server) waitForRunTerminal(ctx context.Context, projectID, runID string, timeout time.Duration) (contracts.Run, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		if s.pg == nil {
+			s.store.mu.RLock()
+			run, ok := s.store.runs[runID]
+			s.store.mu.RUnlock()
+			if !ok {
+				return contracts.Run{}, sql.ErrNoRows
+			}
+			if run.Status == contracts.RunStatusPending || run.Status == contracts.RunStatusRunning {
+				run.Status = contracts.RunStatusSuccess
+				now := time.Now().UTC()
+				run.UpdatedAt = now
+				run.CompletedAt = &now
+				s.store.mu.Lock()
+				s.store.runs[runID] = run
+				s.store.mu.Unlock()
+			}
+			return run, nil
+		}
+		run, err := s.getRunFromPostgres(ctx, projectID, runID)
+		if err != nil {
+			return contracts.Run{}, err
+		}
+		if isTerminalRunStatus(run.Status) {
+			return run, nil
+		}
+		if time.Now().After(deadline) {
+			return contracts.Run{}, fmt.Errorf("run %s did not reach terminal state within %s", runID, timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return contracts.Run{}, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+func isTerminalRunStatus(status contracts.RunStatus) bool {
+	switch status {
+	case contracts.RunStatusSuccess, contracts.RunStatusError, contracts.RunStatusInterrupted, contracts.RunStatusTimeout:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) createRunInMemory(threadID, assistantID string, strategy contracts.MultitaskStrategy, streamResumable bool) contracts.Run {
@@ -1778,8 +2402,31 @@ func (s *Server) getRunFromPostgres(ctx context.Context, projectID, runID string
 	var run contracts.Run
 	var status string
 	var strategy string
+	var (
+		rawInput    []byte
+		rawOutput   []byte
+		rawError    []byte
+		rawMetadata []byte
+		startedAt   sql.NullTime
+		completedAt sql.NullTime
+	)
 	query := `
-		SELECT r.id, COALESCE(r.thread_id,''), r.assistant_id, r.status, r.multitask_strategy, r.stream_resumable, r.created_at, r.updated_at
+		SELECT
+			r.id,
+			COALESCE(r.thread_id,''),
+			r.assistant_id,
+			r.status,
+			r.multitask_strategy,
+			r.stream_resumable,
+			COALESCE(r.input_json, '{}'::jsonb),
+			COALESCE(r.output_json, '{}'::jsonb),
+			COALESCE(r.error_json, '{}'::jsonb),
+			COALESCE(r.metadata_json, '{}'::jsonb),
+			COALESCE(r.checkpoint_id, ''),
+			r.started_at,
+			r.completed_at,
+			r.created_at,
+			r.updated_at
 		FROM runs r
 	`
 	args := []any{runID}
@@ -1793,7 +2440,23 @@ func (s *Server) getRunFromPostgres(ctx context.Context, projectID, runID string
 		`
 		args = append(args, projectID)
 	}
-	err := s.pg.QueryRow(ctx, query, args...).Scan(&run.ID, &run.ThreadID, &run.AssistantID, &status, &strategy, &run.StreamResumable, &run.CreatedAt, &run.UpdatedAt)
+	err := s.pg.QueryRow(ctx, query, args...).Scan(
+		&run.ID,
+		&run.ThreadID,
+		&run.AssistantID,
+		&status,
+		&strategy,
+		&run.StreamResumable,
+		&rawInput,
+		&rawOutput,
+		&rawError,
+		&rawMetadata,
+		&run.CheckpointID,
+		&startedAt,
+		&completedAt,
+		&run.CreatedAt,
+		&run.UpdatedAt,
+	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return contracts.Run{}, sql.ErrNoRows
@@ -1802,6 +2465,24 @@ func (s *Server) getRunFromPostgres(ctx context.Context, projectID, runID string
 	}
 	run.Status = contracts.RunStatus(status)
 	run.MultitaskStrategy = contracts.MultitaskStrategy(strategy)
+	run.Input = decodeJSONAny(rawInput)
+	run.Output = decodeJSONAny(rawOutput)
+	run.Error = decodeJSONAny(rawError)
+	if len(rawMetadata) > 0 {
+		run.Metadata = map[string]any{}
+		_ = json.Unmarshal(rawMetadata, &run.Metadata)
+		if len(run.Metadata) == 0 {
+			run.Metadata = nil
+		}
+	}
+	if startedAt.Valid {
+		ts := startedAt.Time.UTC()
+		run.StartedAt = &ts
+	}
+	if completedAt.Valid {
+		ts := completedAt.Time.UTC()
+		run.CompletedAt = &ts
+	}
 	return run, nil
 }
 
@@ -1832,7 +2513,22 @@ func (s *Server) listRunsFiltered(ctx context.Context, projectID, threadID, assi
 
 func (s *Server) listRunsFromPostgres(ctx context.Context, projectID, threadID, assistantID, status string) ([]contracts.Run, error) {
 	query := `
-		SELECT r.id, COALESCE(r.thread_id,''), r.assistant_id, r.status, r.multitask_strategy, r.stream_resumable, r.created_at, r.updated_at
+		SELECT
+			r.id,
+			COALESCE(r.thread_id,''),
+			r.assistant_id,
+			r.status,
+			r.multitask_strategy,
+			r.stream_resumable,
+			COALESCE(r.input_json, '{}'::jsonb),
+			COALESCE(r.output_json, '{}'::jsonb),
+			COALESCE(r.error_json, '{}'::jsonb),
+			COALESCE(r.metadata_json, '{}'::jsonb),
+			COALESCE(r.checkpoint_id, ''),
+			r.started_at,
+			r.completed_at,
+			r.created_at,
+			r.updated_at
 		FROM runs r
 	`
 	conditions := make([]string, 0, 4)
@@ -1874,11 +2570,53 @@ func (s *Server) listRunsFromPostgres(ctx context.Context, projectID, threadID, 
 		var run contracts.Run
 		var rawStatus string
 		var rawStrategy string
-		if err := rows.Scan(&run.ID, &run.ThreadID, &run.AssistantID, &rawStatus, &rawStrategy, &run.StreamResumable, &run.CreatedAt, &run.UpdatedAt); err != nil {
+		var (
+			rawInput    []byte
+			rawOutput   []byte
+			rawError    []byte
+			rawMetadata []byte
+			startedAt   sql.NullTime
+			completedAt sql.NullTime
+		)
+		if err := rows.Scan(
+			&run.ID,
+			&run.ThreadID,
+			&run.AssistantID,
+			&rawStatus,
+			&rawStrategy,
+			&run.StreamResumable,
+			&rawInput,
+			&rawOutput,
+			&rawError,
+			&rawMetadata,
+			&run.CheckpointID,
+			&startedAt,
+			&completedAt,
+			&run.CreatedAt,
+			&run.UpdatedAt,
+		); err != nil {
 			return nil, err
 		}
 		run.Status = contracts.RunStatus(rawStatus)
 		run.MultitaskStrategy = contracts.MultitaskStrategy(rawStrategy)
+		run.Input = decodeJSONAny(rawInput)
+		run.Output = decodeJSONAny(rawOutput)
+		run.Error = decodeJSONAny(rawError)
+		if len(rawMetadata) > 0 {
+			run.Metadata = map[string]any{}
+			_ = json.Unmarshal(rawMetadata, &run.Metadata)
+			if len(run.Metadata) == 0 {
+				run.Metadata = nil
+			}
+		}
+		if startedAt.Valid {
+			ts := startedAt.Time.UTC()
+			run.StartedAt = &ts
+		}
+		if completedAt.Valid {
+			ts := completedAt.Time.UTC()
+			run.CompletedAt = &ts
+		}
 		out = append(out, run)
 	}
 	return out, rows.Err()
@@ -2023,6 +2761,37 @@ func (s *Server) getThreadFromPostgres(ctx context.Context, projectID, threadID 
 	return thread, nil
 }
 
+func (s *Server) ensureThreadScoped(ctx context.Context, projectID, threadID string) error {
+	if strings.TrimSpace(threadID) == "" {
+		return sql.ErrNoRows
+	}
+	if s.pg == nil {
+		return nil
+	}
+	var exists bool
+	if projectID == "" {
+		if err := s.pg.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM threads WHERE id=$1)`, threadID).Scan(&exists); err != nil {
+			return err
+		}
+	} else {
+		if err := s.pg.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1
+				FROM threads t
+				JOIN assistants a ON a.id = t.assistant_id
+				JOIN deployments d ON d.id = a.deployment_id
+				WHERE t.id=$1 AND d.project_id=$2
+			)
+		`, threadID, projectID).Scan(&exists); err != nil {
+			return err
+		}
+	}
+	if !exists {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *Server) deleteThreadFromPostgres(ctx context.Context, projectID, threadID string) error {
 	tx, err := s.pg.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -2095,6 +2864,17 @@ func nilString(input *string) any {
 		return nil
 	}
 	return *input
+}
+
+func decodeJSONAny(raw []byte) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var out any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil
+	}
+	return out
 }
 
 func (s *Server) listStoreItems(w http.ResponseWriter, r *http.Request) {
@@ -2897,56 +3677,125 @@ func (s *Server) deleteCron(w http.ResponseWriter, r *http.Request) {
 func (s *Server) a2a(w http.ResponseWriter, r *http.Request) {
 	type rpcRequest struct {
 		JSONRPC string          `json:"jsonrpc"`
-		ID      string          `json:"id"`
+		ID      json.RawMessage `json:"id"`
 		Method  string          `json:"method"`
 		Params  json.RawMessage `json:"params"`
 	}
 	type rpcParams struct {
-		ContextID string `json:"contextId"`
-		TaskID    string `json:"taskId"`
-		Message   struct {
-			ContextID string `json:"contextId"`
-		} `json:"message"`
+		ContextID string         `json:"contextId"`
+		TaskID    string         `json:"taskId"`
+		Message   map[string]any `json:"message"`
+		Command   any            `json:"command"`
 	}
+	writeRPCError := func(id json.RawMessage, code int, message string) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"jsonrpc": "2.0",
+			"id":      decodeRPCID(id),
+			"error": map[string]any{
+				"code":    code,
+				"message": message,
+			},
+		})
+	}
+
 	var req rpcRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		writeRPCError(nil, -32700, "parse error")
 		return
 	}
+	if strings.TrimSpace(req.JSONRPC) != "2.0" {
+		writeRPCError(req.ID, -32600, "invalid request")
+		return
+	}
+	if len(req.ID) == 0 || strings.EqualFold(strings.TrimSpace(string(req.ID)), "null") {
+		writeRPCError(nil, -32600, "invalid request")
+		return
+	}
+
 	allowed := map[string]bool{"message/send": true, "message/stream": true, "tasks/get": true, "tasks/cancel": true}
 	if !allowed[req.Method] {
-		writeJSON(w, http.StatusOK, map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32601, "message": "method not found"}})
+		writeRPCError(req.ID, -32601, "method not found")
 		return
 	}
 
 	var params rpcParams
-	_ = json.Unmarshal(req.Params, &params)
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			writeRPCError(req.ID, -32602, "invalid params")
+			return
+		}
+	}
 
 	threadID := strings.TrimSpace(params.ContextID)
-	if threadID == "" {
-		threadID = strings.TrimSpace(params.Message.ContextID)
+	if threadID == "" && params.Message != nil {
+		if contextID, ok := params.Message["contextId"].(string); ok {
+			threadID = strings.TrimSpace(contextID)
+		}
 	}
-	if threadID == "" {
-		threadID = "thread_default"
+	taskID := strings.TrimSpace(params.TaskID)
+	if req.Method == "message/send" || req.Method == "message/stream" {
+		if threadID == "" {
+			writeRPCError(req.ID, -32602, "invalid params: contextId is required")
+			return
+		}
+		if req.Method == "message/stream" && params.Message == nil {
+			writeRPCError(req.ID, -32602, "invalid params: message is required")
+			return
+		}
+		if taskID == "" {
+			taskID = contracts.NewID("task")
+		}
+		s.store.mu.Lock()
+		s.store.a2aTasks[taskID] = a2aTaskRecord{
+			ID:        taskID,
+			ThreadID:  threadID,
+			Status:    "accepted",
+			CreatedAt: time.Now().UTC(),
+		}
+		s.store.mu.Unlock()
 	}
+
+	if req.Method == "tasks/get" || req.Method == "tasks/cancel" {
+		if taskID == "" {
+			writeRPCError(req.ID, -32602, "invalid params: taskId is required")
+			return
+		}
+		s.store.mu.RLock()
+		task, ok := s.store.a2aTasks[taskID]
+		s.store.mu.RUnlock()
+		if !ok {
+			writeRPCError(req.ID, -32004, "task not found")
+			return
+		}
+		if req.Method == "tasks/cancel" && !envBoolOrDefault("A2A_TASKS_CANCEL_SUPPORTED", false) {
+			writeRPCError(req.ID, -32001, "tasks/cancel unsupported")
+			return
+		}
+		if req.Method == "tasks/cancel" {
+			s.store.mu.Lock()
+			task.Status = "cancelled"
+			s.store.a2aTasks[taskID] = task
+			s.store.mu.Unlock()
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"jsonrpc": "2.0",
+			"id":      decodeRPCID(req.ID),
+			"result": map[string]any{
+				"task_id":   taskID,
+				"thread_id": task.ThreadID,
+				"status":    task.Status,
+			},
+		})
+		return
+	}
+
 	if req.Method == "message/stream" {
 		startFrom := parseStartFrom(r.Header.Get("Last-Event-ID"))
 		events := []streamEvent{
-			mkEvent(1, "message_received", map[string]any{"thread_id": threadID, "assistant_id": chi.URLParam(r, "assistant_id")}),
-			mkEvent(2, "message_completed", map[string]any{"thread_id": threadID, "status": "ok"}),
+			mkEvent(1, "message_received", map[string]any{"thread_id": threadID, "assistant_id": chi.URLParam(r, "assistant_id"), "task_id": taskID}),
+			mkEvent(2, "message_completed", map[string]any{"thread_id": threadID, "status": "ok", "task_id": taskID}),
 		}
 		streamSSE(w, r, events, startFrom)
-		return
-	}
-	if req.Method == "tasks/cancel" && !envBoolOrDefault("A2A_TASKS_CANCEL_SUPPORTED", false) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"jsonrpc": "2.0",
-			"id":      req.ID,
-			"error": map[string]any{
-				"code":    -32001,
-				"message": "tasks/cancel unsupported",
-			},
-		})
 		return
 	}
 
@@ -2954,16 +3803,48 @@ func (s *Server) a2a(w http.ResponseWriter, r *http.Request) {
 		"accepted":  true,
 		"method":    req.Method,
 		"thread_id": threadID,
+		"task_id":   taskID,
 	}
-	if req.Method == "tasks/get" || req.Method == "tasks/cancel" {
-		taskID := strings.TrimSpace(params.TaskID)
-		if taskID == "" {
-			taskID = contracts.NewID("task")
-		}
-		result["task_id"] = taskID
-		result["status"] = "ok"
+	writeJSON(w, http.StatusOK, map[string]any{"jsonrpc": "2.0", "id": decodeRPCID(req.ID), "result": result})
+}
+
+func decodeRPCID(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
+	var out any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return string(raw)
+	}
+	return out
+}
+
+func (s *Server) a2aAgentCard(w http.ResponseWriter, r *http.Request) {
+	assistantID := strings.TrimSpace(chi.URLParam(r, "assistant_id"))
+	if assistantID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_assistant_id", "assistant_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	base := "https://example.invalid"
+	if r.TLS == nil {
+		base = "http://" + r.Host
+	} else {
+		base = "https://" + r.Host
+	}
+	cardPath := fmt.Sprintf("/a2a/%s", assistantID)
+	if strings.HasPrefix(r.URL.Path, "/api/v1/") {
+		cardPath = fmt.Sprintf("/api/v1/a2a/%s", assistantID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":          assistantID,
+		"name":        "LangOpen Assistant",
+		"description": "LangOpen A2A compatible assistant endpoint",
+		"endpoint":    base + cardPath,
+		"protocols":   []string{"a2a-json-rpc-2.0"},
+		"capabilities": map[string]any{
+			"methods": []string{"message/send", "message/stream", "tasks/get", "tasks/cancel"},
+		},
+	})
 }
 
 func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {

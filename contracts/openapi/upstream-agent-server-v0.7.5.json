@@ -1,0 +1,41 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Pinned Upstream Agent Server API",
+    "version": "v0.7.5",
+    "x-upstream-release-date": "2026-01-21"
+  },
+  "paths": {
+    "/assistants": {"get": {}, "post": {}},
+    "/assistants/search": {"post": {}},
+    "/assistants/{assistant_id}": {"get": {}, "patch": {}, "delete": {}},
+    "/threads": {"get": {}, "post": {}},
+    "/threads/search": {"post": {}},
+    "/threads/{thread_id}": {"get": {}, "patch": {}, "delete": {}},
+    "/threads/{thread_id}/history": {"get": {}},
+    "/threads/{thread_id}/state": {"post": {}},
+    "/threads/{thread_id}/runs": {"get": {}, "post": {}},
+    "/threads/{thread_id}/runs/stream": {"post": {}},
+    "/threads/{thread_id}/runs/wait": {"post": {}},
+    "/threads/{thread_id}/runs/{run_id}": {"get": {}, "delete": {}},
+    "/threads/{thread_id}/runs/{run_id}/cancel": {"post": {}},
+    "/threads/{thread_id}/runs/{run_id}/stream": {"get": {}},
+    "/runs": {"get": {}, "post": {}},
+    "/runs/stream": {"post": {}},
+    "/runs/wait": {"post": {}},
+    "/runs/{run_id}": {"get": {}, "delete": {}},
+    "/runs/{run_id}/cancel": {"post": {}},
+    "/runs/{run_id}/stream": {"get": {}},
+    "/runs/{run_id}/wait": {"post": {}},
+    "/store/items": {"get": {}, "post": {}},
+    "/store/items/{namespace}/{key}": {"get": {}, "delete": {}},
+    "/crons": {"get": {}, "post": {}},
+    "/crons/{cron_id}": {"get": {}, "patch": {}, "delete": {}},
+    "/a2a/{assistant_id}": {"post": {}},
+    "/a2a/{assistant_id}/.well-known/agent-card.json": {"get": {}},
+    "/mcp": {"get": {}, "post": {}},
+    "/system": {"get": {}},
+    "/system/health": {"get": {}},
+    "/system/attention": {"get": {}}
+  }
+}

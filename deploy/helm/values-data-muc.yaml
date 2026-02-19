@@ -38,11 +38,17 @@ apiServer:
 
 worker:
   replicas: 1
+  executor: runtime
+  runtimeRunnerUrl: http://langopen-runtime-runner
   runMode: mode_a
   sandboxEnabled: false
   sandboxNamespace: langopen
   sandboxTemplateName: langopen-default
   metricsAddr: ":9091"
+
+runtimeRunner:
+  enabled: true
+  replicas: 1
 
 controlPlane:
   enabled: true

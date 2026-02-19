@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -63,6 +64,8 @@ type Worker struct {
 	webhookPollInterval time.Duration
 	webhookMaxAttempts  int
 	stuckRunThreshold   time.Duration
+	executorMode        string
+	executor            runExecutor
 }
 
 type pendingRun struct {
@@ -70,6 +73,11 @@ type pendingRun struct {
 	ThreadID        string
 	AssistantID     string
 	StreamResumable bool
+	Input           any
+	Command         any
+	Configurable    any
+	Metadata        map[string]any
+	CheckpointID    string
 }
 
 type runCorrelation struct {
@@ -96,6 +104,98 @@ type webhookDelivery struct {
 	UpdatedAt time.Time
 }
 
+type runExecutor interface {
+	Execute(ctx context.Context, run pendingRun) (executeResult, error)
+}
+
+type executeResult struct {
+	Status contracts.RunStatus
+	Output any
+	Error  any
+	Events []executorEvent
+}
+
+type executorEvent struct {
+	Name    string
+	Payload any
+}
+
+type simulatedExecutor struct{}
+
+func (e *simulatedExecutor) Execute(_ context.Context, _ pendingRun) (executeResult, error) {
+	return executeResult{
+		Status: contracts.RunStatusSuccess,
+		Output: map[string]any{"message": "simulated execution"},
+		Events: []executorEvent{
+			{Name: "token", Payload: map[string]any{"token": "hello"}},
+		},
+	}, nil
+}
+
+type runtimeRunnerExecutor struct {
+	baseURL    string
+	httpClient *http.Client
+}
+
+func (e *runtimeRunnerExecutor) Execute(ctx context.Context, run pendingRun) (executeResult, error) {
+	payload := map[string]any{
+		"run_id":        run.ID,
+		"thread_id":     run.ThreadID,
+		"assistant_id":  run.AssistantID,
+		"input":         run.Input,
+		"command":       run.Command,
+		"configurable":  run.Configurable,
+		"metadata":      run.Metadata,
+		"checkpoint_id": run.CheckpointID,
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(e.baseURL, "/")+"/execute", bytes.NewReader(body))
+	if err != nil {
+		return executeResult{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return executeResult{}, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return executeResult{}, fmt.Errorf("runtime-runner status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var parsed struct {
+		Status string `json:"status"`
+		Output any    `json:"output"`
+		Error  any    `json:"error"`
+		Events []struct {
+			Event string `json:"event"`
+			Data  any    `json:"data"`
+		} `json:"events"`
+	}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			return executeResult{}, fmt.Errorf("decode runtime-runner response: %w", err)
+		}
+	}
+	result := executeResult{
+		Status: contracts.RunStatus(strings.TrimSpace(parsed.Status)),
+		Output: parsed.Output,
+		Error:  parsed.Error,
+		Events: make([]executorEvent, 0, len(parsed.Events)),
+	}
+	if result.Status == "" {
+		result.Status = contracts.RunStatusSuccess
+	}
+	for _, item := range parsed.Events {
+		name := strings.TrimSpace(item.Event)
+		if name == "" {
+			continue
+		}
+		result.Events = append(result.Events, executorEvent{Name: name, Payload: item.Data})
+	}
+	return result, nil
+}
+
 func New(cfg Config, logger *slog.Logger) (*Worker, error) {
 	initWorkerMetrics()
 	w := &Worker{
@@ -117,6 +217,7 @@ func New(cfg Config, logger *slog.Logger) (*Worker, error) {
 		webhookPollInterval: time.Duration(envIntOrDefault("WEBHOOK_POLL_SECONDS", 5)) * time.Second,
 		webhookMaxAttempts:  envIntOrDefault("WEBHOOK_MAX_ATTEMPTS", 6),
 		stuckRunThreshold:   time.Duration(envIntOrDefault("STUCK_RUN_SECONDS", 300)) * time.Second,
+		executorMode:        strings.TrimSpace(strings.ToLower(envOrDefault("LANGOPEN_EXECUTOR", "runtime"))),
 	}
 	if cfg.PostgresDSN != "" {
 		pg, err := pgxpool.New(context.Background(), cfg.PostgresDSN)
@@ -142,6 +243,19 @@ func New(cfg Config, logger *slog.Logger) (*Worker, error) {
 			w.dynamic = dynClient
 		}
 	}
+	runtimeURL := envOrDefault("RUNTIME_RUNNER_URL", "http://langopen-runtime-runner")
+	if w.executorMode == "simulated" {
+		w.executor = &simulatedExecutor{}
+	} else {
+		w.executorMode = "runtime"
+		w.executor = &runtimeRunnerExecutor{
+			baseURL: runtimeURL,
+			httpClient: &http.Client{
+				Timeout: time.Duration(envIntOrDefault("RUNTIME_RUNNER_TIMEOUT_SECONDS", 120)) * time.Second,
+			},
+		}
+	}
+	w.logger.Info("worker_executor_configured", "executor_mode", w.executorMode, "runtime_runner_url", runtimeURL)
 	return w, nil
 }
 
@@ -263,22 +377,36 @@ func (w *Worker) fetchNextPendingRun(ctx context.Context) (pendingRun, error) {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	run := pendingRun{}
+	var (
+		rawInput    []byte
+		rawMetadata []byte
+	)
 	err = tx.QueryRow(ctx, `
-		SELECT id, COALESCE(thread_id,''), assistant_id, stream_resumable
+		SELECT id, COALESCE(thread_id,''), assistant_id, stream_resumable, COALESCE(input_json, '{}'::jsonb), COALESCE(metadata_json, '{}'::jsonb), COALESCE(checkpoint_id, '')
 		FROM runs
 		WHERE status='pending'
 		ORDER BY created_at ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
-	`).Scan(&run.ID, &run.ThreadID, &run.AssistantID, &run.StreamResumable)
+	`).Scan(&run.ID, &run.ThreadID, &run.AssistantID, &run.StreamResumable, &rawInput, &rawMetadata, &run.CheckpointID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return pendingRun{}, sql.ErrNoRows
 		}
 		return pendingRun{}, err
 	}
+	_ = json.Unmarshal(rawInput, &run.Input)
+	metadata := map[string]any{}
+	_ = json.Unmarshal(rawMetadata, &metadata)
+	run.Metadata = metadata
+	if configurable, ok := metadata["configurable"]; ok {
+		run.Configurable = configurable
+	}
+	if command, ok := metadata["command"]; ok {
+		run.Command = command
+	}
 
-	_, err = tx.Exec(ctx, `UPDATE runs SET status='running', updated_at=NOW() WHERE id=$1`, run.ID)
+	_, err = tx.Exec(ctx, `UPDATE runs SET status='running', started_at=COALESCE(started_at, NOW()), updated_at=NOW() WHERE id=$1`, run.ID)
 	if err != nil {
 		return pendingRun{}, err
 	}
@@ -300,7 +428,21 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 		"assistant_id", corr.AssistantID,
 		"thread_id", corr.ThreadID,
 		"run_id", corr.RunID,
+		"executor_mode", w.executorMode,
 	)
+	action := ""
+	defer func() {
+		_ = w.redis.Del(ctx, cancelKeyPrefix()+run.ID).Err()
+		w.logger.Info("run_finished",
+			"org_id", corr.OrgID,
+			"project_id", corr.ProjectID,
+			"deployment_id", corr.DeploymentID,
+			"assistant_id", corr.AssistantID,
+			"thread_id", corr.ThreadID,
+			"run_id", corr.RunID,
+			"action", action,
+		)
+	}()
 	if w.runMode == "mode_b" {
 		if w.sandboxEnabled {
 			sandboxID, err := w.allocateSandboxClaim(ctx, run.ID)
@@ -341,12 +483,8 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 	}
 	w.emitStreamEvent(ctx, run, "run_started", map[string]any{"run_id": run.ID, "status": "running"})
 
-	time.Sleep(200 * time.Millisecond)
-	action, _ := w.redis.Get(ctx, cancelKeyPrefix()+run.ID).Result()
-	action = strings.TrimSpace(action)
-
-	switch action {
-	case "rollback":
+	action = w.currentCancelAction(ctx, run.ID)
+	if action == "rollback" {
 		if err := w.rollbackRun(ctx, run.ID); err != nil {
 			w.logger.Error("run_rollback_failed",
 				"org_id", corr.OrgID,
@@ -362,8 +500,10 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 		_ = w.updateCronExecutionStatus(ctx, run.ID, "rolled_back")
 		w.emitStreamEvent(ctx, run, "run_rolled_back", map[string]any{"run_id": run.ID, "status": "rolled_back"})
 		_ = w.redis.Del(ctx, streamBufferPrefix()+run.ID).Err()
-	case "interrupt":
-		if err := w.updateRunStatus(ctx, run.ID, contracts.RunStatusInterrupted); err != nil {
+		return
+	}
+	if action == "interrupt" {
+		if err := w.updateRunResult(ctx, run.ID, contracts.RunStatusInterrupted, nil, nil); err != nil {
 			w.logger.Error("run_interrupt_failed",
 				"org_id", corr.OrgID,
 				"project_id", corr.ProjectID,
@@ -388,9 +528,25 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 				"error", err,
 			)
 		}
-	default:
-		if err := w.updateRunStatus(ctx, run.ID, contracts.RunStatusSuccess); err != nil {
-			w.logger.Error("run_complete_failed",
+		return
+	}
+
+	if w.executor == nil {
+		w.executor = &simulatedExecutor{}
+	}
+	result, execErr := w.executor.Execute(ctx, run)
+	if execErr != nil {
+		result.Status = contracts.RunStatusError
+		result.Error = map[string]any{"message": execErr.Error()}
+	}
+	if result.Status == "" {
+		result.Status = contracts.RunStatusSuccess
+	}
+
+	action = w.currentCancelAction(ctx, run.ID)
+	if action == "rollback" {
+		if err := w.rollbackRun(ctx, run.ID); err != nil {
+			w.logger.Error("run_rollback_failed",
 				"org_id", corr.OrgID,
 				"project_id", corr.ProjectID,
 				"deployment_id", corr.DeploymentID,
@@ -401,32 +557,56 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 			)
 			return
 		}
-		_ = w.updateCronExecutionStatus(ctx, run.ID, "success")
-		w.emitStreamEvent(ctx, run, "token", map[string]any{"token": "hello"})
-		w.emitStreamEvent(ctx, run, "run_completed", map[string]any{"run_id": run.ID, "status": "success"})
-		if err := w.enqueueWebhookForRun(ctx, run.ID); err != nil {
-			w.logger.Error("enqueue_webhook_failed",
-				"org_id", corr.OrgID,
-				"project_id", corr.ProjectID,
-				"deployment_id", corr.DeploymentID,
-				"assistant_id", corr.AssistantID,
-				"thread_id", corr.ThreadID,
-				"run_id", corr.RunID,
-				"error", err,
-			)
-		}
+		_ = w.updateCronExecutionStatus(ctx, run.ID, "rolled_back")
+		w.emitStreamEvent(ctx, run, "run_rolled_back", map[string]any{"run_id": run.ID, "status": "rolled_back"})
+		_ = w.redis.Del(ctx, streamBufferPrefix()+run.ID).Err()
+		return
+	}
+	if action == "interrupt" {
+		result.Status = contracts.RunStatusInterrupted
+		result.Error = nil
 	}
 
-	_ = w.redis.Del(ctx, cancelKeyPrefix()+run.ID).Err()
-	w.logger.Info("run_finished",
-		"org_id", corr.OrgID,
-		"project_id", corr.ProjectID,
-		"deployment_id", corr.DeploymentID,
-		"assistant_id", corr.AssistantID,
-		"thread_id", corr.ThreadID,
-		"run_id", corr.RunID,
-		"action", action,
-	)
+	for _, ev := range result.Events {
+		name := strings.TrimSpace(ev.Name)
+		if name == "" {
+			continue
+		}
+		w.emitStreamEvent(ctx, run, name, ev.Payload)
+	}
+
+	if err := w.updateRunResult(ctx, run.ID, result.Status, result.Output, result.Error); err != nil {
+		w.logger.Error("run_complete_failed",
+			"org_id", corr.OrgID,
+			"project_id", corr.ProjectID,
+			"deployment_id", corr.DeploymentID,
+			"assistant_id", corr.AssistantID,
+			"thread_id", corr.ThreadID,
+			"run_id", corr.RunID,
+			"error", err,
+		)
+		return
+	}
+	_ = w.updateCronExecutionStatus(ctx, run.ID, string(result.Status))
+	switch result.Status {
+	case contracts.RunStatusInterrupted:
+		w.emitStreamEvent(ctx, run, "run_interrupted", map[string]any{"run_id": run.ID, "status": "interrupted"})
+	case contracts.RunStatusSuccess:
+		w.emitStreamEvent(ctx, run, "run_completed", map[string]any{"run_id": run.ID, "status": "success"})
+	default:
+		w.emitStreamEvent(ctx, run, "run_failed", map[string]any{"run_id": run.ID, "status": result.Status, "error": result.Error})
+	}
+	if err := w.enqueueWebhookForRun(ctx, run.ID); err != nil {
+		w.logger.Error("enqueue_webhook_failed",
+			"org_id", corr.OrgID,
+			"project_id", corr.ProjectID,
+			"deployment_id", corr.DeploymentID,
+			"assistant_id", corr.AssistantID,
+			"thread_id", corr.ThreadID,
+			"run_id", corr.RunID,
+			"error", err,
+		)
+	}
 }
 
 func (w *Worker) fetchRunCorrelation(ctx context.Context, run pendingRun) runCorrelation {
@@ -476,13 +656,42 @@ func (w *Worker) rollbackRun(ctx context.Context, runID string) error {
 }
 
 func (w *Worker) updateRunStatus(ctx context.Context, runID string, status contracts.RunStatus) error {
-	_, err := w.pg.Exec(ctx, `UPDATE runs SET status=$2, updated_at=NOW() WHERE id=$1`, runID, status)
-	return err
+	return w.updateRunResult(ctx, runID, status, nil, nil)
 }
 
 func (w *Worker) updateCronExecutionStatus(ctx context.Context, runID, status string) error {
 	_, err := w.pg.Exec(ctx, `UPDATE cron_executions SET status=$2 WHERE run_id=$1`, runID, status)
 	return err
+}
+
+func (w *Worker) updateRunResult(ctx context.Context, runID string, status contracts.RunStatus, output any, errPayload any) error {
+	outputRaw, _ := json.Marshal(output)
+	errorRaw, _ := json.Marshal(errPayload)
+	_, err := w.pg.Exec(ctx, `
+		UPDATE runs
+		SET status=$2,
+		    output_json=COALESCE(NULLIF($3::text,''), '{}')::jsonb,
+		    error_json=COALESCE(NULLIF($4::text,''), '{}')::jsonb,
+		    started_at=COALESCE(started_at, NOW()),
+		    completed_at=CASE
+		      WHEN $2 IN ('success','error','timeout','interrupted') THEN NOW()
+		      ELSE completed_at
+		    END,
+		    updated_at=NOW()
+		WHERE id=$1
+	`, runID, status, string(outputRaw), string(errorRaw))
+	return err
+}
+
+func (w *Worker) currentCancelAction(ctx context.Context, runID string) string {
+	if w.redis == nil {
+		return ""
+	}
+	action, err := w.redis.Get(ctx, cancelKeyPrefix()+runID).Result()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(action)
 }
 
 func (w *Worker) emitStreamEvent(ctx context.Context, run pendingRun, name string, payload any) {

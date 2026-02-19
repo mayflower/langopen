@@ -48,11 +48,23 @@ worker:
   enabled: true
   replicas: 2
   runtimeClassName: gvisor
+  executor: runtime
+  runtimeRunnerUrl: ""
   runMode: mode_a
   sandboxEnabled: false
   sandboxNamespace: ""
   sandboxTemplateName: "langopen-default"
   metricsAddr: ":9091"
+  resources: {}
+
+runtimeRunner:
+  enabled: true
+  replicas: 1
+  runtimeClassName: gvisor
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 8083
   resources: {}
 
 controlPlane:

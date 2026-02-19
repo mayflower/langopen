@@ -1,6 +1,8 @@
 # LangOpen
 
-Open, Kubernetes-native LangGraph-compatible platform scaffold.
+LangOpen is a Kubernetes-native, budget-friendly LangGraph-compatible server.
+
+It implements LangGraph-compatible APIs and runtime semantics so teams can run agent infrastructure on their own cluster with lower cost and full control.
 
 ## Layout
 
@@ -54,3 +56,7 @@ Related GitOps files:
 - `../argocd/data-muc/demo-apps/langopen.yaml`
 - `../data-cluster/langopen/values.yaml`
 - `../data-cluster/langopen/charts/pre-setup/values.sops.yaml`
+
+## License
+
+MIT. See `LICENSE`.

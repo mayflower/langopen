@@ -1,0 +1,25 @@
+name: OpenAPI Parity
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check OpenAPI parity
+        run: |
+          python3 ./scripts/check_openapi_parity.py
+
+      - name: Upload parity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-gap-report
+          path: contracts/openapi/parity-gap-report.json

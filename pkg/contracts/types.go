@@ -46,6 +46,13 @@ type Run struct {
 	Status            RunStatus         `json:"status"`
 	MultitaskStrategy MultitaskStrategy `json:"multitask_strategy"`
 	StreamResumable   bool              `json:"stream_resumable"`
+	Input             any               `json:"input,omitempty"`
+	Output            any               `json:"output,omitempty"`
+	Error             any               `json:"error,omitempty"`
+	Metadata          map[string]any    `json:"metadata,omitempty"`
+	CheckpointID      string            `json:"checkpoint_id,omitempty"`
+	StartedAt         *time.Time        `json:"started_at,omitempty"`
+	CompletedAt       *time.Time        `json:"completed_at,omitempty"`
 	CreatedAt         time.Time         `json:"created_at"`
 	UpdatedAt         time.Time         `json:"updated_at"`
 }

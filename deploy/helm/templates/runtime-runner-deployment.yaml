@@ -1,0 +1,64 @@
+{{- if .Values.runtimeRunner.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "langopen.fullname" . }}-runtime-runner
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: runtime-runner
+spec:
+  replicas: {{ .Values.runtimeRunner.replicas }}
+  selector:
+    matchLabels:
+      {{- include "langopen.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: runtime-runner
+  template:
+    metadata:
+      labels:
+        {{- include "langopen.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: runtime-runner
+    spec:
+      {{- if .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      {{- if .Values.runtimeRunner.runtimeClassName }}
+      runtimeClassName: {{ .Values.runtimeRunner.runtimeClassName }}
+      {{- end }}
+      automountServiceAccountToken: false
+      containers:
+        - name: runtime-runner
+          image: {{ include "langopen.image" (dict "Values" .Values "component" "runtime-runner") | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.runtimeRunner.service.targetPort }}
+              name: http
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            {{- toYaml .Values.runtimeRunner.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "langopen.fullname" . }}-runtime-runner
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: runtime-runner
+spec:
+  type: {{ .Values.runtimeRunner.service.type }}
+  selector:
+    {{- include "langopen.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: runtime-runner
+  ports:
+    - name: http
+      port: {{ .Values.runtimeRunner.service.port }}
+      targetPort: {{ .Values.runtimeRunner.service.targetPort }}
+{{- end }}

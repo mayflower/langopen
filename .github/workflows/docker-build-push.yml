@@ -55,7 +55,7 @@ jobs:
           {
             echo "## Published Images"
             echo
-            for component in api-server worker control-plane builder operator portal; do
+            for component in api-server worker control-plane builder operator runtime-runner portal; do
               echo "- ${REGISTRY}/${component}:${TAG}"
             done
           } >> "$GITHUB_STEP_SUMMARY"

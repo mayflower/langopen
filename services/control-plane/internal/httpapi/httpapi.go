@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -56,11 +57,12 @@ type API struct {
 }
 
 type state struct {
-	Deployments []map[string]any
-	Builds      []map[string]any
-	APIKeys     []map[string]any
-	Audit       []map[string]any
-	Secrets     []map[string]any
+	Deployments         []map[string]any
+	Builds              []map[string]any
+	APIKeys             []map[string]any
+	Audit               []map[string]any
+	Secrets             []map[string]any
+	DeploymentRevisions map[string][]deploymentRevisionRecord
 }
 
 type deploymentRecord struct {
@@ -85,6 +87,16 @@ type buildRecord struct {
 	LogsRef      string    `json:"logs_ref,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type deploymentRevisionRecord struct {
+	ID           string         `json:"id"`
+	DeploymentID string         `json:"deployment_id"`
+	RevisionID   string         `json:"revision_id"`
+	ImageDigest  string         `json:"image_digest"`
+	Reason       string         `json:"reason"`
+	Metadata     map[string]any `json:"metadata,omitempty"`
+	CreatedAt    time.Time      `json:"created_at"`
 }
 
 type apiKeyRecord struct {
@@ -161,6 +173,20 @@ func New(logger *slog.Logger) *API {
 		v1.Delete("/secrets/bindings/{binding_id}", a.deleteSecretBinding)
 		v1.Get("/audit", a.listAudit)
 	})
+	r.Route("/v2", func(v2 chi.Router) {
+		v2.Get("/deployments", a.listDeployments)
+		v2.Post("/deployments", a.createDeployment)
+		v2.Get("/deployments/{deployment_id}", a.getDeploymentByID)
+		v2.Patch("/deployments/{deployment_id}", a.updateDeployment)
+		v2.Delete("/deployments/{deployment_id}", a.deleteDeployment)
+		v2.Get("/deployments/{deployment_id}/revisions", a.listDeploymentRevisions)
+		v2.Post("/deployments/{deployment_id}/rollback", a.rollbackDeploymentV2)
+	})
+	r.Route("/v1/integrations/github", func(v1gh chi.Router) {
+		v1gh.Get("/auth", a.githubAuthMetadata)
+		v1gh.Post("/validate", a.githubValidatePAT)
+		v1gh.Get("/repos", a.githubListRepos)
+	})
 	a.router = r
 	return a
 }
@@ -217,8 +243,10 @@ func requiredRoleFor(method, path string) contracts.ProjectRole {
 		return contracts.RoleOperator
 	}
 	if strings.HasPrefix(path, "/internal/v1/deployments") ||
+		strings.HasPrefix(path, "/v2/deployments") ||
 		strings.HasPrefix(path, "/internal/v1/builds") ||
 		strings.HasPrefix(path, "/internal/v1/sources/validate") ||
+		strings.HasPrefix(path, "/v1/integrations/github") ||
 		strings.HasPrefix(path, "/internal/v1/secrets/") {
 		return contracts.RoleDeveloper
 	}
@@ -330,6 +358,7 @@ func (a *API) createDeployment(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = a.writeAudit(r.Context(), rec.ProjectID, "deployment.created", map[string]any{"deployment_id": rec.ID, "repo_url": rec.RepoURL, "git_ref": rec.GitRef})
+		_, _ = a.recordDeploymentRevision(r.Context(), rec, "create", map[string]any{"source": "createDeployment"})
 		if err := a.syncAgentDeploymentRecord(r.Context(), rec); err != nil {
 			contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
@@ -342,6 +371,7 @@ func (a *API) createDeployment(w http.ResponseWriter, r *http.Request) {
 	a.state.Deployments = append(a.state.Deployments, mapFromDeployment(rec))
 	a.state.Audit = append(a.state.Audit, map[string]any{"event": "deployment.created", "timestamp": now, "deployment_id": rec.ID, "project_id": rec.ProjectID})
 	a.mu.Unlock()
+	_, _ = a.recordDeploymentRevision(r.Context(), rec, "create", map[string]any{"source": "createDeployment"})
 	if err := a.syncAgentDeploymentRecord(r.Context(), rec); err != nil {
 		contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 		return
@@ -558,6 +588,7 @@ func (a *API) updateDeployment(w http.ResponseWriter, r *http.Request) {
 			"runtime_profile": rec.RuntimeProfile,
 			"mode":            rec.Mode,
 		})
+		_, _ = a.recordDeploymentRevision(r.Context(), rec, "update", map[string]any{"source": "updateDeployment"})
 		if err := a.syncAgentDeploymentRecord(r.Context(), rec); err != nil {
 			contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
@@ -587,6 +618,7 @@ func (a *API) updateDeployment(w http.ResponseWriter, r *http.Request) {
 		"project_id":    rec.ProjectID,
 	})
 	a.mu.Unlock()
+	_, _ = a.recordDeploymentRevision(r.Context(), rec, "update", map[string]any{"source": "updateDeployment"})
 	if err := a.syncAgentDeploymentRecord(r.Context(), rec); err != nil {
 		contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 		return
@@ -613,7 +645,10 @@ func (a *API) rollbackDeployment(w http.ResponseWriter, r *http.Request) {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_rollback_request", "image_digest is required", observability.RequestIDFromContext(r.Context()))
 		return
 	}
+	a.rollbackDeploymentByDigest(w, r, deploymentID, imageDigest, "digest", map[string]any{"source": "internal_v1"})
+}
 
+func (a *API) rollbackDeploymentByDigest(w http.ResponseWriter, r *http.Request, deploymentID, imageDigest, rollbackSource string, rollbackMetadata map[string]any) {
 	rec, err := a.getDeployment(r.Context(), deploymentID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -649,7 +684,9 @@ func (a *API) rollbackDeployment(w http.ResponseWriter, r *http.Request) {
 		_ = a.writeAudit(r.Context(), projectID, "deployment.rolled_back", map[string]any{
 			"deployment_id": rec.ID,
 			"image_digest":  rec.CurrentImageDigest,
+			"source":        rollbackSource,
 		})
+		_, _ = a.recordDeploymentRevision(r.Context(), rec, "rollback", rollbackMetadata)
 		if err := a.syncAgentDeploymentRecord(r.Context(), rec); err != nil {
 			contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
@@ -678,13 +715,197 @@ func (a *API) rollbackDeployment(w http.ResponseWriter, r *http.Request) {
 		"deployment_id": rec.ID,
 		"project_id":    rec.ProjectID,
 		"image_digest":  rec.CurrentImageDigest,
+		"source":        rollbackSource,
 	})
 	a.mu.Unlock()
+	_, _ = a.recordDeploymentRevision(r.Context(), rec, "rollback", rollbackMetadata)
 	if err := a.syncAgentDeploymentRecord(r.Context(), rec); err != nil {
 		contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 		return
 	}
 	writeJSON(w, http.StatusOK, rec)
+}
+
+func (a *API) rollbackDeploymentV2(w http.ResponseWriter, r *http.Request) {
+	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
+	if deploymentID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	var req struct {
+		RevisionID  string `json:"revision_id"`
+		ImageDigest string `json:"image_digest"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	revisionID := strings.TrimSpace(req.RevisionID)
+	imageDigest := strings.TrimSpace(req.ImageDigest)
+	if revisionID == "" && imageDigest == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_rollback_request", "revision_id or image_digest is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if imageDigest == "" {
+		rev, err := a.getDeploymentRevisionByRevisionID(r.Context(), deploymentID, revisionID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "revision_not_found", "deployment revision not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "revision_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		imageDigest = strings.TrimSpace(rev.ImageDigest)
+		if imageDigest == "" {
+			contracts.WriteError(w, http.StatusBadRequest, "invalid_revision", "revision does not contain image_digest", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+	}
+	a.rollbackDeploymentByDigest(w, r, deploymentID, imageDigest, "v2", map[string]any{
+		"revision_id": revisionID,
+		"source":      "v2",
+	})
+}
+
+func (a *API) listDeploymentRevisions(w http.ResponseWriter, r *http.Request) {
+	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
+	if deploymentID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	deployment, err := a.getDeployment(r.Context(), deploymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if _, err := a.resolveProjectID(r.Context(), deployment.ProjectID); err != nil {
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	revisions, err := a.listDeploymentRevisionsForDeployment(r.Context(), deploymentID)
+	if err != nil {
+		contracts.WriteError(w, http.StatusInternalServerError, "revision_list_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": revisions, "total": len(revisions)})
+}
+
+func (a *API) githubAuthMetadata(w http.ResponseWriter, r *http.Request) {
+	token := strings.TrimSpace(r.Header.Get("X-Github-Token"))
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("GITHUB_PAT"))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"provider":            "github",
+		"auth_mode":           "pat",
+		"configured":          token != "",
+		"installation_flow":   "not_implemented",
+		"supported_endpoints": []string{"/v1/integrations/github/auth", "/v1/integrations/github/validate", "/v1/integrations/github/repos"},
+	})
+}
+
+func (a *API) githubValidatePAT(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	token := strings.TrimSpace(req.Token)
+	if token == "" {
+		token = strings.TrimSpace(r.Header.Get("X-Github-Token"))
+	}
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("GITHUB_PAT"))
+	}
+	if token == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "missing_github_pat", "provide token or configure GITHUB_PAT", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	baseURL := strings.TrimRight(envOrDefault("GITHUB_API_BASE_URL", "https://api.github.com"), "/")
+	user, status, err := a.githubRequest(r.Context(), token, baseURL+"/user")
+	if err != nil {
+		contracts.WriteError(w, http.StatusBadGateway, "github_request_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if status >= 400 {
+		writeJSON(w, status, map[string]any{
+			"provider": "github",
+			"valid":    false,
+			"status":   status,
+			"error":    user,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"provider": "github",
+		"valid":    true,
+		"user": map[string]any{
+			"login": user["login"],
+			"id":    user["id"],
+		},
+	})
+}
+
+func (a *API) githubListRepos(w http.ResponseWriter, r *http.Request) {
+	token := strings.TrimSpace(r.Header.Get("X-Github-Token"))
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("GITHUB_PAT"))
+	}
+	if token == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "missing_github_pat", "set X-Github-Token or configure GITHUB_PAT", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	page := clampInt(parseIntDefault(r.URL.Query().Get("page"), 1), 1, 1000)
+	perPage := clampInt(parseIntDefault(r.URL.Query().Get("per_page"), 50), 1, 100)
+	visibility := strings.TrimSpace(r.URL.Query().Get("visibility"))
+	if visibility == "" {
+		visibility = "all"
+	}
+	baseURL := strings.TrimRight(envOrDefault("GITHUB_API_BASE_URL", "https://api.github.com"), "/")
+	u := fmt.Sprintf("%s/user/repos?sort=updated&per_page=%d&page=%d&visibility=%s", baseURL, perPage, page, url.QueryEscape(visibility))
+	response, status, err := a.githubRequest(r.Context(), token, u)
+	if err != nil {
+		contracts.WriteError(w, http.StatusBadGateway, "github_request_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if status >= 400 {
+		writeJSON(w, status, map[string]any{
+			"provider": "github",
+			"status":   status,
+			"error":    response,
+		})
+		return
+	}
+
+	rawItems, _ := response["items"].([]any)
+	items := make([]map[string]any, 0, len(rawItems))
+	for _, it := range rawItems {
+		repo, _ := it.(map[string]any)
+		if repo == nil {
+			continue
+		}
+		items = append(items, map[string]any{
+			"id":          repo["id"],
+			"name":        repo["name"],
+			"full_name":   repo["full_name"],
+			"private":     repo["private"],
+			"default_ref": repo["default_branch"],
+			"html_url":    repo["html_url"],
+			"clone_url":   repo["clone_url"],
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"provider": "github",
+		"items":    items,
+		"page":     page,
+		"per_page": perPage,
+		"total":    len(items),
+	})
 }
 
 func (a *API) deleteDeployment(w http.ResponseWriter, r *http.Request) {
@@ -730,6 +951,7 @@ func (a *API) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 		_, _ = tx.Exec(r.Context(), `DELETE FROM threads WHERE assistant_id IN (SELECT id FROM assistants WHERE deployment_id=$1)`, deploymentID)
 		_, _ = tx.Exec(r.Context(), `DELETE FROM assistants WHERE deployment_id=$1`, deploymentID)
 		_, _ = tx.Exec(r.Context(), `DELETE FROM builds WHERE deployment_id=$1`, deploymentID)
+		_, _ = tx.Exec(r.Context(), `DELETE FROM deployment_revisions WHERE deployment_id=$1`, deploymentID)
 		_, _ = tx.Exec(r.Context(), `DELETE FROM deployment_secret_bindings WHERE deployment_id=$1`, deploymentID)
 		tag, err := tx.Exec(r.Context(), `DELETE FROM deployments WHERE id=$1`, deploymentID)
 		if err != nil {
@@ -780,6 +1002,7 @@ func (a *API) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 		remainingBuilds = append(remainingBuilds, build)
 	}
 	a.state.Builds = remainingBuilds
+	delete(a.state.DeploymentRevisions, deploymentID)
 
 	remainingSecrets := make([]map[string]any, 0, len(a.state.Secrets))
 	for _, secret := range a.state.Secrets {
@@ -911,6 +1134,11 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 			_, _ = a.pg.Exec(r.Context(), `UPDATE deployments SET current_image_digest=COALESCE(NULLIF($2,''), current_image_digest), updated_at=NOW() WHERE id=$1`, dep.ID, imageRef)
 			dep.CurrentImageDigest = imageRef
 			dep.UpdatedAt = time.Now().UTC()
+			_, _ = a.recordDeploymentRevision(r.Context(), dep, "build", map[string]any{
+				"build_id":   buildID,
+				"commit_sha": req.CommitSHA,
+				"status":     builderResp["status"],
+			})
 			if err := a.syncAgentDeploymentRecord(r.Context(), dep); err != nil {
 				contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 				return
@@ -1856,6 +2084,154 @@ func (a *API) writeAudit(ctx context.Context, projectID, eventType string, paylo
 		VALUES ($1,$2,$3,$4,$5,NOW())
 	`, contracts.NewID("audit"), projectID, "system", eventType, raw)
 	return err
+}
+
+func (a *API) recordDeploymentRevision(ctx context.Context, dep deploymentRecord, reason string, metadata map[string]any) (deploymentRevisionRecord, error) {
+	record := deploymentRevisionRecord{
+		ID:           contracts.NewID("dep_rev"),
+		DeploymentID: dep.ID,
+		RevisionID:   contracts.NewID("rev"),
+		ImageDigest:  strings.TrimSpace(dep.CurrentImageDigest),
+		Reason:       strings.TrimSpace(reason),
+		Metadata:     metadata,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if record.Reason == "" {
+		record.Reason = "update"
+	}
+
+	if a.pg != nil {
+		metaRaw, _ := json.Marshal(record.Metadata)
+		_, err := a.pg.Exec(ctx, `
+			INSERT INTO deployment_revisions (id, deployment_id, revision_id, image_digest, repo_url, git_ref, repo_path, runtime_profile, mode, reason, metadata, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		`, record.ID, record.DeploymentID, record.RevisionID, record.ImageDigest, dep.RepoURL, dep.GitRef, dep.RepoPath, dep.RuntimeProfile, dep.Mode, record.Reason, metaRaw, record.CreatedAt)
+		return record, err
+	}
+
+	a.mu.Lock()
+	if a.state.DeploymentRevisions == nil {
+		a.state.DeploymentRevisions = map[string][]deploymentRevisionRecord{}
+	}
+	a.state.DeploymentRevisions[record.DeploymentID] = append(a.state.DeploymentRevisions[record.DeploymentID], record)
+	a.mu.Unlock()
+	return record, nil
+}
+
+func (a *API) listDeploymentRevisionsForDeployment(ctx context.Context, deploymentID string) ([]deploymentRevisionRecord, error) {
+	if a.pg != nil {
+		rows, err := a.pg.Query(ctx, `
+			SELECT id, deployment_id, revision_id, COALESCE(image_digest,''), reason, COALESCE(metadata, '{}'::jsonb), created_at
+			FROM deployment_revisions
+			WHERE deployment_id=$1
+			ORDER BY created_at DESC
+			LIMIT 200
+		`, deploymentID)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		out := make([]deploymentRevisionRecord, 0, 32)
+		for rows.Next() {
+			var record deploymentRevisionRecord
+			var metadataRaw []byte
+			if err := rows.Scan(&record.ID, &record.DeploymentID, &record.RevisionID, &record.ImageDigest, &record.Reason, &metadataRaw, &record.CreatedAt); err != nil {
+				return nil, err
+			}
+			record.Metadata = map[string]any{}
+			_ = json.Unmarshal(metadataRaw, &record.Metadata)
+			out = append(out, record)
+		}
+		return out, rows.Err()
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	items := append([]deploymentRevisionRecord(nil), a.state.DeploymentRevisions[deploymentID]...)
+	for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
+		items[i], items[j] = items[j], items[i]
+	}
+	return items, nil
+}
+
+func (a *API) getDeploymentRevisionByRevisionID(ctx context.Context, deploymentID, revisionID string) (deploymentRevisionRecord, error) {
+	if a.pg != nil {
+		var record deploymentRevisionRecord
+		var metadataRaw []byte
+		err := a.pg.QueryRow(ctx, `
+			SELECT id, deployment_id, revision_id, COALESCE(image_digest,''), reason, COALESCE(metadata, '{}'::jsonb), created_at
+			FROM deployment_revisions
+			WHERE deployment_id=$1 AND revision_id=$2
+			ORDER BY created_at DESC
+			LIMIT 1
+		`, deploymentID, revisionID).Scan(&record.ID, &record.DeploymentID, &record.RevisionID, &record.ImageDigest, &record.Reason, &metadataRaw, &record.CreatedAt)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return deploymentRevisionRecord{}, sql.ErrNoRows
+			}
+			return deploymentRevisionRecord{}, err
+		}
+		record.Metadata = map[string]any{}
+		_ = json.Unmarshal(metadataRaw, &record.Metadata)
+		return record, nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, record := range a.state.DeploymentRevisions[deploymentID] {
+		if record.RevisionID == revisionID {
+			return record, nil
+		}
+	}
+	return deploymentRevisionRecord{}, sql.ErrNoRows
+}
+
+func (a *API) githubRequest(ctx context.Context, token, rawURL string) (map[string]any, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) == 0 {
+		return map[string]any{}, resp.StatusCode, nil
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err == nil {
+		return obj, resp.StatusCode, nil
+	}
+	var arr []any
+	if err := json.Unmarshal(body, &arr); err == nil {
+		return map[string]any{"items": arr}, resp.StatusCode, nil
+	}
+	return map[string]any{"raw": string(body)}, resp.StatusCode, nil
+}
+
+func parseIntDefault(raw string, fallback int) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func clampInt(value, min, max int) int {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
 }
 
 func generateAPIKey() (string, error) {

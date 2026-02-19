@@ -31,6 +31,7 @@ build worker services/worker/Dockerfile
 build control-plane services/control-plane/Dockerfile
 build builder services/builder/Dockerfile
 build operator services/operator/Dockerfile
+build runtime-runner services/runtime-runner/Dockerfile
 build portal portal/Dockerfile
 
 echo "Pushed tag ${TAG}."

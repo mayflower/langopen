@@ -57,19 +57,27 @@ func TestDocsAndOpenAPI(t *testing.T) {
 	paths, _ := spec["paths"].(map[string]any)
 	required := []string{
 		"/assistants",
+		"/assistants/search",
 		"/assistants/{assistant_id}",
 		"/threads",
+		"/threads/search",
 		"/threads/{thread_id}",
+		"/threads/{thread_id}/history",
+		"/threads/{thread_id}/state",
 		"/threads/{thread_id}/runs",
+		"/threads/{thread_id}/runs/wait",
 		"/threads/{thread_id}/runs/{run_id}",
 		"/threads/{thread_id}/runs/stream",
 		"/threads/{thread_id}/runs/{run_id}/stream",
 		"/runs",
+		"/runs/wait",
 		"/runs/stream",
 		"/runs/{run_id}",
+		"/runs/{run_id}/wait",
 		"/store/items",
 		"/crons",
 		"/a2a/{assistant_id}",
+		"/a2a/{assistant_id}/.well-known/agent-card.json",
 		"/mcp",
 		"/system/attention",
 	}
@@ -499,6 +507,174 @@ func TestRunCreateAndListNonStream(t *testing.T) {
 	}
 }
 
+func TestSearchWaitAndThreadState(t *testing.T) {
+	ts, client := newClientServer(t)
+
+	createAssistantResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/assistants", map[string]any{
+		"deployment_id": "dep_default",
+		"graph_id":      "graph_search",
+		"version":       "v-search",
+	}, "test-key")
+	if createAssistantResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(createAssistantResp.Body)
+		t.Fatalf("create assistant status=%d body=%s", createAssistantResp.StatusCode, string(body))
+	}
+	var assistant map[string]any
+	if err := json.NewDecoder(createAssistantResp.Body).Decode(&assistant); err != nil {
+		t.Fatal(err)
+	}
+	createAssistantResp.Body.Close()
+	assistantID, _ := assistant["id"].(string)
+	if assistantID == "" {
+		t.Fatal("missing assistant id")
+	}
+
+	searchAssistantsResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/assistants/search", map[string]any{
+		"query": "graph_search",
+	}, "test-key")
+	if searchAssistantsResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(searchAssistantsResp.Body)
+		t.Fatalf("assistants/search status=%d body=%s", searchAssistantsResp.StatusCode, string(body))
+	}
+	var assistantSearch map[string]any
+	if err := json.NewDecoder(searchAssistantsResp.Body).Decode(&assistantSearch); err != nil {
+		t.Fatal(err)
+	}
+	searchAssistantsResp.Body.Close()
+	if items, _ := assistantSearch["items"].([]any); len(items) == 0 {
+		t.Fatalf("assistants/search expected at least one item, got %#v", assistantSearch)
+	}
+
+	createThreadResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/threads", map[string]any{
+		"assistant_id": assistantID,
+		"metadata":     map[string]any{"source": "parity"},
+	}, "test-key")
+	if createThreadResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(createThreadResp.Body)
+		t.Fatalf("create thread status=%d body=%s", createThreadResp.StatusCode, string(body))
+	}
+	var thread map[string]any
+	if err := json.NewDecoder(createThreadResp.Body).Decode(&thread); err != nil {
+		t.Fatal(err)
+	}
+	createThreadResp.Body.Close()
+	threadID, _ := thread["id"].(string)
+	if threadID == "" {
+		t.Fatal("missing thread id")
+	}
+
+	searchThreadsResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/threads/search", map[string]any{
+		"query":        threadID,
+		"assistant_id": assistantID,
+	}, "test-key")
+	if searchThreadsResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(searchThreadsResp.Body)
+		t.Fatalf("threads/search status=%d body=%s", searchThreadsResp.StatusCode, string(body))
+	}
+	var threadSearch map[string]any
+	if err := json.NewDecoder(searchThreadsResp.Body).Decode(&threadSearch); err != nil {
+		t.Fatal(err)
+	}
+	searchThreadsResp.Body.Close()
+	if items, _ := threadSearch["items"].([]any); len(items) == 0 {
+		t.Fatalf("threads/search expected at least one item, got %#v", threadSearch)
+	}
+
+	updateStateResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/threads/"+threadID+"/state", map[string]any{
+		"checkpoint_id": "cp_1",
+		"values":        map[string]any{"step": "draft"},
+		"metadata":      map[string]any{"source": "manual"},
+		"reason":        "initial",
+	}, "test-key")
+	if updateStateResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(updateStateResp.Body)
+		t.Fatalf("thread state update status=%d body=%s", updateStateResp.StatusCode, string(body))
+	}
+	updateStateResp.Body.Close()
+
+	historyReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/threads/"+threadID+"/history", nil)
+	historyReq.Header.Set("X-Api-Key", "test-key")
+	historyResp, err := client.Do(historyReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if historyResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(historyResp.Body)
+		t.Fatalf("thread history status=%d body=%s", historyResp.StatusCode, string(body))
+	}
+	var historyBody map[string]any
+	if err := json.NewDecoder(historyResp.Body).Decode(&historyBody); err != nil {
+		t.Fatal(err)
+	}
+	historyResp.Body.Close()
+	if items, _ := historyBody["items"].([]any); len(items) == 0 {
+		t.Fatalf("thread history expected at least one item, got %#v", historyBody)
+	}
+
+	threadWaitResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/threads/"+threadID+"/runs/wait", map[string]any{
+		"assistant_id": assistantID,
+	}, "test-key")
+	if threadWaitResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(threadWaitResp.Body)
+		t.Fatalf("thread runs/wait status=%d body=%s", threadWaitResp.StatusCode, string(body))
+	}
+	var waitedThreadRun map[string]any
+	if err := json.NewDecoder(threadWaitResp.Body).Decode(&waitedThreadRun); err != nil {
+		t.Fatal(err)
+	}
+	threadWaitResp.Body.Close()
+	if status, _ := waitedThreadRun["status"].(string); status != "success" {
+		t.Fatalf("thread wait expected success, got %q", status)
+	}
+
+	statelessWaitResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/runs/wait", map[string]any{
+		"assistant_id": assistantID,
+	}, "test-key")
+	if statelessWaitResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(statelessWaitResp.Body)
+		t.Fatalf("runs/wait status=%d body=%s", statelessWaitResp.StatusCode, string(body))
+	}
+	var waitedRun map[string]any
+	if err := json.NewDecoder(statelessWaitResp.Body).Decode(&waitedRun); err != nil {
+		t.Fatal(err)
+	}
+	statelessWaitResp.Body.Close()
+	if status, _ := waitedRun["status"].(string); status != "success" {
+		t.Fatalf("runs/wait expected success, got %q", status)
+	}
+
+	createRunResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/runs", map[string]any{
+		"assistant_id": assistantID,
+	}, "test-key")
+	if createRunResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(createRunResp.Body)
+		t.Fatalf("create run status=%d body=%s", createRunResp.StatusCode, string(body))
+	}
+	var createdRun map[string]any
+	if err := json.NewDecoder(createRunResp.Body).Decode(&createdRun); err != nil {
+		t.Fatal(err)
+	}
+	createRunResp.Body.Close()
+	runID, _ := createdRun["id"].(string)
+	if runID == "" {
+		t.Fatal("missing run id")
+	}
+
+	waitExistingResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/runs/"+runID+"/wait", map[string]any{}, "test-key")
+	if waitExistingResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(waitExistingResp.Body)
+		t.Fatalf("runs/{run_id}/wait status=%d body=%s", waitExistingResp.StatusCode, string(body))
+	}
+	var waitedExisting map[string]any
+	if err := json.NewDecoder(waitExistingResp.Body).Decode(&waitedExisting); err != nil {
+		t.Fatal(err)
+	}
+	waitExistingResp.Body.Close()
+	if status, _ := waitedExisting["status"].(string); status != "success" {
+		t.Fatalf("runs/{run_id}/wait expected success, got %q", status)
+	}
+}
+
 func TestRunStreamResumeAndReplay(t *testing.T) {
 	ts, client := newClientServer(t)
 
@@ -659,6 +835,10 @@ func TestA2AAndMCP(t *testing.T) {
 	if got, _ := resultObj["thread_id"].(string); got != "thread_x" {
 		t.Fatalf("expected thread_id=thread_x, got %q", got)
 	}
+	taskID, _ := resultObj["task_id"].(string)
+	if taskID == "" {
+		t.Fatalf("expected task_id in message/send result, got %#v", resultObj)
+	}
 	a2aResp.Body.Close()
 
 	a2aStreamBody := map[string]any{"jsonrpc": "2.0", "id": "stream1", "method": "message/stream", "params": map[string]any{"message": map[string]any{"contextId": "thread_x"}}}
@@ -672,7 +852,7 @@ func TestA2AAndMCP(t *testing.T) {
 		t.Fatalf("expected a2a stream event, got: %s", string(streamBytes))
 	}
 
-	a2aCancelBody := map[string]any{"jsonrpc": "2.0", "id": "cancel1", "method": "tasks/cancel", "params": map[string]any{"taskId": "task_x"}}
+	a2aCancelBody := map[string]any{"jsonrpc": "2.0", "id": "cancel1", "method": "tasks/cancel", "params": map[string]any{"taskId": taskID}}
 	a2aCancelResp := doJSON(t, client, http.MethodPost, ts.URL+"/a2a/asst_1", a2aCancelBody, "test-key")
 	if a2aCancelResp.StatusCode != http.StatusOK {
 		t.Fatalf("a2a cancel status=%d", a2aCancelResp.StatusCode)
@@ -688,7 +868,7 @@ func TestA2AAndMCP(t *testing.T) {
 		t.Fatalf("unexpected tasks/cancel error code: %#v", errObj["code"])
 	}
 
-	a2aGetBody := map[string]any{"jsonrpc": "2.0", "id": "get1", "method": "tasks/get", "params": map[string]any{"taskId": "task_x"}}
+	a2aGetBody := map[string]any{"jsonrpc": "2.0", "id": "get1", "method": "tasks/get", "params": map[string]any{"taskId": taskID}}
 	a2aGetResp := doJSON(t, client, http.MethodPost, ts.URL+"/a2a/asst_1", a2aGetBody, "test-key")
 	if a2aGetResp.StatusCode != http.StatusOK {
 		t.Fatalf("a2a tasks/get status=%d", a2aGetResp.StatusCode)
@@ -699,9 +879,37 @@ func TestA2AAndMCP(t *testing.T) {
 	}
 	a2aGetResp.Body.Close()
 	getResultObj, _ := a2aGetResult["result"].(map[string]any)
-	if got, _ := getResultObj["task_id"].(string); got != "task_x" {
-		t.Fatalf("expected task_id task_x, got %q", got)
+	if got, _ := getResultObj["task_id"].(string); got != taskID {
+		t.Fatalf("expected task_id %q, got %q", taskID, got)
 	}
+
+	a2aMissingGetBody := map[string]any{"jsonrpc": "2.0", "id": "get-missing", "method": "tasks/get", "params": map[string]any{"taskId": "task_missing"}}
+	a2aMissingGetResp := doJSON(t, client, http.MethodPost, ts.URL+"/a2a/asst_1", a2aMissingGetBody, "test-key")
+	if a2aMissingGetResp.StatusCode != http.StatusOK {
+		t.Fatalf("a2a tasks/get missing status=%d", a2aMissingGetResp.StatusCode)
+	}
+	var a2aMissingGetResult map[string]any
+	if err := json.NewDecoder(a2aMissingGetResp.Body).Decode(&a2aMissingGetResult); err != nil {
+		t.Fatal(err)
+	}
+	a2aMissingGetResp.Body.Close()
+	if errObj, ok := a2aMissingGetResult["error"].(map[string]any); !ok {
+		t.Fatalf("expected missing task error response, got %#v", a2aMissingGetResult)
+	} else if code, ok := errObj["code"].(float64); !ok || int(code) != -32004 {
+		t.Fatalf("unexpected missing task error code: %#v", errObj["code"])
+	}
+
+	agentCardReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/a2a/asst_1/.well-known/agent-card.json", nil)
+	agentCardReq.Header.Set("X-Api-Key", "test-key")
+	agentCardResp, err := client.Do(agentCardReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agentCardResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(agentCardResp.Body)
+		t.Fatalf("agent-card status=%d body=%s", agentCardResp.StatusCode, string(body))
+	}
+	agentCardResp.Body.Close()
 
 	mcpResp := doJSON(t, client, http.MethodPost, ts.URL+"/mcp", map[string]any{"jsonrpc": "2.0", "id": "1", "method": "initialize"}, "test-key")
 	if mcpResp.StatusCode != http.StatusOK {

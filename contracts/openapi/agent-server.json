@@ -610,6 +610,86 @@
           }
         }
       }
+    },
+    "/assistants/search": {
+      "post": {
+        "summary": "Search assistants",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/threads/search": {
+      "post": {
+        "summary": "Search threads",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/threads/{thread_id}/history": {
+      "get": {
+        "summary": "Get thread history",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/threads/{thread_id}/state": {
+      "post": {
+        "summary": "Update thread state",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/threads/{thread_id}/runs/wait": {
+      "post": {
+        "summary": "Create thread run and wait",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/runs/wait": {
+      "post": {
+        "summary": "Create stateless run and wait",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/runs/{run_id}/wait": {
+      "post": {
+        "summary": "Wait for existing run",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/a2a/{assistant_id}/.well-known/agent-card.json": {
+      "get": {
+        "summary": "Get A2A agent card",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
     }
   }
 }

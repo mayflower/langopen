@@ -476,6 +476,165 @@ func TestControlPlaneDeploymentRollback(t *testing.T) {
 	missingDigestResp.Body.Close()
 }
 
+func TestControlPlaneV2DeploymentRevisionsAndRollback(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://example.invalid")
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doControlPlaneReq(t, ts.URL+"/v2/deployments", map[string]any{
+		"project_id": "proj_default",
+		"repo_url":   "https://github.com/acme/agent",
+		"git_ref":    "main",
+		"repo_path":  ".",
+	})
+	if createResp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("expected 201, got %d body=%s", createResp.StatusCode, string(b))
+	}
+	var created map[string]any
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	createResp.Body.Close()
+	depID, _ := created["id"].(string)
+	if depID == "" {
+		t.Fatal("missing deployment id")
+	}
+
+	rollbackResp := doControlPlaneReq(t, ts.URL+"/v2/deployments/"+depID+"/rollback", map[string]any{
+		"image_digest": "ghcr.io/mayflower/langopen/runtime-runner@sha256:feedbeef",
+	})
+	if rollbackResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(rollbackResp.Body)
+		t.Fatalf("expected 200 for v2 rollback, got %d body=%s", rollbackResp.StatusCode, string(b))
+	}
+	rollbackResp.Body.Close()
+
+	revisionsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v2/deployments/"+depID+"/revisions", nil)
+	revisionsResp, err := http.DefaultClient.Do(revisionsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revisionsResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(revisionsResp.Body)
+		t.Fatalf("expected 200 for revisions, got %d body=%s", revisionsResp.StatusCode, string(b))
+	}
+	var revisions map[string]any
+	if err := json.NewDecoder(revisionsResp.Body).Decode(&revisions); err != nil {
+		t.Fatal(err)
+	}
+	revisionsResp.Body.Close()
+	items, _ := revisions["items"].([]any)
+	if len(items) == 0 {
+		t.Fatalf("expected at least one deployment revision, got %#v", revisions)
+	}
+	first, _ := items[0].(map[string]any)
+	revisionID, _ := first["revision_id"].(string)
+	if revisionID == "" {
+		t.Fatalf("expected revision_id in revision response, got %#v", first)
+	}
+
+	rollbackByRevisionResp := doControlPlaneReq(t, ts.URL+"/v2/deployments/"+depID+"/rollback", map[string]any{
+		"revision_id": revisionID,
+	})
+	if rollbackByRevisionResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(rollbackByRevisionResp.Body)
+		t.Fatalf("expected 200 for rollback by revision id, got %d body=%s", rollbackByRevisionResp.StatusCode, string(b))
+	}
+	rollbackByRevisionResp.Body.Close()
+}
+
+func TestControlPlaneGithubIntegrationEndpoints(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+
+	githubMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/user":
+			writeJSONResp(t, w, http.StatusOK, map[string]any{"login": "mock-user", "id": 12345})
+		case r.Method == http.MethodGet && r.URL.Path == "/user/repos":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if err := json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"id":             1,
+					"name":           "repo-one",
+					"full_name":      "mock/repo-one",
+					"private":        false,
+					"default_branch": "main",
+					"html_url":       "https://github.com/mock/repo-one",
+					"clone_url":      "https://github.com/mock/repo-one.git",
+				},
+			}); err != nil {
+				t.Fatalf("encode repos response: %v", err)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer githubMock.Close()
+
+	t.Setenv("GITHUB_PAT", "ghp_test_token")
+	t.Setenv("GITHUB_API_BASE_URL", githubMock.URL)
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	authReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/integrations/github/auth", nil)
+	authResp, err := http.DefaultClient.Do(authReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(authResp.Body)
+		t.Fatalf("expected 200 for github auth metadata, got %d body=%s", authResp.StatusCode, string(b))
+	}
+	var authMeta map[string]any
+	if err := json.NewDecoder(authResp.Body).Decode(&authMeta); err != nil {
+		t.Fatal(err)
+	}
+	authResp.Body.Close()
+	if configured, _ := authMeta["configured"].(bool); !configured {
+		t.Fatalf("expected configured=true, got %#v", authMeta)
+	}
+
+	validateResp := doControlPlaneReq(t, ts.URL+"/v1/integrations/github/validate", map[string]any{})
+	if validateResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(validateResp.Body)
+		t.Fatalf("expected 200 for github validate, got %d body=%s", validateResp.StatusCode, string(b))
+	}
+	var validateObj map[string]any
+	if err := json.NewDecoder(validateResp.Body).Decode(&validateObj); err != nil {
+		t.Fatal(err)
+	}
+	validateResp.Body.Close()
+	if valid, _ := validateObj["valid"].(bool); !valid {
+		t.Fatalf("expected valid=true, got %#v", validateObj)
+	}
+
+	reposReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/integrations/github/repos", nil)
+	reposResp, err := http.DefaultClient.Do(reposReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reposResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(reposResp.Body)
+		t.Fatalf("expected 200 for github repos, got %d body=%s", reposResp.StatusCode, string(b))
+	}
+	var reposObj map[string]any
+	if err := json.NewDecoder(reposResp.Body).Decode(&reposObj); err != nil {
+		t.Fatal(err)
+	}
+	reposResp.Body.Close()
+	items, _ := reposObj["items"].([]any)
+	if len(items) == 0 {
+		t.Fatalf("expected at least one repo item, got %#v", reposObj)
+	}
+}
+
 func TestControlPlaneListFiltersByProject(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", "")
 	t.Setenv("BUILDER_URL", "http://example.invalid")
