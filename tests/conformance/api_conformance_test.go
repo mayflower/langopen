@@ -111,6 +111,36 @@ func TestDataPlaneRBAC(t *testing.T) {
 	viewerListResp.Body.Close()
 }
 
+func TestAuthSchemeCompatibility(t *testing.T) {
+	ts, client := newClientServer(t)
+
+	validReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/system", nil)
+	validReq.Header.Set("X-Api-Key", "test-key")
+	validReq.Header.Set("X-Auth-Scheme", "langsmith-api-key")
+	validResp, err := client.Do(validReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(validResp.Body)
+		t.Fatalf("expected 200 for compatible auth scheme, got %d body=%s", validResp.StatusCode, string(body))
+	}
+	validResp.Body.Close()
+
+	invalidReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/system", nil)
+	invalidReq.Header.Set("X-Api-Key", "test-key")
+	invalidReq.Header.Set("X-Auth-Scheme", "bearer")
+	invalidResp, err := client.Do(invalidReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if invalidResp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(invalidResp.Body)
+		t.Fatalf("expected 400 for invalid auth scheme, got %d body=%s", invalidResp.StatusCode, string(body))
+	}
+	invalidResp.Body.Close()
+}
+
 func TestAssistantsAndThreadsCRUD(t *testing.T) {
 	ts, client := newClientServer(t)
 
