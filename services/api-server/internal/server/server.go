@@ -171,10 +171,12 @@ func (s *Server) registerDataPlaneRoutes(api chi.Router) {
 	api.Post("/threads/{thread_id}/runs", s.createRun)
 	api.Post("/threads/{thread_id}/runs/stream", s.createRunStream)
 	api.Get("/threads/{thread_id}/runs/{run_id}", s.getThreadRun)
+	api.Delete("/threads/{thread_id}/runs/{run_id}", s.deleteThreadRun)
 	api.Get("/threads/{thread_id}/runs/{run_id}/stream", s.joinRunStream)
 	api.Post("/threads/{thread_id}/runs/{run_id}/cancel", s.cancelRun)
 	api.Get("/runs", s.listRuns)
 	api.Post("/runs", s.createStatelessRun)
+	api.Delete("/runs/{run_id}", s.deleteRun)
 	api.Post("/runs/stream", s.createStatelessRunStream)
 	api.Get("/runs/{run_id}/stream", s.joinRunStream)
 	api.Post("/runs/{run_id}/cancel", s.cancelRun)
@@ -1518,6 +1520,54 @@ func (s *Server) cancelRunInPostgres(ctx context.Context, projectID, runID, acti
 	return tx.Commit(ctx)
 }
 
+func (s *Server) deleteRunFromPostgres(ctx context.Context, projectID, runID, expectedThreadID string) error {
+	tx, err := s.pg.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	scopeQuery := `
+		SELECT EXISTS(
+			SELECT 1
+			FROM runs r
+		`
+	args := []any{runID}
+	conditions := []string{"r.id=$1"}
+	if projectID != "" {
+		scopeQuery += `
+			JOIN assistants a ON a.id = r.assistant_id
+			JOIN deployments d ON d.id = a.deployment_id
+		`
+		args = append(args, projectID)
+		conditions = append(conditions, fmt.Sprintf("d.project_id=$%d", len(args)))
+	}
+	if expectedThreadID != "" {
+		args = append(args, expectedThreadID)
+		conditions = append(conditions, fmt.Sprintf("r.thread_id=$%d", len(args)))
+	}
+	scopeQuery += " WHERE " + strings.Join(conditions, " AND ") + ")"
+
+	var exists bool
+	if err := tx.QueryRow(ctx, scopeQuery, args...).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return sql.ErrNoRows
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM webhook_deliveries WHERE run_id=$1`, runID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM checkpoints WHERE run_id=$1`, runID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM runs WHERE id=$1`, runID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "run_id")
 	if s.pg != nil {
@@ -1585,6 +1635,59 @@ func (s *Server) getThreadRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, run)
+}
+
+func (s *Server) deleteThreadRun(w http.ResponseWriter, r *http.Request) {
+	threadID := strings.TrimSpace(chi.URLParam(r, "thread_id"))
+	if threadID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_thread_id", "thread_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	s.deleteRunInternal(w, r, threadID)
+}
+
+func (s *Server) deleteRun(w http.ResponseWriter, r *http.Request) {
+	s.deleteRunInternal(w, r, "")
+}
+
+func (s *Server) deleteRunInternal(w http.ResponseWriter, r *http.Request, expectedThreadID string) {
+	runID := strings.TrimSpace(chi.URLParam(r, "run_id"))
+	if runID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_run_id", "run_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	if s.pg != nil {
+		projectID := projectIDFromContext(r.Context())
+		if err := s.deleteRunFromPostgres(r.Context(), projectID, runID, expectedThreadID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				contracts.WriteError(w, http.StatusNotFound, "run_not_found", "run not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			contracts.WriteError(w, http.StatusInternalServerError, "db_delete_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		if s.redis != nil {
+			_ = s.redis.Del(r.Context(), s.cfg.StreamBufferPrefix+runID).Err()
+		}
+		s.writeDataPlaneAudit(r.Context(), projectID, "run.deleted", map[string]any{
+			"run_id": runID,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "run_id": runID})
+		return
+	}
+
+	s.store.mu.Lock()
+	run, ok := s.store.runs[runID]
+	if !ok || (expectedThreadID != "" && run.ThreadID != expectedThreadID) {
+		s.store.mu.Unlock()
+		contracts.WriteError(w, http.StatusNotFound, "run_not_found", "run not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	delete(s.store.runs, runID)
+	delete(s.store.events, runID)
+	s.store.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "run_id": runID})
 }
 
 func (s *Server) getRunFromPostgres(ctx context.Context, projectID, runID string) (contracts.Run, error) {

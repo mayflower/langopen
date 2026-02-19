@@ -281,6 +281,32 @@
             "description": "Run response"
           }
         }
+      },
+      "delete": {
+        "summary": "Delete run for thread",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run deleted"
+          }
+        }
       }
     },
     "/threads/{thread_id}/runs/{run_id}/cancel": {
@@ -377,6 +403,24 @@
         "responses": {
           "200": {
             "description": "Run response"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete run",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run deleted"
           }
         }
       }

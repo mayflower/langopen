@@ -363,6 +363,30 @@ func TestRunCreateAndListNonStream(t *testing.T) {
 	}
 	getThreadRunResp.Body.Close()
 
+	deleteThreadRunReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/threads/"+thread.ID+"/runs/"+threadRunID, nil)
+	deleteThreadRunReq.Header.Set("X-Api-Key", "test-key")
+	deleteThreadRunResp, err := client.Do(deleteThreadRunReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteThreadRunResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(deleteThreadRunResp.Body)
+		t.Fatalf("delete thread run status=%d body=%s", deleteThreadRunResp.StatusCode, string(body))
+	}
+	deleteThreadRunResp.Body.Close()
+
+	getDeletedThreadRunReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/threads/"+thread.ID+"/runs/"+threadRunID, nil)
+	getDeletedThreadRunReq.Header.Set("X-Api-Key", "test-key")
+	getDeletedThreadRunResp, err := client.Do(getDeletedThreadRunReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getDeletedThreadRunResp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(getDeletedThreadRunResp.Body)
+		t.Fatalf("expected 404 for deleted thread run, got %d body=%s", getDeletedThreadRunResp.StatusCode, string(body))
+	}
+	getDeletedThreadRunResp.Body.Close()
+
 	listThreadRunsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/threads/"+thread.ID+"/runs", nil)
 	listThreadRunsReq.Header.Set("X-Api-Key", "test-key")
 	listThreadRunsResp, err := client.Do(listThreadRunsReq)
@@ -385,8 +409,8 @@ func TestRunCreateAndListNonStream(t *testing.T) {
 			break
 		}
 	}
-	if !foundThreadRun {
-		t.Fatalf("created thread run %s not found in thread run list", threadRunID)
+	if foundThreadRun {
+		t.Fatalf("deleted thread run %s should not appear in thread run list", threadRunID)
 	}
 
 	createStatelessResp := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/runs", map[string]any{
@@ -405,6 +429,30 @@ func TestRunCreateAndListNonStream(t *testing.T) {
 	if statelessRunID == "" {
 		t.Fatal("missing stateless run id")
 	}
+
+	deleteStatelessReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/runs/"+statelessRunID, nil)
+	deleteStatelessReq.Header.Set("X-Api-Key", "test-key")
+	deleteStatelessResp, err := client.Do(deleteStatelessReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteStatelessResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(deleteStatelessResp.Body)
+		t.Fatalf("delete stateless run status=%d body=%s", deleteStatelessResp.StatusCode, string(body))
+	}
+	deleteStatelessResp.Body.Close()
+
+	getDeletedStatelessReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/runs/"+statelessRunID, nil)
+	getDeletedStatelessReq.Header.Set("X-Api-Key", "test-key")
+	getDeletedStatelessResp, err := client.Do(getDeletedStatelessReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getDeletedStatelessResp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(getDeletedStatelessResp.Body)
+		t.Fatalf("expected 404 for deleted stateless run, got %d body=%s", getDeletedStatelessResp.StatusCode, string(body))
+	}
+	getDeletedStatelessResp.Body.Close()
 
 	listRunsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/runs", nil)
 	listRunsReq.Header.Set("X-Api-Key", "test-key")
@@ -432,8 +480,8 @@ func TestRunCreateAndListNonStream(t *testing.T) {
 			foundStateless = true
 		}
 	}
-	if !foundThread || !foundStateless {
-		t.Fatalf("expected both created runs in list, foundThread=%v foundStateless=%v", foundThread, foundStateless)
+	if foundThread || foundStateless {
+		t.Fatalf("deleted runs should not appear in list, foundThread=%v foundStateless=%v", foundThread, foundStateless)
 	}
 }
 
