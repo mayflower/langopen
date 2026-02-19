@@ -52,6 +52,8 @@ spec:
               value: {{ .Values.env.runStreamBufferTtlSeconds | quote }}
             - name: RUN_MODE
               value: {{ .Values.worker.runMode | quote }}
+            - name: MODE_B_ALLOW_SIMULATED_SANDBOX
+              value: {{ ternary "true" "false" .Values.worker.modeBAllowSimulatedSandbox | quote }}
             - name: LANGOPEN_EXECUTOR
               value: {{ .Values.worker.executor | quote }}
             - name: RUNTIME_RUNNER_URL

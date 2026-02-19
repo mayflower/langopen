@@ -66,6 +66,7 @@ type Worker struct {
 	stuckRunThreshold   time.Duration
 	executorMode        string
 	executor            runExecutor
+	modeBSandboxStrict  bool
 }
 
 type pendingRun struct {
@@ -78,6 +79,10 @@ type pendingRun struct {
 	Configurable    any
 	Metadata        map[string]any
 	CheckpointID    string
+	GraphID         string
+	RepoPath        string
+	RepoURL         string
+	GitRef          string
 }
 
 type runCorrelation struct {
@@ -218,6 +223,7 @@ func New(cfg Config, logger *slog.Logger) (*Worker, error) {
 		webhookMaxAttempts:  envIntOrDefault("WEBHOOK_MAX_ATTEMPTS", 6),
 		stuckRunThreshold:   time.Duration(envIntOrDefault("STUCK_RUN_SECONDS", 300)) * time.Second,
 		executorMode:        strings.TrimSpace(strings.ToLower(envOrDefault("LANGOPEN_EXECUTOR", "runtime"))),
+		modeBSandboxStrict:  !envBoolOrDefault("MODE_B_ALLOW_SIMULATED_SANDBOX", false),
 	}
 	if cfg.PostgresDSN != "" {
 		pg, err := pgxpool.New(context.Background(), cfg.PostgresDSN)
@@ -382,13 +388,26 @@ func (w *Worker) fetchNextPendingRun(ctx context.Context) (pendingRun, error) {
 		rawMetadata []byte
 	)
 	err = tx.QueryRow(ctx, `
-		SELECT id, COALESCE(thread_id,''), assistant_id, stream_resumable, COALESCE(input_json, '{}'::jsonb), COALESCE(metadata_json, '{}'::jsonb), COALESCE(checkpoint_id, '')
-		FROM runs
-		WHERE status='pending'
-		ORDER BY created_at ASC
+		SELECT
+			r.id,
+			COALESCE(r.thread_id,''),
+			r.assistant_id,
+			r.stream_resumable,
+			COALESCE(r.input_json, '{}'::jsonb),
+			COALESCE(r.metadata_json, '{}'::jsonb),
+			COALESCE(r.checkpoint_id, ''),
+			COALESCE(a.graph_id, ''),
+			COALESCE(d.repo_path, ''),
+			COALESCE(d.repo_url, ''),
+			COALESCE(d.git_ref, '')
+		FROM runs r
+		JOIN assistants a ON a.id = r.assistant_id
+		JOIN deployments d ON d.id = a.deployment_id
+		WHERE r.status='pending'
+		ORDER BY r.created_at ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
-	`).Scan(&run.ID, &run.ThreadID, &run.AssistantID, &run.StreamResumable, &rawInput, &rawMetadata, &run.CheckpointID)
+	`).Scan(&run.ID, &run.ThreadID, &run.AssistantID, &run.StreamResumable, &rawInput, &rawMetadata, &run.CheckpointID, &run.GraphID, &run.RepoPath, &run.RepoURL, &run.GitRef)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return pendingRun{}, sql.ErrNoRows
@@ -404,6 +423,32 @@ func (w *Worker) fetchNextPendingRun(ctx context.Context) (pendingRun, error) {
 	}
 	if command, ok := metadata["command"]; ok {
 		run.Command = command
+	}
+	if run.Configurable == nil {
+		run.Configurable = map[string]any{}
+	}
+	if cfg, ok := run.Configurable.(map[string]any); ok {
+		if strings.TrimSpace(run.GraphID) != "" {
+			if _, exists := cfg["graph_target"]; !exists {
+				cfg["graph_target"] = run.GraphID
+			}
+		}
+		if strings.TrimSpace(run.RepoPath) != "" {
+			if _, exists := cfg["repo_path"]; !exists {
+				cfg["repo_path"] = run.RepoPath
+			}
+		}
+		if strings.TrimSpace(run.RepoURL) != "" {
+			if _, exists := cfg["repo_url"]; !exists {
+				cfg["repo_url"] = run.RepoURL
+			}
+		}
+		if strings.TrimSpace(run.GitRef) != "" {
+			if _, exists := cfg["git_ref"]; !exists {
+				cfg["git_ref"] = run.GitRef
+			}
+		}
+		run.Configurable = cfg
 	}
 
 	_, err = tx.Exec(ctx, `UPDATE runs SET status='running', started_at=COALESCE(started_at, NOW()), updated_at=NOW() WHERE id=$1`, run.ID)
@@ -476,6 +521,19 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 			sandboxAllocationsTotal.WithLabelValues("succeeded").Inc()
 			w.emitStreamEvent(ctx, run, "run_sandbox_allocated", map[string]any{"run_id": run.ID, "sandbox_id": sandboxID, "mode": w.runMode})
 		} else {
+			if w.modeBSandboxStrict {
+				_ = w.updateRunResult(ctx, run.ID, contracts.RunStatusError, nil, map[string]any{
+					"message": "mode_b requires sandbox integration but sandbox is disabled/unavailable",
+				})
+				_ = w.updateCronExecutionStatus(ctx, run.ID, "error")
+				w.emitStreamEvent(ctx, run, "run_failed", map[string]any{
+					"run_id":  run.ID,
+					"status":  "error",
+					"message": "mode_b requires sandbox integration but sandbox is disabled/unavailable",
+				})
+				_ = w.enqueueWebhookForRun(ctx, run.ID)
+				return
+			}
 			sandboxAllocationsTotal.WithLabelValues("simulated").Inc()
 			sandboxID := contracts.NewID("sandbox")
 			w.emitStreamEvent(ctx, run, "run_sandbox_allocated", map[string]any{"run_id": run.ID, "sandbox_id": sandboxID, "mode": w.runMode, "simulated": true})
@@ -532,7 +590,15 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 	}
 
 	if w.executor == nil {
-		w.executor = &simulatedExecutor{}
+		result := executeResult{
+			Status: contracts.RunStatusError,
+			Error:  map[string]any{"message": "executor is not configured"},
+		}
+		_ = w.updateRunResult(ctx, run.ID, result.Status, result.Output, result.Error)
+		_ = w.updateCronExecutionStatus(ctx, run.ID, "error")
+		w.emitStreamEvent(ctx, run, "run_failed", map[string]any{"run_id": run.ID, "status": result.Status, "error": result.Error})
+		_ = w.enqueueWebhookForRun(ctx, run.ID)
+		return
 	}
 	result, execErr := w.executor.Execute(ctx, run)
 	if execErr != nil {

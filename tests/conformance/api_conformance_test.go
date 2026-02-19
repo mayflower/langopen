@@ -862,10 +862,9 @@ func TestA2AAndMCP(t *testing.T) {
 		t.Fatal(err)
 	}
 	a2aCancelResp.Body.Close()
-	if errObj, ok := a2aCancelResult["error"].(map[string]any); !ok {
-		t.Fatalf("expected tasks/cancel error response, got %#v", a2aCancelResult)
-	} else if code, ok := errObj["code"].(float64); !ok || int(code) != -32001 {
-		t.Fatalf("unexpected tasks/cancel error code: %#v", errObj["code"])
+	cancelResultObj, _ := a2aCancelResult["result"].(map[string]any)
+	if got, _ := cancelResultObj["status"].(string); got != "cancelled" {
+		t.Fatalf("expected tasks/cancel to set cancelled status, got %#v", a2aCancelResult)
 	}
 
 	a2aGetBody := map[string]any{"jsonrpc": "2.0", "id": "get1", "method": "tasks/get", "params": map[string]any{"taskId": taskID}}

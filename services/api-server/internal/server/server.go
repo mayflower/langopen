@@ -3767,10 +3767,6 @@ func (s *Server) a2a(w http.ResponseWriter, r *http.Request) {
 			writeRPCError(req.ID, -32004, "task not found")
 			return
 		}
-		if req.Method == "tasks/cancel" && !envBoolOrDefault("A2A_TASKS_CANCEL_SUPPORTED", false) {
-			writeRPCError(req.ID, -32001, "tasks/cancel unsupported")
-			return
-		}
 		if req.Method == "tasks/cancel" {
 			s.store.mu.Lock()
 			task.Status = "cancelled"
@@ -3825,12 +3821,13 @@ func (s *Server) a2aAgentCard(w http.ResponseWriter, r *http.Request) {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_assistant_id", "assistant_id is required", observability.RequestIDFromContext(r.Context()))
 		return
 	}
-	base := "https://example.invalid"
-	if r.TLS == nil {
-		base = "http://" + r.Host
-	} else {
-		base = "https://" + r.Host
+	scheme := "https"
+	if xfProto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); xfProto != "" {
+		scheme = xfProto
+	} else if r.TLS == nil {
+		scheme = "http"
 	}
+	base := scheme + "://" + r.Host
 	cardPath := fmt.Sprintf("/a2a/%s", assistantID)
 	if strings.HasPrefix(r.URL.Path, "/api/v1/") {
 		cardPath = fmt.Sprintf("/api/v1/a2a/%s", assistantID)

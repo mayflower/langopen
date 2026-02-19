@@ -41,6 +41,7 @@ worker:
   executor: runtime
   runtimeRunnerUrl: http://langopen-runtime-runner
   runMode: mode_a
+  modeBAllowSimulatedSandbox: false
   sandboxEnabled: false
   sandboxNamespace: langopen
   sandboxTemplateName: langopen-default

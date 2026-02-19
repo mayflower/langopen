@@ -801,11 +801,12 @@ func (a *API) githubAuthMetadata(w http.ResponseWriter, r *http.Request) {
 	if token == "" {
 		token = strings.TrimSpace(os.Getenv("GITHUB_PAT"))
 	}
+	installURL := strings.TrimSpace(os.Getenv("GITHUB_APP_INSTALL_URL"))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"provider":            "github",
 		"auth_mode":           "pat",
 		"configured":          token != "",
-		"installation_flow":   "not_implemented",
+		"installation_flow":   map[string]any{"supported": installURL != "", "install_url": installURL},
 		"supported_endpoints": []string{"/v1/integrations/github/auth", "/v1/integrations/github/validate", "/v1/integrations/github/repos"},
 	})
 }

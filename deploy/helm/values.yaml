@@ -51,6 +51,7 @@ worker:
   executor: runtime
   runtimeRunnerUrl: ""
   runMode: mode_a
+  modeBAllowSimulatedSandbox: false
   sandboxEnabled: false
   sandboxNamespace: ""
   sandboxTemplateName: "langopen-default"
