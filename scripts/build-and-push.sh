@@ -7,8 +7,23 @@ TAG="${TAG:-$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S)}"
 build() {
   local component="$1"
   local dockerfile="$2"
-  docker build -f "$dockerfile" -t "${REGISTRY}/${component}:${TAG}" .
-  docker push "${REGISTRY}/${component}:${TAG}"
+  local image="${REGISTRY}/${component}:${TAG}"
+  local attempt=1
+  local max_attempts=4
+
+  while true; do
+    if docker build -f "$dockerfile" -t "$image" . && docker push "$image"; then
+      break
+    fi
+    if [[ "$attempt" -ge "$max_attempts" ]]; then
+      echo "failed to build/push ${image} after ${max_attempts} attempts" >&2
+      return 1
+    fi
+    local sleep_seconds=$((attempt * 5))
+    echo "retrying ${image} in ${sleep_seconds}s (attempt $((attempt + 1))/${max_attempts})" >&2
+    sleep "$sleep_seconds"
+    attempt=$((attempt + 1))
+  done
 }
 
 build api-server services/api-server/Dockerfile
