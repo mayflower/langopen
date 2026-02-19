@@ -47,7 +47,7 @@ export default function BuildsPage() {
     setSelectedBuildID(buildID);
     setLogs("");
     try {
-      const resp = await fetch(`/api/platform/control/internal/v1/builds/${encodeURIComponent(buildID)}/logs`, { cache: "no-store" });
+      const resp = await fetch(`/api/platform/control/internal/v1/builds/${encodeURIComponent(buildID)}/logs?project_id=${encodeURIComponent(projectID)}`, { cache: "no-store" });
       if (!resp.ok) {
         const body = await resp.text();
         throw new Error(`load build logs failed (${resp.status}) ${body}`);

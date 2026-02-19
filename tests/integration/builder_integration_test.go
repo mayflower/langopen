@@ -543,6 +543,77 @@ func TestControlPlaneListFiltersByProject(t *testing.T) {
 	logsDeniedResp.Body.Close()
 }
 
+func TestControlPlaneDeploymentProjectScopeForItemEndpoints(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://example.invalid")
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doControlPlaneReq(t, ts.URL+"/internal/v1/deployments", map[string]any{
+		"project_id": "proj_a",
+		"repo_url":   "https://github.com/acme/agent",
+		"git_ref":    "main",
+		"repo_path":  ".",
+	})
+	if createResp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("expected 201, got %d body=%s", createResp.StatusCode, string(b))
+	}
+	var created map[string]any
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	createResp.Body.Close()
+	depID, _ := created["id"].(string)
+	if depID == "" {
+		t.Fatal("missing deployment id")
+	}
+
+	getDeniedReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/deployments/"+depID+"?project_id=proj_b", nil)
+	getDeniedResp, err := http.DefaultClient.Do(getDeniedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getDeniedResp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(getDeniedResp.Body)
+		t.Fatalf("expected 404 for cross-project deployment get, got %d body=%s", getDeniedResp.StatusCode, string(b))
+	}
+	getDeniedResp.Body.Close()
+
+	updateDeniedResp := doControlPlaneReqWithHeaders(t, http.MethodPatch, ts.URL+"/internal/v1/deployments/"+depID+"?project_id=proj_b", map[string]any{
+		"git_ref": "release/v2",
+	}, map[string]string{})
+	if updateDeniedResp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(updateDeniedResp.Body)
+		t.Fatalf("expected 404 for cross-project deployment update, got %d body=%s", updateDeniedResp.StatusCode, string(b))
+	}
+	updateDeniedResp.Body.Close()
+
+	deleteDeniedReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/internal/v1/deployments/"+depID+"?project_id=proj_b", nil)
+	deleteDeniedResp, err := http.DefaultClient.Do(deleteDeniedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteDeniedResp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(deleteDeniedResp.Body)
+		t.Fatalf("expected 404 for cross-project deployment delete, got %d body=%s", deleteDeniedResp.StatusCode, string(b))
+	}
+	deleteDeniedResp.Body.Close()
+
+	getAllowedReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/deployments/"+depID+"?project_id=proj_a", nil)
+	getAllowedResp, err := http.DefaultClient.Do(getAllowedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getAllowedResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(getAllowedResp.Body)
+		t.Fatalf("expected 200 for same-project deployment get, got %d body=%s", getAllowedResp.StatusCode, string(b))
+	}
+	getAllowedResp.Body.Close()
+}
+
 func TestControlPlaneAuditFilters(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", "")
 	t.Setenv("BUILDER_URL", "http://example.invalid")

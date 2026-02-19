@@ -336,6 +336,7 @@ func (a *API) listDeployments(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) getDeploymentByID(w http.ResponseWriter, r *http.Request) {
 	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
+	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
 	if deploymentID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
 		return
@@ -349,11 +350,16 @@ func (a *API) getDeploymentByID(w http.ResponseWriter, r *http.Request) {
 		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 		return
 	}
+	if projectID != "" && rec.ProjectID != projectID {
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	writeJSON(w, http.StatusOK, rec)
 }
 
 func (a *API) updateDeployment(w http.ResponseWriter, r *http.Request) {
 	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
+	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
 	if deploymentID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
 		return
@@ -382,6 +388,10 @@ func (a *API) updateDeployment(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if projectID != "" && rec.ProjectID != projectID {
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
 		return
 	}
 	if req.RepoURL != nil {
@@ -478,6 +488,7 @@ func (a *API) updateDeployment(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
+	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
 	if deploymentID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
 		return
@@ -490,6 +501,10 @@ func (a *API) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if projectID != "" && rec.ProjectID != projectID {
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
 		return
 	}
 

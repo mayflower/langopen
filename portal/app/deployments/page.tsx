@@ -229,7 +229,7 @@ export default function DeploymentsPage() {
     setError("");
     setStatus("");
     try {
-      const resp = await fetch(`/api/platform/control/internal/v1/deployments/${encodeURIComponent(id)}`, {
+      const resp = await fetch(`/api/platform/control/internal/v1/deployments/${encodeURIComponent(id)}?project_id=${encodeURIComponent(projectID)}`, {
         method: "DELETE"
       });
       const body = await resp.json();
