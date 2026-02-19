@@ -1086,6 +1086,59 @@ func TestControlPlaneRBAC(t *testing.T) {
 	developerKeyCreate.Body.Close()
 }
 
+func TestControlPlaneRuntimePolicyProjectScope(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://example.invalid")
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doControlPlaneReq(t, ts.URL+"/internal/v1/deployments", map[string]any{
+		"project_id": "proj_a",
+		"repo_url":   "https://github.com/acme/agent",
+		"git_ref":    "main",
+		"repo_path":  ".",
+	})
+	if createResp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("expected 201, got %d body=%s", createResp.StatusCode, string(b))
+	}
+	var dep map[string]any
+	if err := json.NewDecoder(createResp.Body).Decode(&dep); err != nil {
+		t.Fatal(err)
+	}
+	createResp.Body.Close()
+	depID, _ := dep["id"].(string)
+	if depID == "" {
+		t.Fatal("missing deployment id")
+	}
+
+	deniedResp := doControlPlaneReq(t, ts.URL+"/internal/v1/policies/runtime", map[string]any{
+		"deployment_id":   depID,
+		"project_id":      "proj_b",
+		"runtime_profile": "kata-qemu",
+		"mode":            "mode_b",
+	})
+	if deniedResp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(deniedResp.Body)
+		t.Fatalf("expected 404 for cross-project runtime policy update, got %d body=%s", deniedResp.StatusCode, string(b))
+	}
+	deniedResp.Body.Close()
+
+	allowedResp := doControlPlaneReq(t, ts.URL+"/internal/v1/policies/runtime", map[string]any{
+		"deployment_id":   depID,
+		"project_id":      "proj_a",
+		"runtime_profile": "kata-qemu",
+		"mode":            "mode_b",
+	})
+	if allowedResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(allowedResp.Body)
+		t.Fatalf("expected 200 for same-project runtime policy update, got %d body=%s", allowedResp.StatusCode, string(b))
+	}
+	allowedResp.Body.Close()
+}
+
 func TestMigrationContainsRequiredIndexes(t *testing.T) {
 	root := filepath.Join("..", "..")
 	raw, err := os.ReadFile(filepath.Join(root, "db", "migrations", "001_init.sql"))

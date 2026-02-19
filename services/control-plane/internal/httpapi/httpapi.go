@@ -930,6 +930,7 @@ func (a *API) getBuildLogs(w http.ResponseWriter, r *http.Request) {
 func (a *API) setRuntimePolicy(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DeploymentID   string `json:"deployment_id"`
+		ProjectID      string `json:"project_id"`
 		RuntimeProfile string `json:"runtime_profile"`
 		Mode           string `json:"mode"`
 	}
@@ -951,6 +952,21 @@ func (a *API) setRuntimePolicy(w http.ResponseWriter, r *http.Request) {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_mode", "mode must be mode_a or mode_b", observability.RequestIDFromContext(r.Context()))
 		return
 	}
+	req.ProjectID = strings.TrimSpace(req.ProjectID)
+
+	dep, depErr := a.getDeployment(r.Context(), req.DeploymentID)
+	if depErr != nil {
+		if errors.Is(depErr, sql.ErrNoRows) {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", depErr.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if req.ProjectID != "" && dep.ProjectID != req.ProjectID {
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 
 	if a.pg != nil {
 		tag, err := a.pg.Exec(r.Context(), `UPDATE deployments SET runtime_profile=$2, mode=$3, updated_at=NOW() WHERE id=$1`, req.DeploymentID, req.RuntimeProfile, req.Mode)
@@ -962,7 +978,6 @@ func (a *API) setRuntimePolicy(w http.ResponseWriter, r *http.Request) {
 			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
 			return
 		}
-		dep, _ := a.getDeployment(r.Context(), req.DeploymentID)
 		_ = a.writeAudit(r.Context(), dep.ProjectID, "policy.runtime.updated", map[string]any{"deployment_id": req.DeploymentID, "runtime_profile": req.RuntimeProfile, "mode": req.Mode})
 		writeJSON(w, http.StatusOK, map[string]any{"status": "applied", "policy": req})
 		return
