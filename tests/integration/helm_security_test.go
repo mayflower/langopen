@@ -59,6 +59,9 @@ func TestBuilderHasJobRBAC(t *testing.T) {
 	if !strings.Contains(rendered, "name: WORKER_METRICS_ADDR") || !strings.Contains(rendered, "containerPort: 9091") {
 		t.Fatalf("expected worker metrics endpoint wiring in rendered chart")
 	}
+	if !strings.Contains(rendered, "resources: [\"agentdeployments\"]") || !strings.Contains(rendered, "apiGroups: [\"platform.langopen.dev\"]") {
+		t.Fatalf("expected control-plane role permissions for agentdeployments")
+	}
 	if !strings.Contains(rendered, "apiGroups: [\"extensions.agents.x-k8s.io\"]") ||
 		!strings.Contains(rendered, "resources: [\"sandboxtemplates\", \"sandboxwarmpools\", \"sandboxclaims\"]") {
 		t.Fatalf("expected operator RBAC permissions for sandbox CRDs")

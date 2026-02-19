@@ -181,8 +181,10 @@ func BuildKitJobSpec(repoURL, gitRef, repoPath, imageName, commitSHA string) (ma
 					"containers": []map[string]any{{
 						"name":  "buildkit",
 						"image": "moby/buildkit:rootless",
-						"args": []string{
+						"command": []string{
 							"buildctl-daemonless.sh",
+						},
+						"args": []string{
 							"build",
 							"--frontend=dockerfile.v0",
 							"--opt", "context=" + contextRef,

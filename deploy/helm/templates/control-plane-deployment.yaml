@@ -1,4 +1,40 @@
 {{- if .Values.controlPlane.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "langopen.fullname" . }}-control-plane
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "langopen.fullname" . }}-control-plane
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+rules:
+  - apiGroups: ["platform.langopen.dev"]
+    resources: ["agentdeployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "langopen.fullname" . }}-control-plane
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "langopen.fullname" . }}-control-plane
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "langopen.fullname" . }}-control-plane
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,6 +61,7 @@ spec:
       {{- if .Values.controlPlane.runtimeClassName }}
       runtimeClassName: {{ .Values.controlPlane.runtimeClassName }}
       {{- end }}
+      serviceAccountName: {{ include "langopen.fullname" . }}-control-plane
       automountServiceAccountToken: false
       containers:
         - name: control-plane

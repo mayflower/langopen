@@ -157,6 +157,7 @@ func (a *API) buildJob(w http.ResponseWriter, r *http.Request) {
 func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DeploymentID string `json:"deployment_id"`
+		ProjectID    string `json:"project_id"`
 		RepoURL      string `json:"repo_url"`
 		GitRef       string `json:"git_ref"`
 		RepoPath     string `json:"repo_path"`
@@ -218,6 +219,7 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		"service":       "builder",
 		"build_id":      buildID,
 		"deployment_id": req.DeploymentID,
+		"project_id":    req.ProjectID,
 		"commit_sha":    req.CommitSHA,
 	}
 	logLines := []string{

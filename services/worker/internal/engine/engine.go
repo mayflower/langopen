@@ -72,6 +72,15 @@ type pendingRun struct {
 	StreamResumable bool
 }
 
+type runCorrelation struct {
+	OrgID        string
+	ProjectID    string
+	DeploymentID string
+	AssistantID  string
+	ThreadID     string
+	RunID        string
+}
+
 type streamEvent struct {
 	ID    int64           `json:"id"`
 	Event string          `json:"event"`
@@ -283,18 +292,42 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 	workerActiveRunsGauge.Inc()
 	defer workerActiveRunsGauge.Dec()
 
-	w.logger.Info("run_started", "run_id", run.ID, "thread_id", run.ThreadID)
+	corr := w.fetchRunCorrelation(ctx, run)
+	w.logger.Info("run_started",
+		"org_id", corr.OrgID,
+		"project_id", corr.ProjectID,
+		"deployment_id", corr.DeploymentID,
+		"assistant_id", corr.AssistantID,
+		"thread_id", corr.ThreadID,
+		"run_id", corr.RunID,
+	)
 	if w.runMode == "mode_b" {
 		if w.sandboxEnabled {
 			sandboxID, err := w.allocateSandboxClaim(ctx, run.ID)
 			if err != nil {
 				sandboxAllocationsTotal.WithLabelValues("failed").Inc()
-				w.logger.Error("sandbox_allocation_failed", "run_id", run.ID, "error", err)
+				w.logger.Error("sandbox_allocation_failed",
+					"org_id", corr.OrgID,
+					"project_id", corr.ProjectID,
+					"deployment_id", corr.DeploymentID,
+					"assistant_id", corr.AssistantID,
+					"thread_id", corr.ThreadID,
+					"run_id", corr.RunID,
+					"error", err,
+				)
 				_ = w.updateRunStatus(ctx, run.ID, contracts.RunStatusError)
 				_ = w.updateCronExecutionStatus(ctx, run.ID, "error")
 				w.emitStreamEvent(ctx, run, "run_sandbox_allocation_failed", map[string]any{"run_id": run.ID, "error": err.Error()})
 				if enqueueErr := w.enqueueWebhookForRun(ctx, run.ID); enqueueErr != nil {
-					w.logger.Error("enqueue_webhook_failed", "run_id", run.ID, "error", enqueueErr)
+					w.logger.Error("enqueue_webhook_failed",
+						"org_id", corr.OrgID,
+						"project_id", corr.ProjectID,
+						"deployment_id", corr.DeploymentID,
+						"assistant_id", corr.AssistantID,
+						"thread_id", corr.ThreadID,
+						"run_id", corr.RunID,
+						"error", enqueueErr,
+					)
 				}
 				return
 			}
@@ -315,7 +348,15 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 	switch action {
 	case "rollback":
 		if err := w.rollbackRun(ctx, run.ID); err != nil {
-			w.logger.Error("run_rollback_failed", "run_id", run.ID, "error", err)
+			w.logger.Error("run_rollback_failed",
+				"org_id", corr.OrgID,
+				"project_id", corr.ProjectID,
+				"deployment_id", corr.DeploymentID,
+				"assistant_id", corr.AssistantID,
+				"thread_id", corr.ThreadID,
+				"run_id", corr.RunID,
+				"error", err,
+			)
 			return
 		}
 		_ = w.updateCronExecutionStatus(ctx, run.ID, "rolled_back")
@@ -323,29 +364,99 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 		_ = w.redis.Del(ctx, streamBufferPrefix()+run.ID).Err()
 	case "interrupt":
 		if err := w.updateRunStatus(ctx, run.ID, contracts.RunStatusInterrupted); err != nil {
-			w.logger.Error("run_interrupt_failed", "run_id", run.ID, "error", err)
+			w.logger.Error("run_interrupt_failed",
+				"org_id", corr.OrgID,
+				"project_id", corr.ProjectID,
+				"deployment_id", corr.DeploymentID,
+				"assistant_id", corr.AssistantID,
+				"thread_id", corr.ThreadID,
+				"run_id", corr.RunID,
+				"error", err,
+			)
 			return
 		}
 		_ = w.updateCronExecutionStatus(ctx, run.ID, "interrupted")
 		w.emitStreamEvent(ctx, run, "run_interrupted", map[string]any{"run_id": run.ID, "status": "interrupted"})
 		if err := w.enqueueWebhookForRun(ctx, run.ID); err != nil {
-			w.logger.Error("enqueue_webhook_failed", "run_id", run.ID, "error", err)
+			w.logger.Error("enqueue_webhook_failed",
+				"org_id", corr.OrgID,
+				"project_id", corr.ProjectID,
+				"deployment_id", corr.DeploymentID,
+				"assistant_id", corr.AssistantID,
+				"thread_id", corr.ThreadID,
+				"run_id", corr.RunID,
+				"error", err,
+			)
 		}
 	default:
 		if err := w.updateRunStatus(ctx, run.ID, contracts.RunStatusSuccess); err != nil {
-			w.logger.Error("run_complete_failed", "run_id", run.ID, "error", err)
+			w.logger.Error("run_complete_failed",
+				"org_id", corr.OrgID,
+				"project_id", corr.ProjectID,
+				"deployment_id", corr.DeploymentID,
+				"assistant_id", corr.AssistantID,
+				"thread_id", corr.ThreadID,
+				"run_id", corr.RunID,
+				"error", err,
+			)
 			return
 		}
 		_ = w.updateCronExecutionStatus(ctx, run.ID, "success")
 		w.emitStreamEvent(ctx, run, "token", map[string]any{"token": "hello"})
 		w.emitStreamEvent(ctx, run, "run_completed", map[string]any{"run_id": run.ID, "status": "success"})
 		if err := w.enqueueWebhookForRun(ctx, run.ID); err != nil {
-			w.logger.Error("enqueue_webhook_failed", "run_id", run.ID, "error", err)
+			w.logger.Error("enqueue_webhook_failed",
+				"org_id", corr.OrgID,
+				"project_id", corr.ProjectID,
+				"deployment_id", corr.DeploymentID,
+				"assistant_id", corr.AssistantID,
+				"thread_id", corr.ThreadID,
+				"run_id", corr.RunID,
+				"error", err,
+			)
 		}
 	}
 
 	_ = w.redis.Del(ctx, cancelKeyPrefix()+run.ID).Err()
-	w.logger.Info("run_finished", "run_id", run.ID, "action", action)
+	w.logger.Info("run_finished",
+		"org_id", corr.OrgID,
+		"project_id", corr.ProjectID,
+		"deployment_id", corr.DeploymentID,
+		"assistant_id", corr.AssistantID,
+		"thread_id", corr.ThreadID,
+		"run_id", corr.RunID,
+		"action", action,
+	)
+}
+
+func (w *Worker) fetchRunCorrelation(ctx context.Context, run pendingRun) runCorrelation {
+	out := runCorrelation{
+		AssistantID: run.AssistantID,
+		ThreadID:    run.ThreadID,
+		RunID:       run.ID,
+	}
+	if w.pg == nil {
+		return out
+	}
+	var threadID sql.NullString
+	_ = w.pg.QueryRow(ctx, `
+		SELECT
+			COALESCE(o.id, ''),
+			COALESCE(p.id, ''),
+			COALESCE(d.id, ''),
+			COALESCE(r.assistant_id, ''),
+			r.thread_id
+		FROM runs r
+		JOIN assistants a ON a.id = r.assistant_id
+		JOIN deployments d ON d.id = a.deployment_id
+		JOIN projects p ON p.id = d.project_id
+		JOIN organizations o ON o.id = p.organization_id
+		WHERE r.id=$1
+	`, run.ID).Scan(&out.OrgID, &out.ProjectID, &out.DeploymentID, &out.AssistantID, &threadID)
+	if threadID.Valid {
+		out.ThreadID = threadID.String
+	}
+	return out
 }
 
 func (w *Worker) rollbackRun(ctx context.Context, runID string) error {

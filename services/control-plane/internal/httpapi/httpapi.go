@@ -742,6 +742,7 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload := map[string]any{
+		"project_id":     dep.ProjectID,
 		"deployment_id":  dep.ID,
 		"repo_url":       dep.RepoURL,
 		"git_ref":        dep.GitRef,

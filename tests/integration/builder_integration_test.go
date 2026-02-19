@@ -145,6 +145,7 @@ func TestBuildKitJobEndpoint(t *testing.T) {
 	resp := doBuilderReq(t, ts.URL+"/internal/v1/builds/job", map[string]any{
 		"repo_url":   "https://github.com/acme/agent",
 		"git_ref":    "main",
+		"repo_path":  "apps/demo",
 		"image_name": "ghcr.io/acme/agent",
 		"commit_sha": "abcdef1234567890",
 	})
@@ -152,6 +153,36 @@ func TestBuildKitJobEndpoint(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(b))
+	}
+	var job map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := job["spec"].(map[string]any)
+	template, _ := spec["template"].(map[string]any)
+	podSpec, _ := template["spec"].(map[string]any)
+	containers, _ := podSpec["containers"].([]any)
+	if len(containers) == 0 {
+		t.Fatal("expected at least one build container")
+	}
+	first, _ := containers[0].(map[string]any)
+	command, _ := first["command"].([]any)
+	if len(command) == 0 || command[0] != "buildctl-daemonless.sh" {
+		t.Fatalf("expected buildctl-daemonless.sh command, got %#v", first["command"])
+	}
+	args, _ := first["args"].([]any)
+	expectedContext := "--opt"
+	foundContext := false
+	for i := 0; i < len(args)-1; i++ {
+		arg, _ := args[i].(string)
+		next, _ := args[i+1].(string)
+		if arg == expectedContext && strings.HasPrefix(next, "context=https://github.com/acme/agent#main:apps/demo") {
+			foundContext = true
+			break
+		}
+	}
+	if !foundContext {
+		t.Fatalf("expected git context with repo path, args=%#v", first["args"])
 	}
 }
 
