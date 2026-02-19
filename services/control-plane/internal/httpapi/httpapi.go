@@ -256,7 +256,7 @@ func (a *API) createDeployment(w http.ResponseWriter, r *http.Request) {
 
 	a.mu.Lock()
 	a.state.Deployments = append(a.state.Deployments, mapFromDeployment(rec))
-	a.state.Audit = append(a.state.Audit, map[string]any{"event": "deployment.created", "timestamp": now, "deployment_id": rec.ID})
+	a.state.Audit = append(a.state.Audit, map[string]any{"event": "deployment.created", "timestamp": now, "deployment_id": rec.ID, "project_id": rec.ProjectID})
 	a.mu.Unlock()
 	writeJSON(w, http.StatusCreated, rec)
 }
@@ -470,6 +470,7 @@ func (a *API) updateDeployment(w http.ResponseWriter, r *http.Request) {
 		"event":         "deployment.updated",
 		"timestamp":     rec.UpdatedAt,
 		"deployment_id": rec.ID,
+		"project_id":    rec.ProjectID,
 	})
 	a.mu.Unlock()
 	writeJSON(w, http.StatusOK, rec)
@@ -569,6 +570,7 @@ func (a *API) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 		"event":         "deployment.deleted",
 		"timestamp":     time.Now().UTC(),
 		"deployment_id": deploymentID,
+		"project_id":    rec.ProjectID,
 	})
 	a.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "deployment_id": deploymentID})
@@ -1161,8 +1163,25 @@ func (a *API) deleteSecretBinding(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {
+	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+	eventType := strings.TrimSpace(r.URL.Query().Get("event"))
 	if a.pg != nil {
-		rows, err := a.pg.Query(r.Context(), `SELECT id, project_id, actor_id, event_type, payload, created_at FROM audit_logs ORDER BY created_at DESC LIMIT 500`)
+		query := `SELECT id, project_id, actor_id, event_type, payload, created_at FROM audit_logs`
+		args := []any{}
+		conditions := make([]string, 0, 2)
+		if projectID != "" {
+			args = append(args, projectID)
+			conditions = append(conditions, fmt.Sprintf("project_id=$%d", len(args)))
+		}
+		if eventType != "" {
+			args = append(args, eventType)
+			conditions = append(conditions, fmt.Sprintf("event_type=$%d", len(args)))
+		}
+		if len(conditions) > 0 {
+			query += " WHERE " + strings.Join(conditions, " AND ")
+		}
+		query += " ORDER BY created_at DESC LIMIT 500"
+		rows, err := a.pg.Query(r.Context(), query, args...)
 		if err != nil {
 			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
@@ -1196,7 +1215,26 @@ func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {
 
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	writeJSON(w, http.StatusOK, a.state.Audit)
+	if projectID == "" && eventType == "" {
+		writeJSON(w, http.StatusOK, a.state.Audit)
+		return
+	}
+	out := make([]map[string]any, 0)
+	for _, item := range a.state.Audit {
+		if projectID != "" {
+			if itemProjectID, _ := item["project_id"].(string); itemProjectID != projectID {
+				continue
+			}
+		}
+		if eventType != "" {
+			itemEvent, _ := item["event"].(string)
+			if itemEvent != eventType {
+				continue
+			}
+		}
+		out = append(out, item)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (a *API) getDeployment(ctx context.Context, deploymentID string) (deploymentRecord, error) {

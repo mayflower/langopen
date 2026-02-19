@@ -494,6 +494,77 @@ func TestControlPlaneListFiltersByProject(t *testing.T) {
 	}
 }
 
+func TestControlPlaneAuditFilters(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://example.invalid")
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	create := func(projectID string) {
+		resp := doControlPlaneReq(t, ts.URL+"/internal/v1/deployments", map[string]any{
+			"project_id": projectID,
+			"repo_url":   "https://github.com/acme/agent",
+			"git_ref":    "main",
+			"repo_path":  ".",
+		})
+		if resp.StatusCode != http.StatusCreated {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 201, got %d body=%s", resp.StatusCode, string(b))
+		}
+		resp.Body.Close()
+	}
+	create("proj_a")
+	create("proj_b")
+
+	byEventReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/audit?event=deployment.created", nil)
+	byEventResp, err := http.DefaultClient.Do(byEventReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byEventResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(byEventResp.Body)
+		t.Fatalf("expected 200 for audit event filter, got %d body=%s", byEventResp.StatusCode, string(b))
+	}
+	var eventItems []map[string]any
+	if err := json.NewDecoder(byEventResp.Body).Decode(&eventItems); err != nil {
+		t.Fatal(err)
+	}
+	byEventResp.Body.Close()
+	if len(eventItems) < 2 {
+		t.Fatalf("expected at least 2 deployment.created audit events, got %d", len(eventItems))
+	}
+	for _, item := range eventItems {
+		if ev, _ := item["event"].(string); ev != "deployment.created" {
+			t.Fatalf("unexpected event in filtered audit list: %q", ev)
+		}
+	}
+
+	byProjectReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/audit?project_id=proj_a", nil)
+	byProjectResp, err := http.DefaultClient.Do(byProjectReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byProjectResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(byProjectResp.Body)
+		t.Fatalf("expected 200 for audit project filter, got %d body=%s", byProjectResp.StatusCode, string(b))
+	}
+	var projectItems []map[string]any
+	if err := json.NewDecoder(byProjectResp.Body).Decode(&projectItems); err != nil {
+		t.Fatal(err)
+	}
+	byProjectResp.Body.Close()
+	if len(projectItems) == 0 {
+		t.Fatalf("expected at least one audit record for proj_a")
+	}
+	for _, item := range projectItems {
+		if pid, _ := item["project_id"].(string); pid != "proj_a" {
+			t.Fatalf("expected project_id proj_a in filtered audit list, got %q", pid)
+		}
+	}
+}
+
 func TestControlPlaneSourceValidate(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", "")
 
