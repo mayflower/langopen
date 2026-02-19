@@ -436,7 +436,15 @@ func TestControlPlaneListFiltersByProject(t *testing.T) {
 		b, _ := io.ReadAll(buildA.Body)
 		t.Fatalf("expected 202 for build A, got %d body=%s", buildA.StatusCode, string(b))
 	}
+	var buildAObj map[string]any
+	if err := json.NewDecoder(buildA.Body).Decode(&buildAObj); err != nil {
+		t.Fatal(err)
+	}
 	buildA.Body.Close()
+	buildAID, _ := buildAObj["id"].(string)
+	if buildAID == "" {
+		t.Fatal("missing build A id")
+	}
 
 	buildB := doControlPlaneReq(t, ts.URL+"/internal/v1/builds", map[string]any{
 		"deployment_id": depB,
@@ -447,7 +455,15 @@ func TestControlPlaneListFiltersByProject(t *testing.T) {
 		b, _ := io.ReadAll(buildB.Body)
 		t.Fatalf("expected 202 for build B, got %d body=%s", buildB.StatusCode, string(b))
 	}
+	var buildBObj map[string]any
+	if err := json.NewDecoder(buildB.Body).Decode(&buildBObj); err != nil {
+		t.Fatal(err)
+	}
 	buildB.Body.Close()
+	buildBID, _ := buildBObj["id"].(string)
+	if buildBID == "" {
+		t.Fatal("missing build B id")
+	}
 
 	listDepsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/deployments?project_id=proj_a", nil)
 	listDepsResp, err := http.DefaultClient.Do(listDepsReq)
@@ -492,6 +508,39 @@ func TestControlPlaneListFiltersByProject(t *testing.T) {
 			t.Fatalf("expected only deployment %s builds for proj_a filter, got deployment_id=%s", depA, gotDep)
 		}
 	}
+
+	getAllowedReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/builds/"+buildAID+"?project_id=proj_a", nil)
+	getAllowedResp, err := http.DefaultClient.Do(getAllowedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getAllowedResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(getAllowedResp.Body)
+		t.Fatalf("expected 200 for project-scoped build get, got %d body=%s", getAllowedResp.StatusCode, string(b))
+	}
+	getAllowedResp.Body.Close()
+
+	getDeniedReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/builds/"+buildBID+"?project_id=proj_a", nil)
+	getDeniedResp, err := http.DefaultClient.Do(getDeniedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getDeniedResp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(getDeniedResp.Body)
+		t.Fatalf("expected 404 for cross-project build get, got %d body=%s", getDeniedResp.StatusCode, string(b))
+	}
+	getDeniedResp.Body.Close()
+
+	logsDeniedReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/builds/"+buildBID+"/logs?project_id=proj_a", nil)
+	logsDeniedResp, err := http.DefaultClient.Do(logsDeniedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logsDeniedResp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(logsDeniedResp.Body)
+		t.Fatalf("expected 404 for cross-project build logs, got %d body=%s", logsDeniedResp.StatusCode, string(b))
+	}
+	logsDeniedResp.Body.Close()
 }
 
 func TestControlPlaneAuditFilters(t *testing.T) {

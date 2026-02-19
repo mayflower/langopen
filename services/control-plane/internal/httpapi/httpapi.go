@@ -725,23 +725,37 @@ func (a *API) listBuilds(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) getBuild(w http.ResponseWriter, r *http.Request) {
 	buildID := strings.TrimSpace(chi.URLParam(r, "build_id"))
+	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
 	if buildID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_build_id", "build_id is required", observability.RequestIDFromContext(r.Context()))
 		return
 	}
 
-	builderPath := "/internal/v1/builds/" + url.PathEscape(buildID)
-	if resp, status, err := a.callBuilderMethod(r.Context(), http.MethodGet, builderPath, nil); err == nil {
-		writeJSON(w, status, resp)
-		return
+	if projectID == "" {
+		builderPath := "/internal/v1/builds/" + url.PathEscape(buildID)
+		if resp, status, err := a.callBuilderMethod(r.Context(), http.MethodGet, builderPath, nil); err == nil {
+			writeJSON(w, status, resp)
+			return
+		}
 	}
 
 	if a.pg != nil {
 		var rec buildRecord
-		err := a.pg.QueryRow(r.Context(), `
-			SELECT id, deployment_id, status, commit_sha, COALESCE(image_digest,''), COALESCE(logs_ref,''), created_at, updated_at
-			FROM builds WHERE id=$1
-		`, buildID).Scan(&rec.ID, &rec.DeploymentID, &rec.Status, &rec.CommitSHA, &rec.ImageDigest, &rec.LogsRef, &rec.CreatedAt, &rec.UpdatedAt)
+		query := `
+			SELECT b.id, b.deployment_id, b.status, b.commit_sha, COALESCE(b.image_digest,''), COALESCE(b.logs_ref,''), b.created_at, b.updated_at
+			FROM builds b
+		`
+		args := []any{buildID}
+		if projectID == "" {
+			query += ` WHERE b.id=$1`
+		} else {
+			query += `
+				JOIN deployments d ON d.id = b.deployment_id
+				WHERE b.id=$1 AND d.project_id=$2
+			`
+			args = append(args, projectID)
+		}
+		err := a.pg.QueryRow(r.Context(), query, args...).Scan(&rec.ID, &rec.DeploymentID, &rec.Status, &rec.CommitSHA, &rec.ImageDigest, &rec.LogsRef, &rec.CreatedAt, &rec.UpdatedAt)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				contracts.WriteError(w, http.StatusNotFound, "build_not_found", "build not found", observability.RequestIDFromContext(r.Context()))
@@ -756,8 +770,23 @@ func (a *API) getBuild(w http.ResponseWriter, r *http.Request) {
 
 	a.mu.RLock()
 	defer a.mu.RUnlock()
+	deploymentProjects := map[string]string{}
+	if projectID != "" {
+		for _, dep := range a.state.Deployments {
+			depID, _ := dep["id"].(string)
+			depProjectID, _ := dep["project_id"].(string)
+			deploymentProjects[depID] = depProjectID
+		}
+	}
 	for _, item := range a.state.Builds {
 		if id, _ := item["id"].(string); id == buildID {
+			if projectID != "" {
+				deploymentID, _ := item["deployment_id"].(string)
+				if deploymentProjects[deploymentID] != projectID {
+					contracts.WriteError(w, http.StatusNotFound, "build_not_found", "build not found", observability.RequestIDFromContext(r.Context()))
+					return
+				}
+			}
 			writeJSON(w, http.StatusOK, item)
 			return
 		}
@@ -767,9 +796,58 @@ func (a *API) getBuild(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) getBuildLogs(w http.ResponseWriter, r *http.Request) {
 	buildID := strings.TrimSpace(chi.URLParam(r, "build_id"))
+	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
 	if buildID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_build_id", "build_id is required", observability.RequestIDFromContext(r.Context()))
 		return
+	}
+	if projectID != "" {
+		if a.pg != nil {
+			var exists bool
+			err := a.pg.QueryRow(r.Context(), `
+				SELECT EXISTS(
+					SELECT 1
+					FROM builds b
+					JOIN deployments d ON d.id = b.deployment_id
+					WHERE b.id=$1 AND d.project_id=$2
+				)
+			`, buildID, projectID).Scan(&exists)
+			if err != nil {
+				contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			if !exists {
+				contracts.WriteError(w, http.StatusNotFound, "build_not_found", "build not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+		} else {
+			a.mu.RLock()
+			deploymentProjects := map[string]string{}
+			for _, dep := range a.state.Deployments {
+				depID, _ := dep["id"].(string)
+				depProjectID, _ := dep["project_id"].(string)
+				deploymentProjects[depID] = depProjectID
+			}
+			found := false
+			allowed := false
+			for _, build := range a.state.Builds {
+				id, _ := build["id"].(string)
+				if id != buildID {
+					continue
+				}
+				found = true
+				deploymentID, _ := build["deployment_id"].(string)
+				if deploymentProjects[deploymentID] == projectID {
+					allowed = true
+				}
+				break
+			}
+			a.mu.RUnlock()
+			if !found || !allowed {
+				contracts.WriteError(w, http.StatusNotFound, "build_not_found", "build not found", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+		}
 	}
 	builderPath := "/internal/v1/builds/" + url.PathEscape(buildID) + "/logs"
 	resp, status, err := a.callBuilderMethod(r.Context(), http.MethodGet, builderPath, nil)
