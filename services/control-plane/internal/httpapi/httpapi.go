@@ -1112,19 +1112,31 @@ func (a *API) createAPIKey(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) revokeAPIKey(w http.ResponseWriter, r *http.Request) {
 	keyID := strings.TrimSpace(chi.URLParam(r, "key_id"))
+	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
 	if keyID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_key_id", "key_id is required", observability.RequestIDFromContext(r.Context()))
 		return
 	}
 
 	if a.pg != nil {
-		var projectID string
-		err := a.pg.QueryRow(r.Context(), `
+		query := `
 			UPDATE api_keys
 			SET revoked_at=NOW()
 			WHERE id=$1 AND revoked_at IS NULL
 			RETURNING project_id
-		`, keyID).Scan(&projectID)
+		`
+		args := []any{keyID}
+		if projectID != "" {
+			query = `
+				UPDATE api_keys
+				SET revoked_at=NOW()
+				WHERE id=$1 AND revoked_at IS NULL AND project_id=$2
+				RETURNING project_id
+			`
+			args = append(args, projectID)
+		}
+		var revokedProjectID string
+		err := a.pg.QueryRow(r.Context(), query, args...).Scan(&revokedProjectID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				contracts.WriteError(w, http.StatusNotFound, "api_key_not_found", "api key not found", observability.RequestIDFromContext(r.Context()))
@@ -1133,7 +1145,7 @@ func (a *API) revokeAPIKey(w http.ResponseWriter, r *http.Request) {
 			contracts.WriteError(w, http.StatusInternalServerError, "db_update_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
 		}
-		_ = a.writeAudit(r.Context(), projectID, "api_key.revoked", map[string]any{"key_id": keyID})
+		_ = a.writeAudit(r.Context(), revokedProjectID, "api_key.revoked", map[string]any{"key_id": keyID})
 		writeJSON(w, http.StatusOK, map[string]any{"status": "revoked", "key_id": keyID})
 		return
 	}
@@ -1142,6 +1154,12 @@ func (a *API) revokeAPIKey(w http.ResponseWriter, r *http.Request) {
 	defer a.mu.Unlock()
 	for _, item := range a.state.APIKeys {
 		if id, _ := item["id"].(string); id == keyID {
+			if projectID != "" {
+				if itemProjectID, _ := item["project_id"].(string); itemProjectID != projectID {
+					contracts.WriteError(w, http.StatusNotFound, "api_key_not_found", "api key not found", observability.RequestIDFromContext(r.Context()))
+					return
+				}
+			}
 			now := time.Now().UTC()
 			item["revoked_at"] = now
 			writeJSON(w, http.StatusOK, map[string]any{"status": "revoked", "key_id": keyID})

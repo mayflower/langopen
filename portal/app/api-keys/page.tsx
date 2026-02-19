@@ -68,7 +68,7 @@ export default function APIKeysPage() {
   async function revoke(id: string) {
     setError("");
     try {
-      const resp = await fetch(`/api/platform/control/internal/v1/api-keys/${encodeURIComponent(id)}/revoke`, {
+      const resp = await fetch(`/api/platform/control/internal/v1/api-keys/${encodeURIComponent(id)}/revoke?project_id=${encodeURIComponent(projectID)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{}"

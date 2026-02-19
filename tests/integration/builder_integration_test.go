@@ -849,6 +849,47 @@ func TestControlPlaneAPIKeyLifecycle(t *testing.T) {
 	revokeResp.Body.Close()
 }
 
+func TestControlPlaneAPIKeyRevokeProjectScope(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://example.invalid")
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doControlPlaneReq(t, ts.URL+"/internal/v1/api-keys", map[string]any{
+		"project_id": "proj_a",
+		"name":       "scope-test",
+	})
+	if createResp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("expected 201, got %d body=%s", createResp.StatusCode, string(b))
+	}
+	var created map[string]any
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	createResp.Body.Close()
+	keyID, _ := created["id"].(string)
+	if keyID == "" {
+		t.Fatal("missing key id")
+	}
+
+	revokeDeniedResp := doControlPlaneReqWithHeaders(t, http.MethodPost, ts.URL+"/internal/v1/api-keys/"+keyID+"/revoke?project_id=proj_b", map[string]any{}, map[string]string{})
+	if revokeDeniedResp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(revokeDeniedResp.Body)
+		t.Fatalf("expected 404 for cross-project revoke, got %d body=%s", revokeDeniedResp.StatusCode, string(b))
+	}
+	revokeDeniedResp.Body.Close()
+
+	revokeAllowedResp := doControlPlaneReqWithHeaders(t, http.MethodPost, ts.URL+"/internal/v1/api-keys/"+keyID+"/revoke?project_id=proj_a", map[string]any{}, map[string]string{})
+	if revokeAllowedResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(revokeAllowedResp.Body)
+		t.Fatalf("expected 200 for same-project revoke, got %d body=%s", revokeAllowedResp.StatusCode, string(b))
+	}
+	revokeAllowedResp.Body.Close()
+}
+
 func TestControlPlaneSecretBindingLifecycle(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", "")
 	t.Setenv("BUILDER_URL", "http://example.invalid")
