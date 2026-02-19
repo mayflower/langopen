@@ -331,9 +331,10 @@ def execute(req: ExecuteRequest) -> ExecuteResponse:
         )
 
     target = _graph_target(req)
-    repo_path = _repo_path(req)
+    repo_path = ""
 
     try:
+        repo_path = _repo_path(req)
         _prepare_python_env(req, repo_path, target)
         if target:
             target_obj = _resolve_target(target, repo_path)

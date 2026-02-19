@@ -34,12 +34,18 @@ spec:
             - containerPort: {{ .Values.apiServer.service.targetPort }}
               name: http
           env:
+            {{- if .Values.env.postgresDsn }}
             - name: POSTGRES_DSN
               value: {{ .Values.env.postgresDsn | quote }}
+            {{- end }}
+            {{- if .Values.env.redisAddr }}
             - name: REDIS_ADDR
               value: {{ .Values.env.redisAddr | quote }}
+            {{- end }}
+            {{- if .Values.env.bootstrapApiKey }}
             - name: BOOTSTRAP_API_KEY
               value: {{ .Values.env.bootstrapApiKey | quote }}
+            {{- end }}
             - name: OPENAPI_SPEC_PATH
               value: {{ .Values.env.openapiSpecPath | quote }}
             - name: MIGRATIONS_DIR

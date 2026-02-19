@@ -71,10 +71,14 @@ spec:
             - containerPort: {{ .Values.controlPlane.service.targetPort }}
               name: http
           env:
+            {{- if .Values.env.postgresDsn }}
             - name: POSTGRES_DSN
               value: {{ .Values.env.postgresDsn | quote }}
+            {{- end }}
+            {{- if .Values.env.redisAddr }}
             - name: REDIS_ADDR
               value: {{ .Values.env.redisAddr | quote }}
+            {{- end }}
             - name: BUILDER_URL
               value: {{ .Values.env.builderUrl | quote }}
             - name: CONTROL_PLANE_SYNC_AGENTDEPLOYMENT

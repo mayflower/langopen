@@ -34,10 +34,14 @@ spec:
             - containerPort: 9091
               name: metrics
           env:
+            {{- if .Values.env.postgresDsn }}
             - name: POSTGRES_DSN
               value: {{ .Values.env.postgresDsn | quote }}
+            {{- end }}
+            {{- if .Values.env.redisAddr }}
             - name: REDIS_ADDR
               value: {{ .Values.env.redisAddr | quote }}
+            {{- end }}
             - name: RUN_WAKEUP_LIST
               value: {{ .Values.env.runWakeupList | quote }}
             - name: RUN_CANCEL_KEY_PREFIX

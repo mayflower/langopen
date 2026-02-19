@@ -74,8 +74,10 @@ spec:
             - containerPort: {{ .Values.builder.service.targetPort }}
               name: http
           env:
+            {{- if .Values.env.postgresDsn }}
             - name: POSTGRES_DSN
               value: {{ .Values.env.postgresDsn | quote }}
+            {{- end }}
             - name: BUILDKIT_EXECUTE_JOBS
               value: {{ ternary "true" "false" .Values.builder.executeJobs | quote }}
             - name: BUILDKIT_NAMESPACE

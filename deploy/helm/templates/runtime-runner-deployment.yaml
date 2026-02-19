@@ -33,6 +33,9 @@ spec:
           ports:
             - containerPort: {{ .Values.runtimeRunner.service.targetPort }}
               name: http
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           securityContext:
             runAsUser: 65532
             runAsGroup: 65532
@@ -44,6 +47,9 @@ spec:
                 - ALL
           resources:
             {{- toYaml .Values.runtimeRunner.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
