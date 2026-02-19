@@ -618,18 +618,33 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 
 	builderResp, status, err := a.callBuilder(r.Context(), "/internal/v1/builds/trigger", payload)
 	if err != nil {
+		fallbackID := contracts.NewID("build")
+		fallbackLogsRef := "inline://builds/" + fallbackID
+		now := time.Now().UTC()
 		fallback := map[string]any{
-			"id":            contracts.NewID("build"),
+			"id":            fallbackID,
 			"deployment_id": dep.ID,
 			"status":        "queued",
 			"commit_sha":    req.CommitSHA,
-			"created_at":    time.Now().UTC(),
-			"updated_at":    time.Now().UTC(),
+			"logs_ref":      fallbackLogsRef,
+			"created_at":    now,
+			"updated_at":    now,
 			"warning":       "builder unavailable; build queued placeholder created",
 		}
-		a.mu.Lock()
-		a.state.Builds = append(a.state.Builds, fallback)
-		a.mu.Unlock()
+		if a.pg != nil {
+			_, insertErr := a.pg.Exec(r.Context(), `
+				INSERT INTO builds (id, deployment_id, status, commit_sha, image_digest, logs_ref, created_at, updated_at)
+				VALUES ($1,$2,$3,$4,'',$5,$6,$7)
+			`, fallbackID, dep.ID, "queued", req.CommitSHA, fallbackLogsRef, now, now)
+			if insertErr != nil {
+				contracts.WriteError(w, http.StatusInternalServerError, "db_insert_failed", insertErr.Error(), observability.RequestIDFromContext(r.Context()))
+				return
+			}
+		} else {
+			a.mu.Lock()
+			a.state.Builds = append(a.state.Builds, fallback)
+			a.mu.Unlock()
+		}
 		_ = a.writeAudit(r.Context(), dep.ProjectID, "build.triggered", map[string]any{"deployment_id": dep.ID, "build_id": fallback["id"], "fallback": true})
 		writeJSON(w, http.StatusAccepted, fallback)
 		return
@@ -852,6 +867,45 @@ func (a *API) getBuildLogs(w http.ResponseWriter, r *http.Request) {
 	builderPath := "/internal/v1/builds/" + url.PathEscape(buildID) + "/logs"
 	resp, status, err := a.callBuilderMethod(r.Context(), http.MethodGet, builderPath, nil)
 	if err != nil {
+		if a.pg != nil {
+			var logsRef string
+			query := `SELECT COALESCE(logs_ref,'') FROM builds WHERE id=$1`
+			args := []any{buildID}
+			if projectID != "" {
+				query = `
+					SELECT COALESCE(b.logs_ref,'')
+					FROM builds b
+					JOIN deployments d ON d.id = b.deployment_id
+					WHERE b.id=$1 AND d.project_id=$2
+				`
+				args = append(args, projectID)
+			}
+			if dbErr := a.pg.QueryRow(r.Context(), query, args...).Scan(&logsRef); dbErr == nil {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"build_id": buildID,
+					"logs_ref": logsRef,
+					"logs":     "builder unavailable; use logs_ref to retrieve persisted logs",
+				})
+				return
+			}
+		} else {
+			a.mu.RLock()
+			for _, item := range a.state.Builds {
+				id, _ := item["id"].(string)
+				if id != buildID {
+					continue
+				}
+				logsRef, _ := item["logs_ref"].(string)
+				a.mu.RUnlock()
+				writeJSON(w, http.StatusOK, map[string]any{
+					"build_id": buildID,
+					"logs_ref": logsRef,
+					"logs":     "builder unavailable; use logs_ref to retrieve persisted logs",
+				})
+				return
+			}
+			a.mu.RUnlock()
+		}
 		contracts.WriteError(w, http.StatusBadGateway, "build_logs_fetch_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 		return
 	}

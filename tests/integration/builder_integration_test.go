@@ -645,6 +645,77 @@ func TestControlPlaneSourceValidate(t *testing.T) {
 	}
 }
 
+func TestControlPlaneBuildLogsFallbackWhenBuilderUnavailable(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://127.0.0.1:1")
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doControlPlaneReq(t, ts.URL+"/internal/v1/deployments", map[string]any{
+		"project_id": "proj_default",
+		"repo_url":   "https://github.com/acme/agent",
+		"git_ref":    "main",
+		"repo_path":  ".",
+	})
+	if createResp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("expected 201, got %d body=%s", createResp.StatusCode, string(b))
+	}
+	var dep map[string]any
+	if err := json.NewDecoder(createResp.Body).Decode(&dep); err != nil {
+		t.Fatal(err)
+	}
+	createResp.Body.Close()
+	depID, _ := dep["id"].(string)
+	if depID == "" {
+		t.Fatal("missing deployment id")
+	}
+
+	buildResp := doControlPlaneReq(t, ts.URL+"/internal/v1/builds", map[string]any{
+		"deployment_id": depID,
+		"commit_sha":    "abc123",
+		"image_name":    "ghcr.io/acme/agent",
+		"repo_path":     ".",
+	})
+	if buildResp.StatusCode != http.StatusAccepted {
+		b, _ := io.ReadAll(buildResp.Body)
+		t.Fatalf("expected 202, got %d body=%s", buildResp.StatusCode, string(b))
+	}
+	var build map[string]any
+	if err := json.NewDecoder(buildResp.Body).Decode(&build); err != nil {
+		t.Fatal(err)
+	}
+	buildResp.Body.Close()
+	buildID, _ := build["id"].(string)
+	logsRef, _ := build["logs_ref"].(string)
+	if buildID == "" || logsRef == "" {
+		t.Fatalf("expected build id and logs_ref in fallback response, got %#v", build)
+	}
+
+	logsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/builds/"+buildID+"/logs", nil)
+	logsResp, err := http.DefaultClient.Do(logsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logsResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(logsResp.Body)
+		t.Fatalf("expected 200 for fallback logs response, got %d body=%s", logsResp.StatusCode, string(b))
+	}
+	var logsBody map[string]any
+	if err := json.NewDecoder(logsResp.Body).Decode(&logsBody); err != nil {
+		t.Fatal(err)
+	}
+	logsResp.Body.Close()
+	if gotBuildID, _ := logsBody["build_id"].(string); gotBuildID != buildID {
+		t.Fatalf("expected build_id %s, got %q", buildID, gotBuildID)
+	}
+	if gotLogsRef, _ := logsBody["logs_ref"].(string); gotLogsRef == "" {
+		t.Fatalf("expected non-empty logs_ref in fallback logs response")
+	}
+}
+
 func TestControlPlaneAPIKeyLifecycle(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", "")
 	t.Setenv("BUILDER_URL", "http://example.invalid")
