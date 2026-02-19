@@ -16,7 +16,7 @@ metadata:
     app.kubernetes.io/component: operator
 rules:
   - apiGroups: ["", "apps", "networking.k8s.io"]
-    resources: ["pods", "services", "deployments", "networkpolicies", "events"]
+    resources: ["pods", "services", "deployments", "networkpolicies", "ingresses", "events"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["platform.langopen.dev"]
     resources: ["agentdeployments", "agentdeployments/status", "agentdeployments/finalizers"]
