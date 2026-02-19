@@ -112,6 +112,24 @@ export default function RunsPage() {
     setStreamLog((prev) => [...prev, { id: "-", event: "cancel", data: action }]);
   }
 
+  async function deleteRun() {
+    if (!runID) {
+      setError("run_id is required for delete");
+      return;
+    }
+    setError("");
+    const path = threadID
+      ? `/api/platform/data/api/v1/threads/${encodeURIComponent(threadID)}/runs/${encodeURIComponent(runID)}`
+      : `/api/platform/data/api/v1/runs/${encodeURIComponent(runID)}`;
+    const resp = await fetch(path, { method: "DELETE" });
+    if (!resp.ok) {
+      const body = await resp.text();
+      setError(`delete failed (${resp.status}) ${body}`);
+      return;
+    }
+    setStreamLog((prev) => [...prev, { id: "-", event: "delete", data: runID }]);
+  }
+
   return (
     <main className="hero">
       <h2>Runs</h2>
@@ -131,6 +149,7 @@ export default function RunsPage() {
       <div className="row">
         <button disabled={loading} onClick={() => cancel("interrupt")} type="button">Interrupt</button>
         <button disabled={loading} onClick={() => cancel("rollback")} type="button">Rollback</button>
+        <button disabled={loading} onClick={deleteRun} type="button">Delete</button>
       </div>
 
       {error ? <p className="warn">{error}</p> : null}
