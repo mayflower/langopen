@@ -1139,6 +1139,7 @@ func (a *API) revokeAPIKey(w http.ResponseWriter, r *http.Request) {
 func (a *API) bindSecret(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DeploymentID string `json:"deployment_id"`
+		ProjectID    string `json:"project_id"`
 		SecretName   string `json:"secret_name"`
 		TargetKey    string `json:"target_key"`
 	}
@@ -1147,16 +1148,30 @@ func (a *API) bindSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.DeploymentID = strings.TrimSpace(req.DeploymentID)
+	req.ProjectID = strings.TrimSpace(req.ProjectID)
 	req.SecretName = strings.TrimSpace(req.SecretName)
 	req.TargetKey = strings.TrimSpace(req.TargetKey)
 	if req.DeploymentID == "" || req.SecretName == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_secret_binding", "deployment_id and secret_name are required", observability.RequestIDFromContext(r.Context()))
 		return
 	}
+	dep, err := a.getDeployment(r.Context(), req.DeploymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if req.ProjectID != "" && dep.ProjectID != req.ProjectID {
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 
 	event := map[string]any{"event": "secret.bound", "timestamp": time.Now().UTC(), "binding": req}
 	if a.pg != nil {
-		_, err := a.pg.Exec(r.Context(), `
+		_, err = a.pg.Exec(r.Context(), `
 			INSERT INTO deployment_secret_bindings (id, deployment_id, secret_name, target_key, created_at)
 			VALUES ($1,$2,$3,NULLIF($4,''),NOW())
 			ON CONFLICT (deployment_id, secret_name, target_key) DO NOTHING
@@ -1165,12 +1180,7 @@ func (a *API) bindSecret(w http.ResponseWriter, r *http.Request) {
 			contracts.WriteError(w, http.StatusBadRequest, "db_insert_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return
 		}
-
-		projectID := "proj_default"
-		if dep, err := a.getDeployment(r.Context(), req.DeploymentID); err == nil {
-			projectID = dep.ProjectID
-		}
-		_ = a.writeAudit(r.Context(), projectID, "secret.bound", map[string]any{
+		_ = a.writeAudit(r.Context(), dep.ProjectID, "secret.bound", map[string]any{
 			"deployment_id": req.DeploymentID,
 			"secret_name":   req.SecretName,
 			"target_key":    req.TargetKey,
@@ -1207,8 +1217,22 @@ func (a *API) bindSecret(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) listSecretBindings(w http.ResponseWriter, r *http.Request) {
 	deploymentID := strings.TrimSpace(r.URL.Query().Get("deployment_id"))
+	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
 	if deploymentID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_request", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	dep, err := a.getDeployment(r.Context(), deploymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if projectID != "" && dep.ProjectID != projectID {
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
 		return
 	}
 
@@ -1251,6 +1275,7 @@ func (a *API) listSecretBindings(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) deleteSecretBinding(w http.ResponseWriter, r *http.Request) {
 	bindingID := strings.TrimSpace(chi.URLParam(r, "binding_id"))
+	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
 	if bindingID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_binding_id", "binding_id is required", observability.RequestIDFromContext(r.Context()))
 		return
@@ -1258,11 +1283,22 @@ func (a *API) deleteSecretBinding(w http.ResponseWriter, r *http.Request) {
 
 	if a.pg != nil {
 		var deploymentID string
-		err := a.pg.QueryRow(r.Context(), `
+		query := `
 			DELETE FROM deployment_secret_bindings
 			WHERE id=$1
 			RETURNING deployment_id
-		`, bindingID).Scan(&deploymentID)
+		`
+		args := []any{bindingID}
+		if projectID != "" {
+			query = `
+				DELETE FROM deployment_secret_bindings dsb
+				USING deployments d
+				WHERE dsb.id=$1 AND d.id = dsb.deployment_id AND d.project_id=$2
+				RETURNING dsb.deployment_id
+			`
+			args = append(args, projectID)
+		}
+		err := a.pg.QueryRow(r.Context(), query, args...).Scan(&deploymentID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				contracts.WriteError(w, http.StatusNotFound, "secret_binding_not_found", "secret binding not found", observability.RequestIDFromContext(r.Context()))
@@ -1285,20 +1321,37 @@ func (a *API) deleteSecretBinding(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	next := make([]map[string]any, 0, len(a.state.Secrets))
 	found := false
+	deploymentOfBinding := ""
 	for _, item := range a.state.Secrets {
 		id, _ := item["id"].(string)
 		if id == bindingID {
 			found = true
+			deploymentOfBinding, _ = item["deployment_id"].(string)
 			continue
 		}
 		next = append(next, item)
 	}
 	if !found {
+		a.mu.Unlock()
 		contracts.WriteError(w, http.StatusNotFound, "secret_binding_not_found", "secret binding not found", observability.RequestIDFromContext(r.Context()))
 		return
+	}
+	if projectID != "" {
+		deploymentProject := ""
+		for _, dep := range a.state.Deployments {
+			id, _ := dep["id"].(string)
+			if id == deploymentOfBinding {
+				deploymentProject, _ = dep["project_id"].(string)
+				break
+			}
+		}
+		if deploymentProject != projectID {
+			a.mu.Unlock()
+			contracts.WriteError(w, http.StatusNotFound, "secret_binding_not_found", "secret binding not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
 	}
 	a.state.Secrets = next
 	a.state.Audit = append(a.state.Audit, map[string]any{
@@ -1306,6 +1359,7 @@ func (a *API) deleteSecretBinding(w http.ResponseWriter, r *http.Request) {
 		"timestamp":  time.Now().UTC(),
 		"binding_id": bindingID,
 	})
+	a.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "binding_id": bindingID})
 }
 

@@ -69,7 +69,7 @@ export default function DeploymentsPage() {
 
   async function loadBindings(depID: string) {
     try {
-      const resp = await fetch(`/api/platform/control/internal/v1/secrets/bindings?deployment_id=${encodeURIComponent(depID)}`, { cache: "no-store" });
+      const resp = await fetch(`/api/platform/control/internal/v1/secrets/bindings?deployment_id=${encodeURIComponent(depID)}&project_id=${encodeURIComponent(projectID)}`, { cache: "no-store" });
       if (!resp.ok) {
         throw new Error(`load bindings failed (${resp.status})`);
       }
@@ -184,6 +184,7 @@ export default function DeploymentsPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           deployment_id: deploymentID,
+          project_id: projectID,
           secret_name: secretName,
           target_key: targetKey
         })
@@ -206,7 +207,7 @@ export default function DeploymentsPage() {
     setError("");
     setStatus("");
     try {
-      const resp = await fetch(`/api/platform/control/internal/v1/secrets/bindings/${encodeURIComponent(bindingID)}`, {
+      const resp = await fetch(`/api/platform/control/internal/v1/secrets/bindings/${encodeURIComponent(bindingID)}?project_id=${encodeURIComponent(projectID)}`, {
         method: "DELETE"
       });
       const body = await resp.json();

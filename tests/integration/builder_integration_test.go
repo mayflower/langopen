@@ -940,6 +940,114 @@ func TestControlPlaneSecretBindingLifecycle(t *testing.T) {
 	}
 }
 
+func TestControlPlaneSecretBindingProjectScope(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://example.invalid")
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doControlPlaneReq(t, ts.URL+"/internal/v1/deployments", map[string]any{
+		"project_id": "proj_a",
+		"repo_url":   "https://github.com/acme/agent",
+		"git_ref":    "main",
+		"repo_path":  ".",
+	})
+	if createResp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("expected 201, got %d body=%s", createResp.StatusCode, string(b))
+	}
+	var dep map[string]any
+	if err := json.NewDecoder(createResp.Body).Decode(&dep); err != nil {
+		t.Fatal(err)
+	}
+	createResp.Body.Close()
+	depID, _ := dep["id"].(string)
+	if depID == "" {
+		t.Fatal("missing deployment id")
+	}
+
+	bindDeniedResp := doControlPlaneReq(t, ts.URL+"/internal/v1/secrets/bind", map[string]any{
+		"deployment_id": depID,
+		"project_id":    "proj_b",
+		"secret_name":   "openai-secret",
+		"target_key":    "OPENAI_API_KEY",
+	})
+	if bindDeniedResp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(bindDeniedResp.Body)
+		t.Fatalf("expected 404 for cross-project bind, got %d body=%s", bindDeniedResp.StatusCode, string(b))
+	}
+	bindDeniedResp.Body.Close()
+
+	bindAllowedResp := doControlPlaneReq(t, ts.URL+"/internal/v1/secrets/bind", map[string]any{
+		"deployment_id": depID,
+		"project_id":    "proj_a",
+		"secret_name":   "openai-secret",
+		"target_key":    "OPENAI_API_KEY",
+	})
+	if bindAllowedResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(bindAllowedResp.Body)
+		t.Fatalf("expected 200 for same-project bind, got %d body=%s", bindAllowedResp.StatusCode, string(b))
+	}
+	bindAllowedResp.Body.Close()
+
+	listDeniedReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/secrets/bindings?deployment_id="+depID+"&project_id=proj_b", nil)
+	listDeniedResp, err := http.DefaultClient.Do(listDeniedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listDeniedResp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(listDeniedResp.Body)
+		t.Fatalf("expected 404 for cross-project list, got %d body=%s", listDeniedResp.StatusCode, string(b))
+	}
+	listDeniedResp.Body.Close()
+
+	listAllowedReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/secrets/bindings?deployment_id="+depID+"&project_id=proj_a", nil)
+	listAllowedResp, err := http.DefaultClient.Do(listAllowedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listAllowedResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(listAllowedResp.Body)
+		t.Fatalf("expected 200 for same-project list, got %d body=%s", listAllowedResp.StatusCode, string(b))
+	}
+	var bindings []map[string]any
+	if err := json.NewDecoder(listAllowedResp.Body).Decode(&bindings); err != nil {
+		t.Fatal(err)
+	}
+	listAllowedResp.Body.Close()
+	if len(bindings) == 0 {
+		t.Fatal("expected at least one binding")
+	}
+	bindingID, _ := bindings[0]["id"].(string)
+	if bindingID == "" {
+		t.Fatal("missing binding id")
+	}
+
+	deleteDeniedReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/internal/v1/secrets/bindings/"+bindingID+"?project_id=proj_b", nil)
+	deleteDeniedResp, err := http.DefaultClient.Do(deleteDeniedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteDeniedResp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(deleteDeniedResp.Body)
+		t.Fatalf("expected 404 for cross-project delete, got %d body=%s", deleteDeniedResp.StatusCode, string(b))
+	}
+	deleteDeniedResp.Body.Close()
+
+	deleteAllowedReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/internal/v1/secrets/bindings/"+bindingID+"?project_id=proj_a", nil)
+	deleteAllowedResp, err := http.DefaultClient.Do(deleteAllowedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteAllowedResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(deleteAllowedResp.Body)
+		t.Fatalf("expected 200 for same-project delete, got %d body=%s", deleteAllowedResp.StatusCode, string(b))
+	}
+	deleteAllowedResp.Body.Close()
+}
+
 func TestControlPlaneRBAC(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", "")
 	t.Setenv("BUILDER_URL", "http://example.invalid")
