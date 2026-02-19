@@ -10,6 +10,7 @@ type StreamEntry = {
 
 export default function RunsPage() {
   const [threadID, setThreadID] = useState("");
+  const [assistantID, setAssistantID] = useState("asst_default");
   const [runID, setRunID] = useState("");
   const [lastEventID, setLastEventID] = useState("-1");
   const [loading, setLoading] = useState(false);
@@ -89,6 +90,39 @@ export default function RunsPage() {
     }
   }
 
+  async function startStatelessRun(e: FormEvent) {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
+    setStreamLog([]);
+    setLastEventID("-1");
+    setThreadID("");
+
+    try {
+      const resp = await fetch("/api/platform/data/api/v1/runs/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ assistant_id: assistantID, multitask_strategy: "enqueue", stream_resumable: true })
+      });
+      if (!resp.ok || !resp.body) {
+        const body = await resp.text();
+        throw new Error(`start stateless stream failed (${resp.status}) ${body}`);
+      }
+      await consumeSSE(resp.body, (entry) => {
+        setStreamLog((prev) => [...prev, entry]);
+        setLastEventID(entry.id);
+        const parsed = parseJSON(entry.data);
+        if (!runID && parsed && typeof parsed.run_id === "string") {
+          setRunID(parsed.run_id);
+        }
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "start stateless stream failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function cancel(action: "interrupt" | "rollback") {
     if (!runID) {
       setError("run_id is required for cancel");
@@ -138,6 +172,11 @@ export default function RunsPage() {
       <form onSubmit={startThreadRun} className="row">
         <input placeholder="thread_id" value={threadID} onChange={(e) => setThreadID(e.target.value)} />
         <button disabled={loading} type="submit">Start Thread Run</button>
+      </form>
+
+      <form onSubmit={startStatelessRun} className="row">
+        <input placeholder="assistant_id" value={assistantID} onChange={(e) => setAssistantID(e.target.value)} />
+        <button disabled={loading} type="submit">Start Stateless Run</button>
       </form>
 
       <div className="row">
