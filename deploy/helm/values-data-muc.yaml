@@ -2,7 +2,7 @@ fullnameOverride: langopen
 
 global:
   image:
-    repository: registry.data.mayflower.zone/data/langopen
+    repository: ghcr.io/mayflower/langopen
     tag: latest
     pullPolicy: Always
   imagePullSecrets:
@@ -14,7 +14,7 @@ env:
   controlPlaneSyncAgentDeployment: true
   controlPlaneSyncAgentDeploymentStrict: false
   agentDeploymentNamespace: langopen
-  agentDeploymentImage: registry.data.mayflower.zone/data/langopen/api-server:latest
+  agentDeploymentImage: ghcr.io/mayflower/langopen/api-server:latest
 
 apiServer:
   replicas: 1

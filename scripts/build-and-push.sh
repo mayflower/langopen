@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REGISTRY="${REGISTRY:-registry.data.mayflower.zone/data/langopen}"
-TAG="${TAG:-$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S)}"
+REGISTRY="${REGISTRY:-ghcr.io/mayflower/langopen}"
+TAG="${TAG:-$(git rev-parse --short=12 HEAD 2>/dev/null || date +%Y%m%d%H%M%S)}"
 
 build() {
   local component="$1"
