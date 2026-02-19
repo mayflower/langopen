@@ -10,12 +10,13 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   docker-build-push:
     runs-on: mayflower-k8s-runners
     env:
-      REGISTRY: registry.data.mayflower.zone/data/langopen
+      REGISTRY: ghcr.io/mayflower/langopen
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,12 +24,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to registry.data.mayflower.zone
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: registry.data.mayflower.zone
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute image tag
         id: tag
