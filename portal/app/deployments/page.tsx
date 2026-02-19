@@ -250,6 +250,34 @@ export default function DeploymentsPage() {
     }
   }
 
+  async function applyRuntimePolicy(id: string) {
+    setLoading(true);
+    setError("");
+    setStatus("");
+    try {
+      const resp = await fetch("/api/platform/control/internal/v1/policies/runtime", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          deployment_id: id,
+          project_id: projectID,
+          runtime_profile: runtimeProfile,
+          mode
+        })
+      });
+      const body = await resp.json();
+      if (!resp.ok) {
+        throw new Error(JSON.stringify(body));
+      }
+      setStatus(`runtime policy applied: ${id}`);
+      await loadDeployments();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "apply runtime policy failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
     <main className="hero">
       <h2>Deployments</h2>
@@ -347,6 +375,7 @@ export default function DeploymentsPage() {
                 <td>{d.mode}</td>
                 <td>{new Date(d.updated_at).toLocaleString()}</td>
                 <td>
+                  <button disabled={loading} type="button" onClick={() => void applyRuntimePolicy(d.id)}>Apply Policy</button>
                   <button disabled={loading} type="button" onClick={() => void deleteDeployment(d.id)}>Delete</button>
                 </td>
               </tr>
