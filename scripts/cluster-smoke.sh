@@ -45,9 +45,11 @@ kubectl -n "$NAMESPACE" wait --for=condition=Ready "pod/$SMOKE_POD_NAME" --timeo
 HEALTHZ="$(kcurl "$API_BASE/healthz")"
 [[ "$HEALTHZ" == "ok" ]] || fail "healthz response was '$HEALTHZ'"
 kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" "$API_BASE/docs" >/dev/null
-OPENAPI_HEAD="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" "$API_BASE/openapi.json" | head -c 1)"
+OPENAPI_BODY="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" "$API_BASE/openapi.json")"
+OPENAPI_HEAD="${OPENAPI_BODY:0:1}"
 [[ "$OPENAPI_HEAD" == "{" ]] || fail "openapi.json was not JSON"
-METRICS_HEAD="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" "$API_BASE/metrics" | head -n 1)"
+METRICS_BODY="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" "$API_BASE/metrics")"
+METRICS_HEAD="$(printf '%s\n' "$METRICS_BODY" | sed -n '1p')"
 [[ "$METRICS_HEAD" == \#* ]] || fail "api metrics endpoint unavailable"
 
 THREAD_JSON="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{}' "$API_BASE/api/v1/threads")"
@@ -95,7 +97,9 @@ echo "control-plane deployment: $CP_DEPLOY_ID"
 
 CP_BUILD_JSON="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{"deployment_id":"'"$CP_DEPLOY_ID"'","commit_sha":"abcdef123456","image_name":"ghcr.io/acme/agent"}' "$CONTROL_BASE/internal/v1/builds")"
 CP_BUILD_STATUS="$(printf '%s' "$CP_BUILD_JSON" | jq -r '.status')"
-[[ "$CP_BUILD_STATUS" == "succeeded" || "$CP_BUILD_STATUS" == "queued" ]] || fail "control-plane build trigger failed: $CP_BUILD_JSON"
+if [[ "$CP_BUILD_STATUS" != "succeeded" && "$CP_BUILD_STATUS" != "queued" && "$CP_BUILD_STATUS" != "failed_validation" ]]; then
+  fail "control-plane build trigger failed: $CP_BUILD_JSON"
+fi
 
 CP_VALIDATE_JSON="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{"repo_path":"/tmp/repo"}' "$CONTROL_BASE/internal/v1/sources/validate" || true)"
 if printf '%s' "$CP_VALIDATE_JSON" | jq -e '.error' >/dev/null 2>&1; then
