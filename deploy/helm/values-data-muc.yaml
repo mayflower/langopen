@@ -11,6 +11,10 @@ global:
 
 env:
   builderUrl: http://langopen-builder
+  controlPlaneSyncAgentDeployment: true
+  controlPlaneSyncAgentDeploymentStrict: false
+  agentDeploymentNamespace: langopen
+  agentDeploymentImage: registry.data.mayflower.zone/data/langopen/api-server:latest
 
 apiServer:
   replicas: 1

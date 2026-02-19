@@ -23,18 +23,36 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"langopen.dev/pkg/contracts"
 	"langopen.dev/pkg/observability"
 )
 
+type contextKey string
+
+const projectIDContextKey contextKey = "project_id"
+
+var errProjectScope = errors.New("project_scope_violation")
+
 type API struct {
-	logger     *slog.Logger
-	router     chi.Router
-	mu         sync.RWMutex
-	state      state
-	pg         *pgxpool.Pool
-	builder    string
-	httpClient *http.Client
+	logger              *slog.Logger
+	router              chi.Router
+	mu                  sync.RWMutex
+	state               state
+	pg                  *pgxpool.Pool
+	builder             string
+	httpClient          *http.Client
+	dynamic             dynamic.Interface
+	syncAgentDeployment bool
+	strictAgentSync     bool
+	agentNamespace      string
+	defaultAgentImage   string
 }
 
 type state struct {
@@ -87,9 +105,13 @@ type secretBindingRecord struct {
 
 func New(logger *slog.Logger) *API {
 	a := &API{
-		logger:     logger,
-		builder:    strings.TrimRight(strings.TrimSpace(os.Getenv("BUILDER_URL")), "/"),
-		httpClient: &http.Client{Timeout: 12 * time.Second},
+		logger:              logger,
+		builder:             strings.TrimRight(strings.TrimSpace(os.Getenv("BUILDER_URL")), "/"),
+		httpClient:          &http.Client{Timeout: 12 * time.Second},
+		syncAgentDeployment: envBoolOrDefault("CONTROL_PLANE_SYNC_AGENTDEPLOYMENT", true),
+		strictAgentSync:     envBoolOrDefault("CONTROL_PLANE_SYNC_AGENTDEPLOYMENT_STRICT", false),
+		agentNamespace:      envOrDefault("AGENT_DEPLOYMENT_NAMESPACE", "default"),
+		defaultAgentImage:   envOrDefault("AGENT_DEPLOYMENT_IMAGE", "ghcr.io/mayflower/langopen/agent-runtime:latest"),
 	}
 	if a.builder == "" {
 		a.builder = "http://langopen-builder"
@@ -100,6 +122,14 @@ func New(logger *slog.Logger) *API {
 			logger.Error("control_plane_postgres_connect_failed", "error", err)
 		} else {
 			a.pg = pool
+		}
+	}
+	if a.syncAgentDeployment {
+		dyn, err := initDynamicClient()
+		if err != nil {
+			logger.Warn("control_plane_dynamic_client_init_failed", "error", err)
+		} else {
+			a.dynamic = dyn
 		}
 	}
 
@@ -141,6 +171,20 @@ func (a *API) rbacMiddleware(next http.Handler) http.Handler {
 		if r.URL.Path == "/healthz" || r.URL.Path == "/metrics" {
 			next.ServeHTTP(w, r)
 			return
+		}
+
+		if a.pg != nil {
+			apiKey := strings.TrimSpace(r.Header.Get(contracts.HeaderAPIKey))
+			if apiKey == "" {
+				contracts.WriteError(w, http.StatusUnauthorized, "missing_api_key", "X-Api-Key header is required", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			projectID, err := a.validateAPIKey(r.Context(), apiKey)
+			if err != nil {
+				contracts.WriteError(w, http.StatusUnauthorized, "invalid_api_key", "API key is invalid or revoked", observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), projectIDContextKey, projectID))
 		}
 
 		role := contracts.ProjectRole(strings.TrimSpace(r.Header.Get(contracts.HeaderProjectRole)))
@@ -190,6 +234,36 @@ func roleAtLeast(actual, required contracts.ProjectRole) bool {
 	return rank[actual] >= rank[required]
 }
 
+func projectIDFromContext(ctx context.Context) string {
+	projectID, _ := ctx.Value(projectIDContextKey).(string)
+	return strings.TrimSpace(projectID)
+}
+
+func (a *API) validateAPIKey(ctx context.Context, apiKey string) (string, error) {
+	if a.pg == nil {
+		return "", errors.New("postgres unavailable")
+	}
+	hash := hashAPIKey(apiKey)
+	var projectID string
+	err := a.pg.QueryRow(ctx, `SELECT project_id FROM api_keys WHERE key_hash=$1 AND revoked_at IS NULL LIMIT 1`, hash).Scan(&projectID)
+	if err != nil {
+		return "", err
+	}
+	return projectID, nil
+}
+
+func (a *API) resolveProjectID(ctx context.Context, requested string) (string, error) {
+	requested = strings.TrimSpace(requested)
+	authorized := projectIDFromContext(ctx)
+	if authorized == "" {
+		return requested, nil
+	}
+	if requested != "" && requested != authorized {
+		return "", errProjectScope
+	}
+	return authorized, nil
+}
+
 func (a *API) createDeployment(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ProjectID      string `json:"project_id"`
@@ -207,8 +281,13 @@ func (a *API) createDeployment(w http.ResponseWriter, r *http.Request) {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment", "repo_url is required", observability.RequestIDFromContext(r.Context()))
 		return
 	}
-	if req.ProjectID == "" {
-		req.ProjectID = "proj_default"
+	projectID, err := a.resolveProjectID(r.Context(), req.ProjectID)
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if projectID == "" {
+		projectID = "proj_default"
 	}
 	if req.GitRef == "" {
 		req.GitRef = "main"
@@ -230,7 +309,7 @@ func (a *API) createDeployment(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	rec := deploymentRecord{
 		ID:             contracts.NewID("dep"),
-		ProjectID:      req.ProjectID,
+		ProjectID:      projectID,
 		RepoURL:        req.RepoURL,
 		GitRef:         req.GitRef,
 		RepoPath:       req.RepoPath,
@@ -250,6 +329,10 @@ func (a *API) createDeployment(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = a.writeAudit(r.Context(), rec.ProjectID, "deployment.created", map[string]any{"deployment_id": rec.ID, "repo_url": rec.RepoURL, "git_ref": rec.GitRef})
+		if err := a.syncAgentDeploymentRecord(r.Context(), rec); err != nil {
+			contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
 		writeJSON(w, http.StatusCreated, rec)
 		return
 	}
@@ -258,6 +341,10 @@ func (a *API) createDeployment(w http.ResponseWriter, r *http.Request) {
 	a.state.Deployments = append(a.state.Deployments, mapFromDeployment(rec))
 	a.state.Audit = append(a.state.Audit, map[string]any{"event": "deployment.created", "timestamp": now, "deployment_id": rec.ID, "project_id": rec.ProjectID})
 	a.mu.Unlock()
+	if err := a.syncAgentDeploymentRecord(r.Context(), rec); err != nil {
+		contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	writeJSON(w, http.StatusCreated, rec)
 }
 
@@ -288,7 +375,11 @@ func (a *API) validateSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listDeployments(w http.ResponseWriter, r *http.Request) {
-	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+	projectID, err := a.resolveProjectID(r.Context(), r.URL.Query().Get("project_id"))
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	if a.pg != nil {
 		query := `
 			SELECT id, project_id, repo_url, git_ref, repo_path, runtime_profile, mode, COALESCE(current_image_digest,''), created_at, updated_at
@@ -336,7 +427,11 @@ func (a *API) listDeployments(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) getDeploymentByID(w http.ResponseWriter, r *http.Request) {
 	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
-	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+	projectID, err := a.resolveProjectID(r.Context(), r.URL.Query().Get("project_id"))
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	if deploymentID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
 		return
@@ -359,7 +454,11 @@ func (a *API) getDeploymentByID(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) updateDeployment(w http.ResponseWriter, r *http.Request) {
 	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
-	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+	projectID, err := a.resolveProjectID(r.Context(), r.URL.Query().Get("project_id"))
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	if deploymentID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
 		return
@@ -458,6 +557,10 @@ func (a *API) updateDeployment(w http.ResponseWriter, r *http.Request) {
 			"runtime_profile": rec.RuntimeProfile,
 			"mode":            rec.Mode,
 		})
+		if err := a.syncAgentDeploymentRecord(r.Context(), rec); err != nil {
+			contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
 		writeJSON(w, http.StatusOK, rec)
 		return
 	}
@@ -483,12 +586,20 @@ func (a *API) updateDeployment(w http.ResponseWriter, r *http.Request) {
 		"project_id":    rec.ProjectID,
 	})
 	a.mu.Unlock()
+	if err := a.syncAgentDeploymentRecord(r.Context(), rec); err != nil {
+		contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	writeJSON(w, http.StatusOK, rec)
 }
 
 func (a *API) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
-	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+	projectID, err := a.resolveProjectID(r.Context(), r.URL.Query().Get("project_id"))
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	if deploymentID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
 		return
@@ -542,6 +653,10 @@ func (a *API) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 		_ = a.writeAudit(r.Context(), rec.ProjectID, "deployment.deleted", map[string]any{
 			"deployment_id": rec.ID,
 		})
+		if err := a.deleteAgentDeployment(r.Context(), rec.ID); err != nil {
+			contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "deployment_id": deploymentID})
 		return
 	}
@@ -588,6 +703,10 @@ func (a *API) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 		"project_id":    rec.ProjectID,
 	})
 	a.mu.Unlock()
+	if err := a.deleteAgentDeployment(r.Context(), deploymentID); err != nil {
+		contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "deployment_id": deploymentID})
 }
 
@@ -615,6 +734,10 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if _, err := a.resolveProjectID(r.Context(), dep.ProjectID); err != nil {
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
 		return
 	}
 
@@ -685,8 +808,18 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		if v, ok := builderResp["image_digest"].(string); ok {
 			digest = v
 		}
+		imageRef := strings.TrimSpace(digest)
+		if strings.TrimSpace(req.ImageName) != "" && strings.TrimSpace(digest) != "" {
+			imageRef = strings.TrimSpace(req.ImageName) + "@" + strings.TrimSpace(digest)
+		}
 		if buildID != "" {
-			_, _ = a.pg.Exec(r.Context(), `UPDATE deployments SET current_image_digest=COALESCE(NULLIF($2,''), current_image_digest), updated_at=NOW() WHERE id=$1`, dep.ID, digest)
+			_, _ = a.pg.Exec(r.Context(), `UPDATE deployments SET current_image_digest=COALESCE(NULLIF($2,''), current_image_digest), updated_at=NOW() WHERE id=$1`, dep.ID, imageRef)
+			dep.CurrentImageDigest = imageRef
+			dep.UpdatedAt = time.Now().UTC()
+			if err := a.syncAgentDeploymentRecord(r.Context(), dep); err != nil {
+				contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+				return
+			}
 		}
 		_ = a.writeAudit(r.Context(), dep.ProjectID, "build.triggered", map[string]any{"deployment_id": dep.ID, "build_id": buildID, "commit_sha": req.CommitSHA, "status": builderResp["status"]})
 	}
@@ -694,7 +827,11 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listBuilds(w http.ResponseWriter, r *http.Request) {
-	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+	projectID, err := a.resolveProjectID(r.Context(), r.URL.Query().Get("project_id"))
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	if a.pg != nil {
 		query := `
 			SELECT b.id, b.deployment_id, b.status, b.commit_sha, COALESCE(b.image_digest,''), COALESCE(b.logs_ref,''), b.created_at, b.updated_at
@@ -755,7 +892,11 @@ func (a *API) listBuilds(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) getBuild(w http.ResponseWriter, r *http.Request) {
 	buildID := strings.TrimSpace(chi.URLParam(r, "build_id"))
-	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+	projectID, err := a.resolveProjectID(r.Context(), r.URL.Query().Get("project_id"))
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	if buildID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_build_id", "build_id is required", observability.RequestIDFromContext(r.Context()))
 		return
@@ -826,7 +967,11 @@ func (a *API) getBuild(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) getBuildLogs(w http.ResponseWriter, r *http.Request) {
 	buildID := strings.TrimSpace(chi.URLParam(r, "build_id"))
-	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+	projectID, err := a.resolveProjectID(r.Context(), r.URL.Query().Get("project_id"))
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	if buildID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_build_id", "build_id is required", observability.RequestIDFromContext(r.Context()))
 		return
@@ -952,7 +1097,12 @@ func (a *API) setRuntimePolicy(w http.ResponseWriter, r *http.Request) {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_mode", "mode must be mode_a or mode_b", observability.RequestIDFromContext(r.Context()))
 		return
 	}
-	req.ProjectID = strings.TrimSpace(req.ProjectID)
+	projectID, err := a.resolveProjectID(r.Context(), req.ProjectID)
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	req.ProjectID = projectID
 
 	dep, depErr := a.getDeployment(r.Context(), req.DeploymentID)
 	if depErr != nil {
@@ -979,18 +1129,53 @@ func (a *API) setRuntimePolicy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = a.writeAudit(r.Context(), dep.ProjectID, "policy.runtime.updated", map[string]any{"deployment_id": req.DeploymentID, "runtime_profile": req.RuntimeProfile, "mode": req.Mode})
+		dep.RuntimeProfile = req.RuntimeProfile
+		dep.Mode = req.Mode
+		dep.UpdatedAt = time.Now().UTC()
+		if err := a.syncAgentDeploymentRecord(r.Context(), dep); err != nil {
+			contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "applied", "policy": req})
 		return
 	}
 
 	a.mu.Lock()
+	updated := false
+	var updatedRec deploymentRecord
+	for i, item := range a.state.Deployments {
+		id, _ := item["id"].(string)
+		if id != req.DeploymentID {
+			continue
+		}
+		rec := deploymentFromMap(item)
+		rec.RuntimeProfile = req.RuntimeProfile
+		rec.Mode = req.Mode
+		rec.UpdatedAt = time.Now().UTC()
+		a.state.Deployments[i] = mapFromDeployment(rec)
+		updated = true
+		updatedRec = rec
+		break
+	}
 	a.state.Audit = append(a.state.Audit, map[string]any{"event": "policy.runtime.updated", "timestamp": time.Now().UTC(), "policy": req})
 	a.mu.Unlock()
+	if !updated {
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if err := a.syncAgentDeploymentRecord(r.Context(), updatedRec); err != nil {
+		contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "applied", "policy": req})
 }
 
 func (a *API) listAPIKeys(w http.ResponseWriter, r *http.Request) {
-	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+	projectID, err := a.resolveProjectID(r.Context(), r.URL.Query().Get("project_id"))
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	if projectID == "" {
 		projectID = "proj_default"
 	}
@@ -1052,7 +1237,11 @@ func (a *API) createAPIKey(w http.ResponseWriter, r *http.Request) {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
 		return
 	}
-	projectID := strings.TrimSpace(req.ProjectID)
+	projectID, err := a.resolveProjectID(r.Context(), req.ProjectID)
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	if projectID == "" {
 		projectID = "proj_default"
 	}
@@ -1112,7 +1301,11 @@ func (a *API) createAPIKey(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) revokeAPIKey(w http.ResponseWriter, r *http.Request) {
 	keyID := strings.TrimSpace(chi.URLParam(r, "key_id"))
-	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+	projectID, err := a.resolveProjectID(r.Context(), r.URL.Query().Get("project_id"))
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	if keyID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_key_id", "key_id is required", observability.RequestIDFromContext(r.Context()))
 		return
@@ -1181,7 +1374,12 @@ func (a *API) bindSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.DeploymentID = strings.TrimSpace(req.DeploymentID)
-	req.ProjectID = strings.TrimSpace(req.ProjectID)
+	projectID, err := a.resolveProjectID(r.Context(), req.ProjectID)
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	req.ProjectID = projectID
 	req.SecretName = strings.TrimSpace(req.SecretName)
 	req.TargetKey = strings.TrimSpace(req.TargetKey)
 	if req.DeploymentID == "" || req.SecretName == "" {
@@ -1250,7 +1448,11 @@ func (a *API) bindSecret(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) listSecretBindings(w http.ResponseWriter, r *http.Request) {
 	deploymentID := strings.TrimSpace(r.URL.Query().Get("deployment_id"))
-	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+	projectID, err := a.resolveProjectID(r.Context(), r.URL.Query().Get("project_id"))
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	if deploymentID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_request", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
 		return
@@ -1308,7 +1510,11 @@ func (a *API) listSecretBindings(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) deleteSecretBinding(w http.ResponseWriter, r *http.Request) {
 	bindingID := strings.TrimSpace(chi.URLParam(r, "binding_id"))
-	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+	projectID, err := a.resolveProjectID(r.Context(), r.URL.Query().Get("project_id"))
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	if bindingID == "" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_binding_id", "binding_id is required", observability.RequestIDFromContext(r.Context()))
 		return
@@ -1397,7 +1603,11 @@ func (a *API) deleteSecretBinding(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {
-	projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+	projectID, err := a.resolveProjectID(r.Context(), r.URL.Query().Get("project_id"))
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
 	eventType := strings.TrimSpace(r.URL.Query().Get("event"))
 	if a.pg != nil {
 		query := `SELECT id, project_id, actor_id, event_type, payload, created_at FROM audit_logs`
@@ -1472,6 +1682,7 @@ func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) getDeployment(ctx context.Context, deploymentID string) (deploymentRecord, error) {
+	authorizedProjectID := projectIDFromContext(ctx)
 	if a.pg != nil {
 		var rec deploymentRecord
 		err := a.pg.QueryRow(ctx, `
@@ -1484,6 +1695,9 @@ func (a *API) getDeployment(ctx context.Context, deploymentID string) (deploymen
 			}
 			return deploymentRecord{}, err
 		}
+		if authorizedProjectID != "" && rec.ProjectID != authorizedProjectID {
+			return deploymentRecord{}, sql.ErrNoRows
+		}
 		return rec, nil
 	}
 
@@ -1491,7 +1705,11 @@ func (a *API) getDeployment(ctx context.Context, deploymentID string) (deploymen
 	defer a.mu.RUnlock()
 	for _, item := range a.state.Deployments {
 		if id, _ := item["id"].(string); id == deploymentID {
-			return deploymentFromMap(item), nil
+			rec := deploymentFromMap(item)
+			if authorizedProjectID != "" && rec.ProjectID != authorizedProjectID {
+				return deploymentRecord{}, sql.ErrNoRows
+			}
+			return rec, nil
 		}
 	}
 	return deploymentRecord{}, sql.ErrNoRows
@@ -1556,6 +1774,168 @@ func generateAPIKey() (string, error) {
 func hashAPIKey(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
+}
+
+func (a *API) syncAgentDeploymentRecord(ctx context.Context, dep deploymentRecord) error {
+	if !a.syncAgentDeployment || a.dynamic == nil {
+		return nil
+	}
+	namespace := strings.TrimSpace(a.agentNamespace)
+	if namespace == "" {
+		namespace = "default"
+	}
+	resource := schema.GroupVersionResource{
+		Group:    "platform.langopen.dev",
+		Version:  "v1alpha1",
+		Resource: "agentdeployments",
+	}
+	desired := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "platform.langopen.dev/v1alpha1",
+			"kind":       "AgentDeployment",
+			"metadata": map[string]any{
+				"name": dep.ID,
+				"labels": map[string]any{
+					"project_id": dep.ProjectID,
+				},
+			},
+			"spec": map[string]any{
+				"image":            a.agentImageForDeployment(dep),
+				"runtimeClassName": runtimeClassForProfile(dep.RuntimeProfile),
+				"mode":             normalizeMode(dep.Mode),
+			},
+		},
+	}
+
+	current, err := a.dynamic.Resource(resource).Namespace(namespace).Get(ctx, dep.ID, metav1.GetOptions{})
+	if err != nil {
+		if !k8serrors.IsNotFound(err) {
+			return a.handleAgentSyncError("get", dep.ID, err)
+		}
+		_, err = a.dynamic.Resource(resource).Namespace(namespace).Create(ctx, desired, metav1.CreateOptions{})
+		return a.handleAgentSyncError("create", dep.ID, err)
+	}
+
+	current.Object["spec"] = desired.Object["spec"]
+	labels := map[string]any{}
+	if metadata, ok := current.Object["metadata"].(map[string]any); ok {
+		if existingLabels, ok := metadata["labels"].(map[string]any); ok {
+			labels = existingLabels
+		}
+	}
+	labels["project_id"] = dep.ProjectID
+	if metadata, ok := current.Object["metadata"].(map[string]any); ok {
+		metadata["labels"] = labels
+	}
+	_, err = a.dynamic.Resource(resource).Namespace(namespace).Update(ctx, current, metav1.UpdateOptions{})
+	return a.handleAgentSyncError("update", dep.ID, err)
+}
+
+func (a *API) deleteAgentDeployment(ctx context.Context, deploymentID string) error {
+	if !a.syncAgentDeployment || a.dynamic == nil {
+		return nil
+	}
+	namespace := strings.TrimSpace(a.agentNamespace)
+	if namespace == "" {
+		namespace = "default"
+	}
+	resource := schema.GroupVersionResource{
+		Group:    "platform.langopen.dev",
+		Version:  "v1alpha1",
+		Resource: "agentdeployments",
+	}
+	err := a.dynamic.Resource(resource).Namespace(namespace).Delete(ctx, deploymentID, metav1.DeleteOptions{})
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return a.handleAgentSyncError("delete", deploymentID, err)
+	}
+	return nil
+}
+
+func (a *API) handleAgentSyncError(operation, deploymentID string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if a.strictAgentSync {
+		return err
+	}
+	a.logger.Warn("agent_deployment_sync_best_effort_failed",
+		"operation", operation,
+		"deployment_id", deploymentID,
+		"error", err,
+	)
+	return nil
+}
+
+func (a *API) agentImageForDeployment(dep deploymentRecord) string {
+	image := strings.TrimSpace(dep.CurrentImageDigest)
+	if image == "" {
+		image = strings.TrimSpace(a.defaultAgentImage)
+	}
+	if image == "" {
+		image = "ghcr.io/mayflower/langopen/agent-runtime:latest"
+	}
+	return image
+}
+
+func runtimeClassForProfile(profile string) string {
+	profile = strings.TrimSpace(strings.ToLower(profile))
+	if profile == "" {
+		return "gvisor"
+	}
+	if strings.HasPrefix(profile, "kata") {
+		return profile
+	}
+	return "gvisor"
+}
+
+func normalizeMode(mode string) string {
+	mode = strings.TrimSpace(strings.ToLower(mode))
+	if mode == "mode_b" {
+		return "mode_b"
+	}
+	return "mode_a"
+}
+
+func initDynamicClient() (dynamic.Interface, error) {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		kubeconfig := strings.TrimSpace(os.Getenv("KUBECONFIG"))
+		if kubeconfig == "" {
+			home, homeErr := os.UserHomeDir()
+			if homeErr == nil {
+				kubeconfig = home + "/.kube/config"
+			}
+		}
+		if kubeconfig != "" {
+			cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return dynamic.NewForConfig(cfg)
+}
+
+func envOrDefault(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func envBoolOrDefault(key string, fallback bool) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	switch value {
+	case "1", "t", "true", "yes", "y", "on":
+		return true
+	case "0", "f", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func mapFromDeployment(rec deploymentRecord) map[string]any {

@@ -1,0 +1,43 @@
+{{- if .Values.operator.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "langopen.fullname" . }}-operator
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "langopen.fullname" . }}-operator
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+rules:
+  - apiGroups: ["", "apps", "networking.k8s.io"]
+    resources: ["pods", "services", "deployments", "networkpolicies", "events"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["platform.langopen.dev"]
+    resources: ["agentdeployments", "agentdeployments/status", "agentdeployments/finalizers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxtemplates", "sandboxwarmpools", "sandboxclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "langopen.fullname" . }}-operator
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "langopen.fullname" . }}-operator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "langopen.fullname" . }}-operator
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -138,6 +138,7 @@ func (a *API) buildJob(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		RepoURL   string `json:"repo_url"`
 		GitRef    string `json:"git_ref"`
+		RepoPath  string `json:"repo_path"`
 		ImageName string `json:"image_name"`
 		CommitSHA string `json:"commit_sha"`
 	}
@@ -145,7 +146,7 @@ func (a *API) buildJob(w http.ResponseWriter, r *http.Request) {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
 		return
 	}
-	job, err := langgraph.BuildKitJobSpec(req.RepoURL, req.GitRef, req.ImageName, req.CommitSHA)
+	job, err := langgraph.BuildKitJobSpec(req.RepoURL, req.GitRef, req.RepoPath, req.ImageName, req.CommitSHA)
 	if err != nil {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_request", err.Error(), observability.RequestIDFromContext(r.Context()))
 		return
@@ -198,7 +199,7 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 	logsRef := "inline://builds/" + buildID
 
 	if a.executeJobs {
-		jobSpec, err := langgraph.BuildKitJobSpec(req.RepoURL, req.GitRef, req.ImageName, req.CommitSHA)
+		jobSpec, err := langgraph.BuildKitJobSpec(req.RepoURL, req.GitRef, req.RepoPath, req.ImageName, req.CommitSHA)
 		if err != nil {
 			contracts.WriteError(w, http.StatusBadRequest, "invalid_request", err.Error(), observability.RequestIDFromContext(r.Context()))
 			return

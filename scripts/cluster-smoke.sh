@@ -88,16 +88,16 @@ A2A_JSON="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application
 MCP_JSON="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":"1","method":"initialize","params":{}}' "$API_BASE/mcp")"
 [[ "$(printf '%s' "$MCP_JSON" | jq -r '.jsonrpc')" == "2.0" ]] || fail "mcp response invalid: $MCP_JSON"
 
-CP_DEPLOY_JSON="$(kcurl -H "Content-Type: application/json" -d '{"project_id":"proj_default","repo_url":"https://github.com/acme/agent","git_ref":"main","repo_path":"/"}' "$CONTROL_BASE/internal/v1/deployments")"
+CP_DEPLOY_JSON="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{"project_id":"proj_default","repo_url":"https://github.com/acme/agent","git_ref":"main","repo_path":"/"}' "$CONTROL_BASE/internal/v1/deployments")"
 CP_DEPLOY_ID="$(printf '%s' "$CP_DEPLOY_JSON" | jq -r '.id')"
 [[ -n "$CP_DEPLOY_ID" && "$CP_DEPLOY_ID" != "null" ]] || fail "control-plane deployment id missing: $CP_DEPLOY_JSON"
 echo "control-plane deployment: $CP_DEPLOY_ID"
 
-CP_BUILD_JSON="$(kcurl -H "Content-Type: application/json" -d '{"deployment_id":"'"$CP_DEPLOY_ID"'","commit_sha":"abcdef123456","image_name":"ghcr.io/acme/agent"}' "$CONTROL_BASE/internal/v1/builds")"
+CP_BUILD_JSON="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{"deployment_id":"'"$CP_DEPLOY_ID"'","commit_sha":"abcdef123456","image_name":"ghcr.io/acme/agent"}' "$CONTROL_BASE/internal/v1/builds")"
 CP_BUILD_STATUS="$(printf '%s' "$CP_BUILD_JSON" | jq -r '.status')"
 [[ "$CP_BUILD_STATUS" == "succeeded" || "$CP_BUILD_STATUS" == "queued" ]] || fail "control-plane build trigger failed: $CP_BUILD_JSON"
 
-CP_VALIDATE_JSON="$(kcurl -H "Content-Type: application/json" -d '{"repo_path":"/tmp/repo"}' "$CONTROL_BASE/internal/v1/sources/validate" || true)"
+CP_VALIDATE_JSON="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{"repo_path":"/tmp/repo"}' "$CONTROL_BASE/internal/v1/sources/validate" || true)"
 if printf '%s' "$CP_VALIDATE_JSON" | jq -e '.error' >/dev/null 2>&1; then
   echo "source validation returned expected error in smoke context"
 fi

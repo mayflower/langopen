@@ -145,9 +145,18 @@ func indexRune(s string, sep rune) int {
 	return -1
 }
 
-func BuildKitJobSpec(repoURL, gitRef, imageName, commitSHA string) (map[string]any, error) {
+func BuildKitJobSpec(repoURL, gitRef, repoPath, imageName, commitSHA string) (map[string]any, error) {
 	if repoURL == "" || gitRef == "" || imageName == "" || commitSHA == "" {
 		return nil, errors.New("repo_url, git_ref, image_name, and commit_sha are required")
+	}
+	contextRef := strings.TrimSpace(repoURL) + "#" + strings.TrimSpace(gitRef)
+	repoPath = strings.TrimSpace(repoPath)
+	if repoPath != "" && repoPath != "." && repoPath != "/" {
+		repoPath = strings.TrimPrefix(repoPath, "./")
+		repoPath = strings.TrimPrefix(repoPath, "/")
+		if repoPath != "" {
+			contextRef += ":" + repoPath
+		}
 	}
 	shortSHA := commitSHA
 	if len(shortSHA) > 8 {
@@ -173,10 +182,11 @@ func BuildKitJobSpec(repoURL, gitRef, imageName, commitSHA string) (map[string]a
 						"name":  "buildkit",
 						"image": "moby/buildkit:rootless",
 						"args": []string{
+							"buildctl-daemonless.sh",
 							"build",
 							"--frontend=dockerfile.v0",
-							"--local", "context=.",
-							"--local", "dockerfile=.",
+							"--opt", "context=" + contextRef,
+							"--opt", "filename=Dockerfile",
 							"--output", "type=image,name=" + imageName + ":" + commitSHA + ",push=true",
 						},
 					}},

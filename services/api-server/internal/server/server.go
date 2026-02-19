@@ -148,6 +148,7 @@ func New(logger *slog.Logger) (*Server, error) {
 	r.Group(s.registerDataPlaneRoutes)
 
 	r.Post("/a2a/{assistant_id}", s.a2a)
+	r.Get("/mcp", s.mcp)
 	r.Post("/mcp", s.mcp)
 
 	s.router = r
@@ -1135,6 +1136,12 @@ func (s *Server) createRunStream(w http.ResponseWriter, r *http.Request) {
 		run = s.createRunInMemory(threadID, req.AssistantID, strategy, streamResumable)
 	}
 
+	var pubsub *redis.PubSub
+	if s.redis != nil {
+		pubsub = s.redis.Subscribe(r.Context(), s.cfg.StreamChannelPrefix+run.ID)
+		defer pubsub.Close()
+	}
+
 	events := []streamEvent{mkEvent(1, "run_queued", map[string]any{"run_id": run.ID, "thread_id": run.ThreadID, "status": run.Status})}
 	for _, ev := range events {
 		s.persistEvent(r.Context(), run.ID, run.StreamResumable, ev)
@@ -1154,6 +1161,10 @@ func (s *Server) createRunStream(w http.ResponseWriter, r *http.Request) {
 		events = append(events, completionEvents...)
 	}
 
+	if pubsub != nil {
+		streamSSEWithPubSub(w, r, events, 0, pubsub, streamIdleTimeout())
+		return
+	}
 	streamSSE(w, r, events, 0)
 }
 
@@ -1200,6 +1211,12 @@ func (s *Server) createStatelessRunStream(w http.ResponseWriter, r *http.Request
 		run = s.createRunInMemory("", req.AssistantID, strategy, streamResumable)
 	}
 
+	var pubsub *redis.PubSub
+	if s.redis != nil {
+		pubsub = s.redis.Subscribe(r.Context(), s.cfg.StreamChannelPrefix+run.ID)
+		defer pubsub.Close()
+	}
+
 	events := []streamEvent{
 		mkEvent(1, "run_queued", map[string]any{
 			"run_id":       run.ID,
@@ -1225,6 +1242,10 @@ func (s *Server) createStatelessRunStream(w http.ResponseWriter, r *http.Request
 		events = append(events, completionEvents...)
 	}
 
+	if pubsub != nil {
+		streamSSEWithPubSub(w, r, events, 0, pubsub, streamIdleTimeout())
+		return
+	}
 	streamSSE(w, r, events, 0)
 }
 
@@ -1391,7 +1412,17 @@ func (s *Server) joinRunStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var pubsub *redis.PubSub
+	if s.redis != nil {
+		pubsub = s.redis.Subscribe(r.Context(), s.cfg.StreamChannelPrefix+runID)
+		defer pubsub.Close()
+	}
+
 	events := s.loadEvents(r.Context(), runID)
+	if pubsub != nil {
+		streamSSEWithPubSub(w, r, events, startFrom, pubsub, streamIdleTimeout())
+		return
+	}
 	streamSSE(w, r, events, startFrom)
 }
 
@@ -2520,9 +2551,21 @@ func unscopedNamespace(projectID, namespace string) string {
 	return namespace
 }
 
-func (s *Server) getCronFromPostgres(ctx context.Context, cronID string) (contracts.CronJob, error) {
+func (s *Server) getCronFromPostgres(ctx context.Context, projectID, cronID string) (contracts.CronJob, error) {
 	var cronJob contracts.CronJob
-	err := s.pg.QueryRow(ctx, `SELECT id, assistant_id, schedule, enabled FROM cron_jobs WHERE id=$1`, cronID).
+	query := `SELECT c.id, c.assistant_id, c.schedule, c.enabled FROM cron_jobs c`
+	args := []any{cronID}
+	if projectID == "" {
+		query += ` WHERE c.id=$1`
+	} else {
+		query += `
+			JOIN assistants a ON a.id = c.assistant_id
+			JOIN deployments d ON d.id = a.deployment_id
+			WHERE c.id=$1 AND d.project_id=$2
+		`
+		args = append(args, projectID)
+	}
+	err := s.pg.QueryRow(ctx, query, args...).
 		Scan(&cronJob.ID, &cronJob.AssistantID, &cronJob.Schedule, &cronJob.Enabled)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -2533,14 +2576,28 @@ func (s *Server) getCronFromPostgres(ctx context.Context, cronID string) (contra
 	return cronJob, nil
 }
 
-func (s *Server) updateCronInPostgres(ctx context.Context, cronID string, schedule any, enabled any) (contracts.CronJob, error) {
+func (s *Server) updateCronInPostgres(ctx context.Context, projectID, cronID string, schedule any, enabled any) (contracts.CronJob, error) {
 	var cronJob contracts.CronJob
-	err := s.pg.QueryRow(ctx, `
-		UPDATE cron_jobs
-		SET schedule=COALESCE($2, schedule), enabled=COALESCE($3, enabled), updated_at=NOW()
-		WHERE id=$1
-		RETURNING id, assistant_id, schedule, enabled
-	`, cronID, schedule, enabled).Scan(&cronJob.ID, &cronJob.AssistantID, &cronJob.Schedule, &cronJob.Enabled)
+	query := `
+		UPDATE cron_jobs c
+		SET schedule=COALESCE($2, c.schedule), enabled=COALESCE($3, c.enabled), updated_at=NOW()
+	`
+	args := []any{cronID, schedule, enabled}
+	if projectID == "" {
+		query += `
+			WHERE c.id=$1
+			RETURNING c.id, c.assistant_id, c.schedule, c.enabled
+		`
+	} else {
+		query += `
+			FROM assistants a
+			JOIN deployments d ON d.id = a.deployment_id
+			WHERE c.id=$1 AND a.id = c.assistant_id AND d.project_id=$4
+			RETURNING c.id, c.assistant_id, c.schedule, c.enabled
+		`
+		args = append(args, projectID)
+	}
+	err := s.pg.QueryRow(ctx, query, args...).Scan(&cronJob.ID, &cronJob.AssistantID, &cronJob.Schedule, &cronJob.Enabled)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return contracts.CronJob{}, sql.ErrNoRows
@@ -2550,8 +2607,19 @@ func (s *Server) updateCronInPostgres(ctx context.Context, cronID string, schedu
 	return cronJob, nil
 }
 
-func (s *Server) deleteCronFromPostgres(ctx context.Context, cronID string) error {
-	tag, err := s.pg.Exec(ctx, `DELETE FROM cron_jobs WHERE id=$1`, cronID)
+func (s *Server) deleteCronFromPostgres(ctx context.Context, projectID, cronID string) error {
+	query := `DELETE FROM cron_jobs c`
+	args := []any{cronID}
+	if projectID == "" {
+		query += ` WHERE c.id=$1`
+	} else {
+		query += `
+			USING assistants a, deployments d
+			WHERE c.id=$1 AND a.id = c.assistant_id AND d.id = a.deployment_id AND d.project_id=$2
+		`
+		args = append(args, projectID)
+	}
+	tag, err := s.pg.Exec(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -2682,7 +2750,7 @@ func (s *Server) getCron(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.pg != nil {
-		cronJob, err := s.getCronFromPostgres(r.Context(), cronID)
+		cronJob, err := s.getCronFromPostgres(r.Context(), projectIDFromContext(r.Context()), cronID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				contracts.WriteError(w, http.StatusNotFound, "cron_not_found", "cron not found", observability.RequestIDFromContext(r.Context()))
@@ -2740,7 +2808,7 @@ func (s *Server) updateCron(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.pg != nil {
-		cronJob, err := s.updateCronInPostgres(r.Context(), cronID, schedule, enabled)
+		cronJob, err := s.updateCronInPostgres(r.Context(), projectIDFromContext(r.Context()), cronID, schedule, enabled)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				contracts.WriteError(w, http.StatusNotFound, "cron_not_found", "cron not found", observability.RequestIDFromContext(r.Context()))
@@ -2779,7 +2847,7 @@ func (s *Server) deleteCron(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.pg != nil {
-		if err := s.deleteCronFromPostgres(r.Context(), cronID); err != nil {
+		if err := s.deleteCronFromPostgres(r.Context(), projectIDFromContext(r.Context()), cronID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				contracts.WriteError(w, http.StatusNotFound, "cron_not_found", "cron not found", observability.RequestIDFromContext(r.Context()))
 				return
@@ -2879,7 +2947,21 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 		Method string `json:"method"`
 	}
 	var req rpcRequest
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Method != http.MethodGet {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	if req.Method == "" {
+		req.Method = strings.TrimSpace(r.URL.Query().Get("method"))
+	}
+	if strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/event-stream") {
+		streamSSE(w, r, []streamEvent{
+			mkEvent(1, "mcp_ready", map[string]any{
+				"transport": "streamable-http",
+				"stateless": true,
+			}),
+		}, parseStartFrom(r.Header.Get("Last-Event-ID")))
+		return
+	}
 
 	result := map[string]any{
 		"jsonrpc": "2.0",
@@ -2910,24 +2992,106 @@ func streamSSE(w http.ResponseWriter, r *http.Request, events []streamEvent, sta
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
-	for _, ev := range events {
-		if ev.ID < startFrom {
-			continue
-		}
-		_, _ = fmt.Fprintf(w, "id: %d\n", ev.ID)
-		_, _ = fmt.Fprintf(w, "event: %s\n", ev.Event)
-		lines := strings.Split(string(ev.Data), "\n")
-		for _, ln := range lines {
-			_, _ = fmt.Fprintf(w, "data: %s\n", ln)
-		}
-		_, _ = fmt.Fprint(w, "\n")
-		flusher.Flush()
+	for _, ev := range filterEventsFrom(events, startFrom) {
+		writeSSEEvent(w, flusher, ev)
 		select {
 		case <-r.Context().Done():
 			return
 		case <-time.After(120 * time.Millisecond):
 		}
 	}
+}
+
+func streamSSEWithPubSub(w http.ResponseWriter, r *http.Request, events []streamEvent, startFrom int64, pubsub *redis.PubSub, idleTimeout time.Duration) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	lastEventID := int64(0)
+	initial := filterEventsFrom(events, startFrom)
+	for _, ev := range initial {
+		writeSSEEvent(w, flusher, ev)
+		lastEventID = ev.ID
+		if isTerminalStreamEvent(ev.Event) {
+			return
+		}
+	}
+
+	channel := pubsub.Channel(redis.WithChannelSize(128))
+	timer := time.NewTimer(idleTimeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-timer.C:
+			return
+		case msg, ok := <-channel:
+			if !ok {
+				return
+			}
+			var ev streamEvent
+			if err := json.Unmarshal([]byte(msg.Payload), &ev); err != nil {
+				continue
+			}
+			if ev.ID <= lastEventID || ev.ID < startFrom {
+				continue
+			}
+			writeSSEEvent(w, flusher, ev)
+			lastEventID = ev.ID
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(idleTimeout)
+			if isTerminalStreamEvent(ev.Event) {
+				return
+			}
+		}
+	}
+}
+
+func filterEventsFrom(events []streamEvent, startFrom int64) []streamEvent {
+	filtered := make([]streamEvent, 0, len(events))
+	for _, ev := range events {
+		if ev.ID < startFrom {
+			continue
+		}
+		filtered = append(filtered, ev)
+	}
+	return filtered
+}
+
+func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, ev streamEvent) {
+	_, _ = fmt.Fprintf(w, "id: %d\n", ev.ID)
+	_, _ = fmt.Fprintf(w, "event: %s\n", ev.Event)
+	lines := strings.Split(string(ev.Data), "\n")
+	for _, ln := range lines {
+		_, _ = fmt.Fprintf(w, "data: %s\n", ln)
+	}
+	_, _ = fmt.Fprint(w, "\n")
+	flusher.Flush()
+}
+
+func isTerminalStreamEvent(event string) bool {
+	switch strings.TrimSpace(strings.ToLower(event)) {
+	case "run_completed", "run_interrupted", "run_rolled_back", "run_failed", "run_sandbox_allocation_failed":
+		return true
+	default:
+		return false
+	}
+}
+
+func streamIdleTimeout() time.Duration {
+	return time.Duration(envIntOrDefault("SSE_IDLE_TIMEOUT_SECONDS", 15)) * time.Second
 }
 
 func isValidMultitaskStrategy(strategy contracts.MultitaskStrategy) bool {

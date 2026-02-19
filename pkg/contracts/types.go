@@ -76,8 +76,16 @@ func IsValidProjectRole(role ProjectRole) bool {
 }
 
 const (
-	HeaderAPIKey      = "X-Api-Key"
-	HeaderAuthScheme  = "X-Auth-Scheme"
-	HeaderRequestID   = "X-Request-Id"
-	HeaderProjectRole = "X-Project-Role"
+	HeaderAPIKey       = "X-Api-Key"
+	HeaderAuthScheme   = "X-Auth-Scheme"
+	HeaderRequestID    = "X-Request-Id"
+	HeaderProjectRole  = "X-Project-Role"
+	HeaderOrgID        = "X-Org-Id"
+	HeaderProjectID    = "X-Project-Id"
+	HeaderDeploymentID = "X-Deployment-Id"
+	HeaderAssistantID  = "X-Assistant-Id"
+	HeaderThreadID     = "X-Thread-Id"
+	HeaderRunID        = "X-Run-Id"
+	HeaderSandboxID    = "X-Sandbox-Id"
+	HeaderBuildID      = "X-Build-Id"
 )

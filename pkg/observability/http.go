@@ -53,12 +53,28 @@ func CorrelationMiddleware(logger *slog.Logger) func(http.Handler) http.Handler 
 			statusCode := strconv.Itoa(rec.statusCode)
 			reqTotal.WithLabelValues(serviceName, r.Method, r.URL.Path, statusCode).Inc()
 			reqDuration.WithLabelValues(serviceName, r.Method, r.URL.Path, statusCode).Observe(latency)
+			orgID := r.Header.Get(contracts.HeaderOrgID)
+			projectID := r.Header.Get(contracts.HeaderProjectID)
+			deploymentID := r.Header.Get(contracts.HeaderDeploymentID)
+			assistantID := r.Header.Get(contracts.HeaderAssistantID)
+			threadID := r.Header.Get(contracts.HeaderThreadID)
+			runID := r.Header.Get(contracts.HeaderRunID)
+			sandboxID := r.Header.Get(contracts.HeaderSandboxID)
+			buildID := r.Header.Get(contracts.HeaderBuildID)
 			logger.Info("http_request",
 				"request_id", requestID,
 				"method", r.Method,
 				"path", r.URL.Path,
 				"status", rec.statusCode,
 				"latency_ms", time.Since(started).Milliseconds(),
+				"org_id", orgID,
+				"project_id", projectID,
+				"deployment_id", deploymentID,
+				"assistant_id", assistantID,
+				"thread_id", threadID,
+				"run_id", runID,
+				"sandbox_id", sandboxID,
+				"build_id", buildID,
 			)
 		})
 	}

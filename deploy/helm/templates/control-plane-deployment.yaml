@@ -40,6 +40,14 @@ spec:
               value: {{ .Values.env.redisAddr | quote }}
             - name: BUILDER_URL
               value: {{ .Values.env.builderUrl | quote }}
+            - name: CONTROL_PLANE_SYNC_AGENTDEPLOYMENT
+              value: {{ ternary "true" "false" .Values.env.controlPlaneSyncAgentDeployment | quote }}
+            - name: CONTROL_PLANE_SYNC_AGENTDEPLOYMENT_STRICT
+              value: {{ ternary "true" "false" .Values.env.controlPlaneSyncAgentDeploymentStrict | quote }}
+            - name: AGENT_DEPLOYMENT_NAMESPACE
+              value: {{ default .Release.Namespace .Values.env.agentDeploymentNamespace | quote }}
+            - name: AGENT_DEPLOYMENT_IMAGE
+              value: {{ .Values.env.agentDeploymentImage | quote }}
           {{- range .Values.extraEnv.controlPlane }}
             - name: {{ .name }}
               value: {{ .value | quote }}

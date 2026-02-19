@@ -14,6 +14,10 @@ env:
   redisAddr: ""
   bootstrapApiKey: ""
   builderUrl: "http://langopen-builder"
+  controlPlaneSyncAgentDeployment: true
+  controlPlaneSyncAgentDeploymentStrict: false
+  agentDeploymentNamespace: ""
+  agentDeploymentImage: "ghcr.io/mayflower/langopen/agent-runtime:latest"
   openapiSpecPath: "/app/contracts/openapi/agent-server.json"
   migrationsDir: "/app/db/migrations"
   runWakeupList: "langopen:runs:wakeup"
