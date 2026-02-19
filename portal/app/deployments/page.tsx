@@ -114,6 +114,39 @@ export default function DeploymentsPage() {
     }
   }
 
+  async function updateDeployment() {
+    if (!deploymentID) {
+      setError("deployment_id is required to update");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    setStatus("");
+    try {
+      const resp = await fetch(`/api/platform/control/internal/v1/deployments/${encodeURIComponent(deploymentID)}?project_id=${encodeURIComponent(projectID)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          repo_url: repoURL,
+          git_ref: gitRef,
+          repo_path: repoPath,
+          runtime_profile: runtimeProfile,
+          mode
+        })
+      });
+      const body = await resp.json();
+      if (!resp.ok) {
+        throw new Error(JSON.stringify(body));
+      }
+      setStatus(`deployment updated: ${deploymentID}`);
+      await loadDeployments();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "update deployment failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function validateSource() {
     setLoading(true);
     setError("");
@@ -295,6 +328,7 @@ export default function DeploymentsPage() {
           <input value={runtimeProfile} onChange={(e) => setRuntimeProfile(e.target.value)} placeholder="runtime_profile" />
           <input value={mode} onChange={(e) => setMode(e.target.value)} placeholder="mode_a|mode_b" />
           <button disabled={loading} type="submit">Create</button>
+          <button disabled={loading || !deploymentID} type="button" onClick={() => void updateDeployment()}>Update Selected</button>
           <button disabled={loading} type="button" onClick={validateSource}>Validate Source</button>
         </div>
       </form>
