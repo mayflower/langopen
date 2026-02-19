@@ -44,7 +44,11 @@ WORKER_EXECUTOR="$(kubectl -n "$NAMESPACE" get deploy -l app.kubernetes.io/compo
 [[ "$WORKER_EXECUTOR" == "runtime" ]] || fail "expected LANGOPEN_EXECUTOR=runtime, got '$WORKER_EXECUTOR'"
 kubectl -n "$NAMESPACE" get deploy -l app.kubernetes.io/component=runtime-runner >/dev/null
 
-ASSISTANT_JSON="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{"deployment_id":"dep_default","graph_id":"graph_parity"}' "$API_BASE/api/v1/assistants")"
+CP_DEPLOY_JSON="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{"project_id":"proj_default","repo_url":"https://github.com/mayflower/langopen","git_ref":"main","repo_path":"examples/python_proof_agent"}' "$CONTROL_BASE/internal/v1/deployments")"
+CP_DEPLOY_ID="$(printf '%s' "$CP_DEPLOY_JSON" | jq -r '.id')"
+[[ -n "$CP_DEPLOY_ID" && "$CP_DEPLOY_ID" != "null" ]] || fail "control-plane deployment create failed: $CP_DEPLOY_JSON"
+
+ASSISTANT_JSON="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{"deployment_id":"'"$CP_DEPLOY_ID"'","graph_id":"proof_agent:run"}' "$API_BASE/api/v1/assistants")"
 ASSISTANT_ID="$(printf '%s' "$ASSISTANT_JSON" | jq -r '.id')"
 [[ -n "$ASSISTANT_ID" && "$ASSISTANT_ID" != "null" ]] || fail "assistant create failed: $ASSISTANT_JSON"
 
@@ -52,7 +56,7 @@ THREAD_JSON="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: applicat
 THREAD_ID="$(printf '%s' "$THREAD_JSON" | jq -r '.id')"
 [[ -n "$THREAD_ID" && "$THREAD_ID" != "null" ]] || fail "thread create failed: $THREAD_JSON"
 
-ASSIST_SEARCH="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{"query":"graph_parity"}' "$API_BASE/api/v1/assistants/search")"
+ASSIST_SEARCH="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{"query":"proof_agent:run"}' "$API_BASE/api/v1/assistants/search")"
 [[ "$(printf '%s' "$ASSIST_SEARCH" | jq -r '.total')" -ge 1 ]] || fail "assistants/search returned no items: $ASSIST_SEARCH"
 
 THREAD_SEARCH="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d '{"assistant_id":"'"$ASSISTANT_ID"'"}' "$API_BASE/api/v1/threads/search")"
