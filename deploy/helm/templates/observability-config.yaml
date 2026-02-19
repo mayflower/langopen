@@ -46,6 +46,26 @@ data:
         },
         {
           "type": "timeseries",
+          "title": "Build Failures (15m)",
+          "targets": [
+            {
+              "expr": "sum(increase(langopen_build_failures_total[15m]))",
+              "legendFormat": "build_failures_15m"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Run Queue Depth",
+          "targets": [
+            {
+              "expr": "sum(langopen_worker_queue_depth)",
+              "legendFormat": "queue_depth"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
           "title": "Stuck Runs",
           "targets": [
             {
@@ -71,6 +91,16 @@ data:
             {
               "expr": "sum(langopen_warm_pool_ready_replicas) / clamp_min(sum(langopen_warm_pool_configured_replicas), 1)",
               "legendFormat": "ready_ratio"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Backend Health",
+          "targets": [
+            {
+              "expr": "min(langopen_worker_backend_up{backend=~\"postgres|redis\"}) by (backend)",
+              "legendFormat": "backend"
             }
           ]
         }

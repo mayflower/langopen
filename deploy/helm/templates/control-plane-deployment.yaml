@@ -105,6 +105,9 @@ spec:
             runAsNonRoot: true
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           resources:
             {{- toYaml .Values.controlPlane.resources | nindent 12 }}
 ---

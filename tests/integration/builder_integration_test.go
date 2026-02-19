@@ -424,6 +424,58 @@ func TestControlPlaneDeploymentGetAndUpdate(t *testing.T) {
 	getAfterDeleteResp.Body.Close()
 }
 
+func TestControlPlaneDeploymentRollback(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://example.invalid")
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doControlPlaneReq(t, ts.URL+"/internal/v1/deployments", map[string]any{
+		"project_id": "proj_default",
+		"repo_url":   "https://github.com/acme/agent",
+		"git_ref":    "main",
+		"repo_path":  ".",
+	})
+	if createResp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("expected 201, got %d body=%s", createResp.StatusCode, string(b))
+	}
+	var created map[string]any
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	createResp.Body.Close()
+	depID, _ := created["id"].(string)
+	if depID == "" {
+		t.Fatal("missing deployment id")
+	}
+
+	rollbackResp := doControlPlaneReq(t, ts.URL+"/internal/v1/deployments/"+depID+"/rollback", map[string]any{
+		"image_digest": "ghcr.io/mayflower/langopen/agent-runtime@sha256:feedbeef",
+	})
+	if rollbackResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(rollbackResp.Body)
+		t.Fatalf("expected 200 for rollback, got %d body=%s", rollbackResp.StatusCode, string(b))
+	}
+	var rolledBack map[string]any
+	if err := json.NewDecoder(rollbackResp.Body).Decode(&rolledBack); err != nil {
+		t.Fatal(err)
+	}
+	rollbackResp.Body.Close()
+	if got, _ := rolledBack["current_image_digest"].(string); got != "ghcr.io/mayflower/langopen/agent-runtime@sha256:feedbeef" {
+		t.Fatalf("expected current_image_digest to be updated, got %q", got)
+	}
+
+	missingDigestResp := doControlPlaneReq(t, ts.URL+"/internal/v1/deployments/"+depID+"/rollback", map[string]any{})
+	if missingDigestResp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(missingDigestResp.Body)
+		t.Fatalf("expected 400 for missing image_digest, got %d body=%s", missingDigestResp.StatusCode, string(b))
+	}
+	missingDigestResp.Body.Close()
+}
+
 func TestControlPlaneListFiltersByProject(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", "")
 	t.Setenv("BUILDER_URL", "http://example.invalid")

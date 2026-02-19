@@ -411,6 +411,19 @@ func (s *Server) writeDataPlaneAudit(ctx context.Context, projectID, eventType s
 	}
 }
 
+func (s *Server) auditWebhookConfigured(ctx context.Context, projectID string, run contracts.Run, webhookURL string) {
+	webhookURL = strings.TrimSpace(webhookURL)
+	if webhookURL == "" {
+		return
+	}
+	s.writeDataPlaneAudit(ctx, projectID, "run.webhook_configured", map[string]any{
+		"run_id":       run.ID,
+		"thread_id":    run.ThreadID,
+		"assistant_id": run.AssistantID,
+		"webhook_url":  webhookURL,
+	})
+}
+
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
@@ -997,6 +1010,7 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	threadID := chi.URLParam(r, "thread_id")
+	projectID := projectIDFromContext(r.Context())
 	var req createRunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
@@ -1017,11 +1031,12 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	if req.StreamResumable != nil {
 		streamResumable = *req.StreamResumable
 	}
+	webhookURL := strings.TrimSpace(req.WebhookURL)
 
 	var run contracts.Run
 	var err error
 	if s.pg != nil {
-		run, err = s.createRunInPostgres(r.Context(), projectIDFromContext(r.Context()), threadID, req.AssistantID, strategy, streamResumable, strings.TrimSpace(req.WebhookURL))
+		run, err = s.createRunInPostgres(r.Context(), projectID, threadID, req.AssistantID, strategy, streamResumable, webhookURL)
 		if err != nil {
 			if errors.Is(err, errRunConflict) {
 				contracts.WriteError(w, http.StatusConflict, "run_conflict", "thread already has active run", observability.RequestIDFromContext(r.Context()))
@@ -1040,10 +1055,12 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	} else {
 		run = s.createRunInMemory(threadID, req.AssistantID, strategy, streamResumable)
 	}
+	s.auditWebhookConfigured(r.Context(), projectID, run, webhookURL)
 	writeJSON(w, http.StatusCreated, run)
 }
 
 func (s *Server) createStatelessRun(w http.ResponseWriter, r *http.Request) {
+	projectID := projectIDFromContext(r.Context())
 	var req createRunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
@@ -1064,13 +1081,14 @@ func (s *Server) createStatelessRun(w http.ResponseWriter, r *http.Request) {
 	if req.StreamResumable != nil {
 		streamResumable = *req.StreamResumable
 	}
+	webhookURL := strings.TrimSpace(req.WebhookURL)
 
 	var (
 		run contracts.Run
 		err error
 	)
 	if s.pg != nil {
-		run, err = s.createStatelessRunInPostgres(r.Context(), projectIDFromContext(r.Context()), req.AssistantID, strategy, streamResumable, strings.TrimSpace(req.WebhookURL))
+		run, err = s.createStatelessRunInPostgres(r.Context(), projectID, req.AssistantID, strategy, streamResumable, webhookURL)
 		if err != nil {
 			if errors.Is(err, errProjectScope) {
 				contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "assistant is not accessible for this API key project", observability.RequestIDFromContext(r.Context()))
@@ -1085,12 +1103,14 @@ func (s *Server) createStatelessRun(w http.ResponseWriter, r *http.Request) {
 	} else {
 		run = s.createRunInMemory("", req.AssistantID, strategy, streamResumable)
 	}
+	s.auditWebhookConfigured(r.Context(), projectID, run, webhookURL)
 
 	writeJSON(w, http.StatusCreated, run)
 }
 
 func (s *Server) createRunStream(w http.ResponseWriter, r *http.Request) {
 	threadID := chi.URLParam(r, "thread_id")
+	projectID := projectIDFromContext(r.Context())
 	var req createRunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
@@ -1111,11 +1131,12 @@ func (s *Server) createRunStream(w http.ResponseWriter, r *http.Request) {
 	if req.StreamResumable != nil {
 		streamResumable = *req.StreamResumable
 	}
+	webhookURL := strings.TrimSpace(req.WebhookURL)
 
 	var run contracts.Run
 	var err error
 	if s.pg != nil {
-		run, err = s.createRunInPostgres(r.Context(), projectIDFromContext(r.Context()), threadID, req.AssistantID, strategy, streamResumable, strings.TrimSpace(req.WebhookURL))
+		run, err = s.createRunInPostgres(r.Context(), projectID, threadID, req.AssistantID, strategy, streamResumable, webhookURL)
 		if err != nil {
 			if errors.Is(err, errRunConflict) {
 				contracts.WriteError(w, http.StatusConflict, "run_conflict", "thread already has active run", observability.RequestIDFromContext(r.Context()))
@@ -1134,6 +1155,7 @@ func (s *Server) createRunStream(w http.ResponseWriter, r *http.Request) {
 	} else {
 		run = s.createRunInMemory(threadID, req.AssistantID, strategy, streamResumable)
 	}
+	s.auditWebhookConfigured(r.Context(), projectID, run, webhookURL)
 
 	var pubsub *redis.PubSub
 	if s.redis != nil {
@@ -1168,6 +1190,7 @@ func (s *Server) createRunStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createStatelessRunStream(w http.ResponseWriter, r *http.Request) {
+	projectID := projectIDFromContext(r.Context())
 	var req createRunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
 		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
@@ -1188,13 +1211,14 @@ func (s *Server) createStatelessRunStream(w http.ResponseWriter, r *http.Request
 	if req.StreamResumable != nil {
 		streamResumable = *req.StreamResumable
 	}
+	webhookURL := strings.TrimSpace(req.WebhookURL)
 
 	var (
 		run contracts.Run
 		err error
 	)
 	if s.pg != nil {
-		run, err = s.createStatelessRunInPostgres(r.Context(), projectIDFromContext(r.Context()), req.AssistantID, strategy, streamResumable, strings.TrimSpace(req.WebhookURL))
+		run, err = s.createStatelessRunInPostgres(r.Context(), projectID, req.AssistantID, strategy, streamResumable, webhookURL)
 		if err != nil {
 			if errors.Is(err, errProjectScope) {
 				contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "assistant is not accessible for this API key project", observability.RequestIDFromContext(r.Context()))
@@ -1209,6 +1233,7 @@ func (s *Server) createStatelessRunStream(w http.ResponseWriter, r *http.Request
 	} else {
 		run = s.createRunInMemory("", req.AssistantID, strategy, streamResumable)
 	}
+	s.auditWebhookConfigured(r.Context(), projectID, run, webhookURL)
 
 	var pubsub *redis.PubSub
 	if s.redis != nil {

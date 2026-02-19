@@ -407,8 +407,15 @@ func (r *AgentDeploymentReconciler) reconcileSandboxResources(ctx context.Contex
 	if err := r.reconcileUnstructured(ctx, warmPool); err != nil {
 		return err
 	}
-	ready := warmPoolReplicas
-	if statusReplicas, found, _ := unstructured.NestedInt64(warmPool.Object, "status", "readyReplicas"); found {
+	observedWarmPool := &unstructured.Unstructured{}
+	observedWarmPool.SetGroupVersionKind(groupVersion.WithKind("SandboxWarmPool"))
+	if err := r.Get(ctx, client.ObjectKey{Name: warmPool.GetName(), Namespace: warmPool.GetNamespace()}, observedWarmPool); err != nil {
+		return err
+	}
+	ready := int32(0)
+	if statusReplicas, found, _ := unstructured.NestedInt64(observedWarmPool.Object, "status", "readyReplicas"); found {
+		ready = int32(statusReplicas)
+	} else if statusReplicas, found, _ := unstructured.NestedInt64(observedWarmPool.Object, "status", "availableReplicas"); found {
 		ready = int32(statusReplicas)
 	}
 	warmPoolConfigured.WithLabelValues(dep.Namespace, dep.Name).Set(float64(warmPoolReplicas))

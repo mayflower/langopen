@@ -48,6 +48,9 @@ spec:
             runAsNonRoot: true
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
 {{- end }}

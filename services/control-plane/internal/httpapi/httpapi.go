@@ -146,6 +146,7 @@ func New(logger *slog.Logger) *API {
 		v1.Get("/deployments", a.listDeployments)
 		v1.Get("/deployments/{deployment_id}", a.getDeploymentByID)
 		v1.Patch("/deployments/{deployment_id}", a.updateDeployment)
+		v1.Post("/deployments/{deployment_id}/rollback", a.rollbackDeployment)
 		v1.Delete("/deployments/{deployment_id}", a.deleteDeployment)
 		v1.Post("/builds", a.triggerBuild)
 		v1.Get("/builds", a.listBuilds)
@@ -584,6 +585,99 @@ func (a *API) updateDeployment(w http.ResponseWriter, r *http.Request) {
 		"timestamp":     rec.UpdatedAt,
 		"deployment_id": rec.ID,
 		"project_id":    rec.ProjectID,
+	})
+	a.mu.Unlock()
+	if err := a.syncAgentDeploymentRecord(r.Context(), rec); err != nil {
+		contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
+}
+
+func (a *API) rollbackDeployment(w http.ResponseWriter, r *http.Request) {
+	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
+	if deploymentID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	var req struct {
+		ImageDigest string `json:"image_digest"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	imageDigest := strings.TrimSpace(req.ImageDigest)
+	if imageDigest == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_rollback_request", "image_digest is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	rec, err := a.getDeployment(r.Context(), deploymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	projectID, err := a.resolveProjectID(r.Context(), rec.ProjectID)
+	if err != nil {
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	rec.CurrentImageDigest = imageDigest
+	rec.UpdatedAt = time.Now().UTC()
+
+	if a.pg != nil {
+		tag, err := a.pg.Exec(r.Context(), `
+			UPDATE deployments
+			SET current_image_digest=$2, updated_at=$3
+			WHERE id=$1
+		`, rec.ID, rec.CurrentImageDigest, rec.UpdatedAt)
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_update_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		if tag.RowsAffected() == 0 {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		_ = a.writeAudit(r.Context(), projectID, "deployment.rolled_back", map[string]any{
+			"deployment_id": rec.ID,
+			"image_digest":  rec.CurrentImageDigest,
+		})
+		if err := a.syncAgentDeploymentRecord(r.Context(), rec); err != nil {
+			contracts.WriteError(w, http.StatusBadGateway, "agent_deployment_sync_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		writeJSON(w, http.StatusOK, rec)
+		return
+	}
+
+	a.mu.Lock()
+	updated := false
+	for i, item := range a.state.Deployments {
+		if id, _ := item["id"].(string); id == rec.ID {
+			a.state.Deployments[i] = mapFromDeployment(rec)
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		a.mu.Unlock()
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	a.state.Audit = append(a.state.Audit, map[string]any{
+		"event":         "deployment.rolled_back",
+		"timestamp":     rec.UpdatedAt,
+		"deployment_id": rec.ID,
+		"project_id":    rec.ProjectID,
+		"image_digest":  rec.CurrentImageDigest,
 	})
 	a.mu.Unlock()
 	if err := a.syncAgentDeploymentRecord(r.Context(), rec); err != nil {

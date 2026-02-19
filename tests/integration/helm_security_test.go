@@ -27,6 +27,9 @@ func TestHelmDefaultsEnforceSecurity(t *testing.T) {
 	if strings.Contains(rendered, "automountServiceAccountToken: true") {
 		t.Fatalf("security regression: found automountServiceAccountToken=true")
 	}
+	if strings.Count(rendered, "- ALL") < 6 {
+		t.Fatalf("expected dropped Linux capabilities for hardened pods")
+	}
 
 	runtimeClassCount := strings.Count(rendered, "runtimeClassName: gvisor")
 	if runtimeClassCount < 4 {
@@ -91,6 +94,36 @@ func TestObservabilityAlertRulesCoverage(t *testing.T) {
 	for _, alertName := range requiredAlerts {
 		if !strings.Contains(rendered, "alert: "+alertName) {
 			t.Fatalf("missing required alert rule %s", alertName)
+		}
+	}
+}
+
+func TestObservabilityDashboardQuerySmoke(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm not installed")
+	}
+
+	root := filepath.Join("..", "..")
+	cmd := exec.Command("helm", "template", "langopen", filepath.Join(root, "deploy", "helm"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template failed: %v output=%s", err, string(out))
+	}
+	rendered := string(out)
+
+	requiredQueries := []string{
+		"sum(langopen_worker_queue_depth)",
+		"sum(langopen_worker_stuck_runs)",
+		"sum(langopen_worker_webhook_dead_letters)",
+		"sum(increase(langopen_build_failures_total[15m]))",
+		"min(langopen_worker_backend_up{backend=~",
+		"postgres|redis",
+		"}) by (backend)",
+		"sum(langopen_warm_pool_ready_replicas) / clamp_min(sum(langopen_warm_pool_configured_replicas), 1)",
+	}
+	for _, query := range requiredQueries {
+		if !strings.Contains(rendered, query) {
+			t.Fatalf("missing dashboard query %q", query)
 		}
 	}
 }
