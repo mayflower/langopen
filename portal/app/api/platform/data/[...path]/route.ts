@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { toNormalizedError } from "../../../../../lib/errors";
 
 const BASE = process.env.PLATFORM_DATA_API_BASE_URL || "http://langopen-api-server";
 const API_KEY = process.env.PLATFORM_API_KEY || process.env.BOOTSTRAP_API_KEY || "";
@@ -30,8 +31,14 @@ export async function HEAD(req: NextRequest, ctx: { params: Promise<{ path: stri
 async function proxy(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
   if (!API_KEY) {
     return NextResponse.json(
-      { error: "missing_platform_api_key", message: "Set PLATFORM_API_KEY or BOOTSTRAP_API_KEY" },
-      { status: 500 }
+      {
+        error: {
+          code: "missing_platform_api_key",
+          title: "Authentication required",
+          message: "Configure PLATFORM_API_KEY or BOOTSTRAP_API_KEY for the portal proxy."
+        }
+      },
+      { status: 401 }
     );
   }
 
@@ -61,8 +68,24 @@ async function proxy(req: NextRequest, ctx: { params: Promise<{ path: string[] }
     cache: "no-store"
   });
 
+  if (!resp.ok) {
+    const normalized = await toNormalizedError(resp, "Data API request failed.");
+    return NextResponse.json(
+      {
+        error: {
+          code: normalized.code,
+          title: normalized.title,
+          message: normalized.message,
+          action_label: normalized.actionLabel,
+          action_href: normalized.actionHref
+        }
+      },
+      { status: resp.status }
+    );
+  }
+
   const outHeaders = new Headers();
-  ["content-type", "cache-control", "connection"].forEach((name) => {
+  ["content-type", "cache-control", "connection", "x-request-id"].forEach((name) => {
     const value = resp.headers.get(name);
     if (value) {
       outHeaders.set(name, value);

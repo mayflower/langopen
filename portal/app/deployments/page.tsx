@@ -1,6 +1,23 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
+import { Button } from "../../components/ui/Button";
+import { ConfirmDialog } from "../../components/ui/ConfirmDialog";
+import { DataTable, type ColumnDef } from "../../components/ui/DataTable";
+import { EmptyState } from "../../components/ui/EmptyState";
+import { ErrorState } from "../../components/ui/ErrorState";
+import { Field } from "../../components/ui/Field";
+import { InlineAlert } from "../../components/ui/InlineAlert";
+import { PageHeader } from "../../components/ui/PageHeader";
+import { Select } from "../../components/ui/Select";
+import { SplitPane } from "../../components/ui/SplitPane";
+import { StatusChip } from "../../components/ui/StatusChip";
+import { ToastRegion, useToastRegion } from "../../components/ui/ToastRegion";
+import { Toolbar } from "../../components/ui/Toolbar";
+import { fetchPortalJSON, toPortalError, type PortalError } from "../../lib/client-api";
+import { compactId, formatDateTime } from "../../lib/format";
+import { useTableQueryState } from "../../lib/table-query";
+import { initialActionState, initialDataState } from "../../lib/ui-types";
 
 type Deployment = {
   id: string;
@@ -22,12 +39,19 @@ type SecretBinding = {
   created_at: string;
 };
 
+type DetailTab = "overview" | "source" | "build" | "secrets" | "policy";
+
+const DEFAULT_PROJECT = "proj_default";
+
 export default function DeploymentsPage() {
-  const [deployments, setDeployments] = useState<Deployment[]>([]);
-  const [projectID, setProjectID] = useState("proj_default");
-  const [error, setError] = useState("");
-  const [status, setStatus] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [projectID, setProjectID] = useState(DEFAULT_PROJECT);
+  const [state, setState] = useState(initialDataState<Deployment>());
+  const [selectedDeploymentID, setSelectedDeploymentID] = useState("");
+  const [loadError, setLoadError] = useState<PortalError | null>(null);
+
+  const [tab, setTab] = useState<DetailTab>("overview");
+  const [showCreate, setShowCreate] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState<string>("");
 
   const [repoURL, setRepoURL] = useState("https://github.com/acme/agent");
   const [gitRef, setGitRef] = useState("main");
@@ -35,58 +59,93 @@ export default function DeploymentsPage() {
   const [runtimeProfile, setRuntimeProfile] = useState("gvisor");
   const [mode, setMode] = useState("mode_a");
 
-  const [deploymentID, setDeploymentID] = useState("");
   const [imageName, setImageName] = useState("ghcr.io/acme/agent");
   const [commitSHA, setCommitSHA] = useState("abcdef123456");
+
   const [secretName, setSecretName] = useState("openai-secret");
   const [targetKey, setTargetKey] = useState("OPENAI_API_KEY");
-  const [bindings, setBindings] = useState<SecretBinding[]>([]);
+  const [bindings, setBindings] = useState(initialDataState<SecretBinding>());
+
+  const [action, setAction] = useState(initialActionState());
+  const [deletingBindingID, setDeletingBindingID] = useState("");
+  const { state: table, setState: setTable } = useTableQueryState({ sort: "updated_at", order: "desc", page: 1, pageSize: 8 });
+  const { toasts, push, remove } = useToastRegion();
 
   useEffect(() => {
     void loadDeployments();
   }, [projectID]);
 
   useEffect(() => {
-    if (deploymentID) {
-      void loadBindings(deploymentID);
-    } else {
-      setBindings([]);
+    if (!selectedDeploymentID) {
+      setBindings(initialDataState<SecretBinding>());
+      return;
     }
-  }, [deploymentID]);
+    void loadBindings(selectedDeploymentID);
+  }, [selectedDeploymentID, projectID]);
+
+  const selectedDeployment = useMemo(
+    () => state.items.find((item) => item.id === selectedDeploymentID) || null,
+    [state.items, selectedDeploymentID]
+  );
+
+  const visibleDeployments = useMemo(() => {
+    const q = table.q.trim().toLowerCase();
+    const filtered = q
+      ? state.items.filter((item) => [item.id, item.repo_url, item.git_ref, item.mode].join(" ").toLowerCase().includes(q))
+      : state.items;
+
+    const sorted = [...filtered].sort((a, b) => {
+      const key = table.sort || "updated_at";
+      const av = `${(a as Record<string, string | undefined>)[key] || ""}`;
+      const bv = `${(b as Record<string, string | undefined>)[key] || ""}`;
+      const cmp = av.localeCompare(bv);
+      return table.order === "asc" ? cmp : -cmp;
+    });
+
+    const start = (table.page - 1) * table.pageSize;
+    return {
+      total: sorted.length,
+      rows: sorted.slice(start, start + table.pageSize)
+    };
+  }, [state.items, table]);
 
   async function loadDeployments() {
+    setState((prev) => ({ ...prev, loading: true, error: "" }));
+    setLoadError(null);
     try {
-      const resp = await fetch(`/api/platform/control/internal/v1/deployments?project_id=${encodeURIComponent(projectID)}`, { cache: "no-store" });
-      if (!resp.ok) {
-        throw new Error(`load deployments failed (${resp.status})`);
+      const rows = await fetchPortalJSON<Deployment[]>(`/api/platform/control/internal/v1/deployments?project_id=${encodeURIComponent(projectID)}`);
+      setState({ loading: false, error: "", items: rows });
+      if (rows.length > 0 && !rows.some((row) => row.id === selectedDeploymentID)) {
+        setSelectedDeploymentID(rows[0].id);
       }
-      const data = (await resp.json()) as Deployment[];
-      setDeployments(data);
+      if (rows.length === 0) {
+        setSelectedDeploymentID("");
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "failed to load deployments");
+      const normalized = err as PortalError;
+      setState((prev) => ({ ...prev, loading: false, error: normalized.message }));
+      setLoadError(normalized);
     }
   }
 
-  async function loadBindings(depID: string) {
+  async function loadBindings(deploymentID: string) {
+    setBindings((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const resp = await fetch(`/api/platform/control/internal/v1/secrets/bindings?deployment_id=${encodeURIComponent(depID)}&project_id=${encodeURIComponent(projectID)}`, { cache: "no-store" });
-      if (!resp.ok) {
-        throw new Error(`load bindings failed (${resp.status})`);
-      }
-      const data = (await resp.json()) as SecretBinding[];
-      setBindings(data);
+      const rows = await fetchPortalJSON<SecretBinding[]>(
+        `/api/platform/control/internal/v1/secrets/bindings?deployment_id=${encodeURIComponent(deploymentID)}&project_id=${encodeURIComponent(projectID)}`
+      );
+      setBindings({ loading: false, error: "", items: rows });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "failed to load secret bindings");
+      const normalized = err as PortalError;
+      setBindings((prev) => ({ ...prev, loading: false, error: normalized.message }));
     }
   }
 
   async function createDeployment(e: FormEvent) {
     e.preventDefault();
-    setLoading(true);
-    setError("");
-    setStatus("");
+    setAction({ phase: "pending", message: "Creating deployment..." });
     try {
-      const resp = await fetch("/api/platform/control/internal/v1/deployments", {
+      const created = await fetchPortalJSON<Deployment>("/api/platform/control/internal/v1/deployments", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -98,325 +157,494 @@ export default function DeploymentsPage() {
           mode
         })
       });
-      const body = await resp.json();
-      if (!resp.ok) {
-        throw new Error(JSON.stringify(body));
-      }
-      if (typeof body.id === "string") {
-        setDeploymentID(body.id);
-      }
-      setStatus("deployment created");
+      setSelectedDeploymentID(created.id);
+      setShowCreate(false);
+      setAction({ phase: "success", message: "Deployment created." });
+      push("success", "Deployment created.");
       await loadDeployments();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "create deployment failed");
-    } finally {
-      setLoading(false);
+      const normalized = err as PortalError;
+      setAction({ phase: "error", message: normalized.message });
+      push("error", normalized.message);
     }
   }
 
-  async function updateDeployment() {
-    if (!deploymentID) {
-      setError("deployment_id is required to update");
+  async function updateSource(e: FormEvent) {
+    e.preventDefault();
+    if (!selectedDeploymentID) {
+      push("warning", "Select a deployment first.");
       return;
     }
-    setLoading(true);
-    setError("");
-    setStatus("");
+    setAction({ phase: "pending", message: "Updating source settings..." });
     try {
-      const resp = await fetch(`/api/platform/control/internal/v1/deployments/${encodeURIComponent(deploymentID)}?project_id=${encodeURIComponent(projectID)}`, {
+      await fetchPortalJSON(`/api/platform/control/internal/v1/deployments/${encodeURIComponent(selectedDeploymentID)}?project_id=${encodeURIComponent(projectID)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          repo_url: repoURL,
-          git_ref: gitRef,
-          repo_path: repoPath,
-          runtime_profile: runtimeProfile,
-          mode
-        })
+        body: JSON.stringify({ repo_url: repoURL, git_ref: gitRef, repo_path: repoPath })
       });
-      const body = await resp.json();
-      if (!resp.ok) {
-        throw new Error(JSON.stringify(body));
-      }
-      setStatus(`deployment updated: ${deploymentID}`);
+      setAction({ phase: "success", message: "Source settings saved." });
+      push("success", "Deployment source updated.");
       await loadDeployments();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "update deployment failed");
-    } finally {
-      setLoading(false);
+      const normalized = err as PortalError;
+      setAction({ phase: "error", message: normalized.message });
+      push("error", normalized.message);
     }
   }
 
   async function validateSource() {
-    setLoading(true);
-    setError("");
-    setStatus("");
+    setAction({ phase: "pending", message: "Validating source..." });
     try {
-      const resp = await fetch("/api/platform/control/internal/v1/sources/validate", {
+      await fetchPortalJSON("/api/platform/control/internal/v1/sources/validate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repo_path: repoPath })
       });
-      const body = await resp.json();
-      if (!resp.ok) {
-        throw new Error(JSON.stringify(body));
-      }
-      setStatus(`source validation status: ${JSON.stringify(body)}`);
+      setAction({ phase: "success", message: "Source validation passed." });
+      push("success", "Source validation passed.");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "source validate failed");
-    } finally {
-      setLoading(false);
+      const normalized = err as PortalError;
+      setAction({ phase: "error", message: normalized.message });
+      push("error", normalized.message);
     }
   }
 
   async function triggerBuild(e: FormEvent) {
     e.preventDefault();
-    if (!deploymentID) {
-      setError("deployment_id is required");
+    if (!selectedDeploymentID) {
+      push("warning", "Select a deployment first.");
       return;
     }
-    setLoading(true);
-    setError("");
-    setStatus("");
+    setAction({ phase: "pending", message: "Triggering build..." });
     try {
-      const resp = await fetch("/api/platform/control/internal/v1/builds", {
+      await fetchPortalJSON("/api/platform/control/internal/v1/builds", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          deployment_id: deploymentID,
+          deployment_id: selectedDeploymentID,
           commit_sha: commitSHA,
           image_name: imageName,
           repo_path: repoPath
         })
       });
-      const body = await resp.json();
-      if (!resp.ok) {
-        throw new Error(JSON.stringify(body));
-      }
-      setStatus(`build triggered: ${body.id || body.status}`);
-      await loadDeployments();
+      setAction({ phase: "success", message: "Build queued." });
+      push("success", "Build queued.");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "build trigger failed");
-    } finally {
-      setLoading(false);
+      const normalized = err as PortalError;
+      setAction({ phase: "error", message: normalized.message });
+      push("error", normalized.message);
     }
   }
 
   async function bindSecret(e: FormEvent) {
     e.preventDefault();
-    if (!deploymentID) {
-      setError("deployment_id is required");
+    if (!selectedDeploymentID) {
+      push("warning", "Select a deployment first.");
       return;
     }
-    setLoading(true);
-    setError("");
-    setStatus("");
+    setAction({ phase: "pending", message: "Binding secret..." });
     try {
-      const resp = await fetch("/api/platform/control/internal/v1/secrets/bind", {
+      await fetchPortalJSON("/api/platform/control/internal/v1/secrets/bind", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          deployment_id: deploymentID,
+          deployment_id: selectedDeploymentID,
           project_id: projectID,
           secret_name: secretName,
           target_key: targetKey
         })
       });
-      const body = await resp.json();
-      if (!resp.ok) {
-        throw new Error(JSON.stringify(body));
-      }
-      setStatus(`secret bound: ${secretName}`);
-      await loadBindings(deploymentID);
+      setAction({ phase: "success", message: "Secret bound." });
+      push("success", "Secret bound to deployment.");
+      await loadBindings(selectedDeploymentID);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "bind secret failed");
-    } finally {
-      setLoading(false);
+      const normalized = err as PortalError;
+      setAction({ phase: "error", message: normalized.message });
+      push("error", normalized.message);
     }
   }
 
   async function unbindSecret(bindingID: string) {
-    setLoading(true);
-    setError("");
-    setStatus("");
+    setDeletingBindingID(bindingID);
     try {
-      const resp = await fetch(`/api/platform/control/internal/v1/secrets/bindings/${encodeURIComponent(bindingID)}?project_id=${encodeURIComponent(projectID)}`, {
-        method: "DELETE"
-      });
-      const body = await resp.json();
-      if (!resp.ok) {
-        throw new Error(JSON.stringify(body));
-      }
-      setStatus(`secret binding removed: ${bindingID}`);
-      if (deploymentID) {
-        await loadBindings(deploymentID);
+      await fetchPortalJSON(
+        `/api/platform/control/internal/v1/secrets/bindings/${encodeURIComponent(bindingID)}?project_id=${encodeURIComponent(projectID)}`,
+        { method: "DELETE" }
+      );
+      push("success", "Secret unbound.");
+      if (selectedDeploymentID) {
+        await loadBindings(selectedDeploymentID);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "unbind secret failed");
+      const normalized = err as PortalError;
+      push("error", normalized.message);
     } finally {
-      setLoading(false);
+      setDeletingBindingID("");
     }
   }
 
-  async function deleteDeployment(id: string) {
-    setLoading(true);
-    setError("");
-    setStatus("");
-    try {
-      const resp = await fetch(`/api/platform/control/internal/v1/deployments/${encodeURIComponent(id)}?project_id=${encodeURIComponent(projectID)}`, {
-        method: "DELETE"
-      });
-      const body = await resp.json();
-      if (!resp.ok) {
-        throw new Error(JSON.stringify(body));
-      }
-      if (deploymentID === id) {
-        setDeploymentID("");
-        setBindings([]);
-      }
-      setStatus(`deployment deleted: ${id}`);
-      await loadDeployments();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "delete deployment failed");
-    } finally {
-      setLoading(false);
+  async function applyPolicy(e: FormEvent) {
+    e.preventDefault();
+    if (!selectedDeploymentID) {
+      push("warning", "Select a deployment first.");
+      return;
     }
-  }
-
-  async function applyRuntimePolicy(id: string) {
-    setLoading(true);
-    setError("");
-    setStatus("");
+    setAction({ phase: "pending", message: "Applying runtime policy..." });
     try {
-      const resp = await fetch("/api/platform/control/internal/v1/policies/runtime", {
+      await fetchPortalJSON("/api/platform/control/internal/v1/policies/runtime", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          deployment_id: id,
+          deployment_id: selectedDeploymentID,
           project_id: projectID,
           runtime_profile: runtimeProfile,
           mode
         })
       });
-      const body = await resp.json();
-      if (!resp.ok) {
-        throw new Error(JSON.stringify(body));
-      }
-      setStatus(`runtime policy applied: ${id}`);
+      setAction({ phase: "success", message: "Runtime policy applied." });
+      push("success", "Runtime policy applied.");
       await loadDeployments();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "apply runtime policy failed");
-    } finally {
-      setLoading(false);
+      const normalized = err as PortalError;
+      setAction({ phase: "error", message: normalized.message });
+      push("error", normalized.message);
     }
   }
 
+  async function deleteDeployment() {
+    if (!confirmDelete) {
+      return;
+    }
+    try {
+      await fetchPortalJSON(
+        `/api/platform/control/internal/v1/deployments/${encodeURIComponent(confirmDelete)}?project_id=${encodeURIComponent(projectID)}`,
+        { method: "DELETE" }
+      );
+      push("success", "Deployment deleted.");
+      if (selectedDeploymentID === confirmDelete) {
+        setSelectedDeploymentID("");
+      }
+      await loadDeployments();
+    } catch (err) {
+      const normalized = err as PortalError;
+      push("error", normalized.message);
+    } finally {
+      setConfirmDelete("");
+    }
+  }
+
+  const columns: ColumnDef<Deployment>[] = [
+    { key: "id", header: "Deployment", render: (row) => <code title={row.id}>{compactId(row.id, 10)}</code> },
+    { key: "repo_url", header: "Repository", render: (row) => <span>{row.repo_url}</span> },
+    { key: "git_ref", header: "Ref", render: (row) => row.git_ref },
+    { key: "current_image_digest", header: "Image", render: (row) => <code>{compactId(row.current_image_digest || "-", 12)}</code> },
+    { key: "runtime", header: "Runtime", render: (row) => <StatusChip status={row.runtime_profile || "unknown"} /> },
+    { key: "mode", header: "Mode", render: (row) => row.mode },
+    { key: "updated_at", header: "Updated", render: (row) => formatDateTime(row.updated_at) }
+  ];
+
   return (
-    <main className="hero">
-      <h2>Deployments</h2>
-      <p>Git connect, source validation, and build/deploy flow.</p>
+    <main className="ui-panel ui-stack">
+      <PageHeader
+        title="Deployments"
+        subtitle="Selection-first workflow for source updates, builds, secret bindings, and runtime policy operations."
+        actions={
+          <Button type="button" variant="primary" onClick={() => setShowCreate(true)}>
+            Create deployment
+          </Button>
+        }
+      />
 
-      <form onSubmit={createDeployment} className="card">
-        <h3>Create Deployment</h3>
-        <div className="row">
-          <input value={projectID} onChange={(e) => setProjectID(e.target.value)} placeholder="project_id" />
-          <input value={repoURL} onChange={(e) => setRepoURL(e.target.value)} placeholder="repo_url" />
-          <input value={gitRef} onChange={(e) => setGitRef(e.target.value)} placeholder="git_ref" />
-          <input value={repoPath} onChange={(e) => setRepoPath(e.target.value)} placeholder="repo_path" />
+      <Toolbar>
+        <Field id="dep-project" label="Project" value={projectID} onChange={(e) => setProjectID(e.target.value)} />
+        <Field
+          id="dep-search"
+          label="Search"
+          value={table.q}
+          onChange={(e) => setTable({ q: e.target.value, page: 1 })}
+          placeholder="Search by id, repo, ref, mode"
+        />
+        <Select id="dep-sort" label="Sort" value={table.sort} onChange={(e) => setTable({ sort: e.target.value })}>
+          <option value="updated_at">Updated</option>
+          <option value="git_ref">Ref</option>
+          <option value="repo_url">Repository</option>
+          <option value="mode">Mode</option>
+        </Select>
+        <Select id="dep-order" label="Order" value={table.order} onChange={(e) => setTable({ order: e.target.value as "asc" | "desc" })}>
+          <option value="desc">Descending</option>
+          <option value="asc">Ascending</option>
+        </Select>
+      </Toolbar>
+
+      <div className="ui-row" style={{ justifyContent: "space-between" }}>
+        <span className="ui-muted">{visibleDeployments.total} deployment(s)</span>
+        <div className="ui-row">
+          <Button type="button" variant="ghost" onClick={() => setTable({ page: Math.max(1, table.page - 1) })} disabled={table.page <= 1}>
+            Prev
+          </Button>
+          <span className="ui-muted">Page {table.page}</span>
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={() => setTable({ page: table.page + 1 })}
+            disabled={table.page * table.pageSize >= visibleDeployments.total}
+          >
+            Next
+          </Button>
         </div>
-        <div className="row">
-          <input value={runtimeProfile} onChange={(e) => setRuntimeProfile(e.target.value)} placeholder="runtime_profile" />
-          <input value={mode} onChange={(e) => setMode(e.target.value)} placeholder="mode_a|mode_b" />
-          <button disabled={loading} type="submit">Create</button>
-          <button disabled={loading || !deploymentID} type="button" onClick={() => void updateDeployment()}>Update Selected</button>
-          <button disabled={loading} type="button" onClick={validateSource}>Validate Source</button>
-        </div>
-      </form>
+      </div>
 
-      <form onSubmit={triggerBuild} className="card">
-        <h3>Trigger Build</h3>
-        <div className="row">
-          <input value={deploymentID} onChange={(e) => setDeploymentID(e.target.value)} placeholder="deployment_id" />
-          <input value={imageName} onChange={(e) => setImageName(e.target.value)} placeholder="image_name" />
-          <input value={commitSHA} onChange={(e) => setCommitSHA(e.target.value)} placeholder="commit_sha" />
-          <button disabled={loading} type="submit">Build</button>
-        </div>
-      </form>
-
-      <form onSubmit={bindSecret} className="card">
-        <h3>Secret Bindings</h3>
-        <div className="row">
-          <input value={deploymentID} onChange={(e) => setDeploymentID(e.target.value)} placeholder="deployment_id" />
-          <input value={secretName} onChange={(e) => setSecretName(e.target.value)} placeholder="secret_name" />
-          <input value={targetKey} onChange={(e) => setTargetKey(e.target.value)} placeholder="target_key" />
-          <button disabled={loading} type="submit">Bind</button>
-          <button disabled={loading || !deploymentID} type="button" onClick={() => void loadBindings(deploymentID)}>Refresh Bindings</button>
-        </div>
-        {bindings.length === 0 ? <p className="muted">No bindings for selected deployment.</p> : (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Secret</th>
-                <th>Target</th>
-                <th>Created</th>
-                <th>Action</th>
-              </tr>
-            </thead>
-            <tbody>
-              {bindings.map((b) => (
-                <tr key={b.id}>
-                  <td>{b.id}</td>
-                  <td>{b.secret_name}</td>
-                  <td>{b.target_key || "-"}</td>
-                  <td>{new Date(b.created_at).toLocaleString()}</td>
-                  <td>
-                    <button disabled={loading} type="button" onClick={() => void unbindSecret(b.id)}>Unbind</button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </form>
-
-      {error ? <p className="warn">{error}</p> : null}
-      {status ? <p className="muted">{status}</p> : null}
-
-      {deployments.length === 0 ? <p>No deployments found.</p> : null}
-      {deployments.length > 0 ? (
-        <table className="table">
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>Repo</th>
-              <th>Ref</th>
-              <th>Digest</th>
-              <th>Runtime</th>
-              <th>Mode</th>
-              <th>Updated</th>
-              <th>Action</th>
-            </tr>
-          </thead>
-          <tbody>
-            {deployments.map((d) => (
-              <tr key={d.id}>
-                <td>{d.id}</td>
-                <td>{d.repo_url}</td>
-                <td>{d.git_ref}</td>
-                <td>{d.current_image_digest || "-"}</td>
-                <td>{d.runtime_profile}</td>
-                <td>{d.mode}</td>
-                <td>{new Date(d.updated_at).toLocaleString()}</td>
-                <td>
-                  <button disabled={loading} type="button" onClick={() => void applyRuntimePolicy(d.id)}>Apply Policy</button>
-                  <button disabled={loading} type="button" onClick={() => void deleteDeployment(d.id)}>Delete</button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      {loadError ? (
+        <ErrorState
+          title={loadError.title}
+          message={loadError.message}
+          retry={() => void loadDeployments()}
+          actionHref={loadError.actionHref}
+          actionLabel={loadError.actionLabel}
+        />
       ) : null}
+
+      {!loadError && state.loading ? <InlineAlert type="info">Loading deployments...</InlineAlert> : null}
+      {!loadError && !state.loading && visibleDeployments.rows.length === 0 ? (
+        <EmptyState
+          title="No deployments yet"
+          description="Create a deployment to connect a repository and start build/deploy operations."
+          action={
+            <Button type="button" variant="primary" onClick={() => setShowCreate(true)}>
+              Create deployment
+            </Button>
+          }
+        />
+      ) : null}
+
+      {!loadError && visibleDeployments.rows.length > 0 ? (
+        <SplitPane
+          left={
+            <DataTable
+              columns={columns}
+              rows={visibleDeployments.rows}
+              onRowClick={(row) => setSelectedDeploymentID(row.id)}
+              selectedRow={(row) => row.id === selectedDeploymentID}
+            />
+          }
+          right={
+            <section className="ui-subpanel ui-stack">
+              <div className="ui-row" style={{ justifyContent: "space-between" }}>
+                <h2 style={{ margin: 0 }}>{selectedDeployment ? compactId(selectedDeployment.id, 14) : "Select a deployment"}</h2>
+                {selectedDeployment ? <StatusChip status={selectedDeployment.runtime_profile} /> : null}
+              </div>
+
+              <div className="ui-tabs" role="tablist" aria-label="Deployment detail tabs">
+                {([
+                  ["overview", "Overview"],
+                  ["source", "Source"],
+                  ["build", "Build"],
+                  ["secrets", "Secrets"],
+                  ["policy", "Policy"]
+                ] as [DetailTab, string][]).map(([value, label]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    role="tab"
+                    aria-selected={tab === value}
+                    className={tab === value ? "is-active" : ""}
+                    onClick={() => setTab(value)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              {selectedDeployment ? (
+                <>
+                  {tab === "overview" ? (
+                    <section className="ui-stack">
+                      <InlineAlert type="info">Select tabs to update source, trigger builds, bind secrets, or apply runtime policy.</InlineAlert>
+                      <div className="ui-kpi-grid">
+                        <article className="ui-kpi">
+                          <span className="ui-muted">Repository</span>
+                          <p>{selectedDeployment.repo_url}</p>
+                        </article>
+                        <article className="ui-kpi">
+                          <span className="ui-muted">Ref</span>
+                          <p>{selectedDeployment.git_ref}</p>
+                        </article>
+                        <article className="ui-kpi">
+                          <span className="ui-muted">Mode</span>
+                          <p>{selectedDeployment.mode}</p>
+                        </article>
+                        <article className="ui-kpi">
+                          <span className="ui-muted">Updated</span>
+                          <p>{formatDateTime(selectedDeployment.updated_at)}</p>
+                        </article>
+                      </div>
+                      <div className="ui-right">
+                        <Button type="button" variant="danger" onClick={() => setConfirmDelete(selectedDeployment.id)}>
+                          Delete deployment
+                        </Button>
+                      </div>
+                    </section>
+                  ) : null}
+
+                  {tab === "source" ? (
+                    <form className="ui-stack" onSubmit={updateSource}>
+                      <Toolbar>
+                        <Field id="dep-source-repo" label="Repository URL" value={repoURL} onChange={(e) => setRepoURL(e.target.value)} required />
+                        <Field id="dep-source-ref" label="Git ref" value={gitRef} onChange={(e) => setGitRef(e.target.value)} required />
+                        <Field id="dep-source-path" label="Repo path" value={repoPath} onChange={(e) => setRepoPath(e.target.value)} required />
+                      </Toolbar>
+                      <div className="ui-row">
+                        <Button type="submit" variant="primary" busy={action.phase === "pending"}>
+                          Save source
+                        </Button>
+                        <Button type="button" variant="secondary" onClick={() => void validateSource()}>
+                          Validate source
+                        </Button>
+                      </div>
+                    </form>
+                  ) : null}
+
+                  {tab === "build" ? (
+                    <form className="ui-stack" onSubmit={triggerBuild}>
+                      <Toolbar>
+                        <Field id="dep-build-image" label="Image name" value={imageName} onChange={(e) => setImageName(e.target.value)} required />
+                        <Field id="dep-build-commit" label="Commit SHA" value={commitSHA} onChange={(e) => setCommitSHA(e.target.value)} required />
+                      </Toolbar>
+                      <div className="ui-row">
+                        <Button type="submit" variant="primary" busy={action.phase === "pending"}>
+                          Trigger build
+                        </Button>
+                      </div>
+                    </form>
+                  ) : null}
+
+                  {tab === "secrets" ? (
+                    <section className="ui-stack">
+                      <form className="ui-stack" onSubmit={bindSecret}>
+                        <Toolbar>
+                          <Field id="dep-secret-name" label="Secret name" value={secretName} onChange={(e) => setSecretName(e.target.value)} required />
+                          <Field id="dep-secret-target" label="Target env key" value={targetKey} onChange={(e) => setTargetKey(e.target.value)} required />
+                        </Toolbar>
+                        <div className="ui-row">
+                          <Button type="submit" variant="primary" busy={action.phase === "pending"}>
+                            Bind secret
+                          </Button>
+                          <Button type="button" variant="secondary" onClick={() => void loadBindings(selectedDeployment.id)}>
+                            Refresh
+                          </Button>
+                        </div>
+                      </form>
+                      {bindings.error ? <InlineAlert type="error">{bindings.error}</InlineAlert> : null}
+                      {bindings.loading ? <InlineAlert type="info">Loading bindings...</InlineAlert> : null}
+                      {!bindings.loading && bindings.items.length === 0 ? (
+                        <EmptyState title="No bindings" description="No secrets are bound to this deployment yet." />
+                      ) : null}
+                      {bindings.items.length > 0 ? (
+                        <DataTable
+                          dense
+                          rows={bindings.items}
+                          columns={[
+                            { key: "id", header: "Binding", render: (row) => <code>{compactId(row.id, 10)}</code> },
+                            { key: "secret", header: "Secret", render: (row) => row.secret_name },
+                            { key: "target", header: "Target", render: (row) => row.target_key || "-" },
+                            { key: "created", header: "Created", render: (row) => formatDateTime(row.created_at) },
+                            {
+                              key: "action",
+                              header: "Action",
+                              render: (row) => (
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void unbindSecret(row.id);
+                                  }}
+                                  disabled={deletingBindingID === row.id}
+                                >
+                                  Unbind
+                                </Button>
+                              )
+                            }
+                          ]}
+                        />
+                      ) : null}
+                    </section>
+                  ) : null}
+
+                  {tab === "policy" ? (
+                    <form className="ui-stack" onSubmit={applyPolicy}>
+                      <Toolbar>
+                        <Select id="dep-policy-runtime" label="Runtime profile" value={runtimeProfile} onChange={(e) => setRuntimeProfile(e.target.value)}>
+                          <option value="gvisor">gvisor</option>
+                          <option value="kata-default">kata-default</option>
+                        </Select>
+                        <Select id="dep-policy-mode" label="Execution mode" value={mode} onChange={(e) => setMode(e.target.value)}>
+                          <option value="mode_a">mode_a</option>
+                          <option value="mode_b">mode_b</option>
+                        </Select>
+                      </Toolbar>
+                      <div className="ui-row">
+                        <Button type="submit" variant="primary" busy={action.phase === "pending"}>
+                          Apply policy
+                        </Button>
+                      </div>
+                    </form>
+                  ) : null}
+                </>
+              ) : (
+                <EmptyState title="No deployment selected" description="Select a deployment on the left to manage source, builds, secrets, and policy." />
+              )}
+
+              {action.message ? (
+                <InlineAlert type={action.phase === "error" ? "error" : action.phase === "success" ? "success" : "info"}>{action.message}</InlineAlert>
+              ) : null}
+            </section>
+          }
+        />
+      ) : null}
+
+      <ConfirmDialog
+        open={Boolean(confirmDelete)}
+        title="Delete deployment"
+        message="This removes deployment metadata and may disrupt runs. Continue?"
+        confirmLabel="Delete"
+        danger
+        onCancel={() => setConfirmDelete("")}
+        onConfirm={() => void deleteDeployment()}
+      />
+
+      {showCreate ? (
+        <div className="ui-modal-backdrop" role="dialog" aria-modal="true" aria-label="Create deployment">
+          <form className="ui-modal ui-stack" onSubmit={createDeployment}>
+            <h3>Create deployment</h3>
+            <p className="ui-muted">Step 1: Connect source. Step 2: Set runtime defaults. Step 3: Create.</p>
+            <Toolbar>
+              <Field id="dep-create-project" label="Project" value={projectID} onChange={(e) => setProjectID(e.target.value)} required />
+              <Field id="dep-create-repo" label="Repository URL" value={repoURL} onChange={(e) => setRepoURL(e.target.value)} required />
+              <Field id="dep-create-ref" label="Git ref" value={gitRef} onChange={(e) => setGitRef(e.target.value)} required />
+              <Field id="dep-create-path" label="Repo path" value={repoPath} onChange={(e) => setRepoPath(e.target.value)} required />
+              <Select id="dep-create-runtime" label="Runtime profile" value={runtimeProfile} onChange={(e) => setRuntimeProfile(e.target.value)}>
+                <option value="gvisor">gvisor</option>
+                <option value="kata-default">kata-default</option>
+              </Select>
+              <Select id="dep-create-mode" label="Mode" value={mode} onChange={(e) => setMode(e.target.value)}>
+                <option value="mode_a">mode_a</option>
+                <option value="mode_b">mode_b</option>
+              </Select>
+            </Toolbar>
+            <div className="ui-modal__actions">
+              <Button type="button" variant="secondary" onClick={() => setShowCreate(false)}>
+                Cancel
+              </Button>
+              <Button type="submit" variant="primary" busy={action.phase === "pending"}>
+                Create deployment
+              </Button>
+            </div>
+          </form>
+        </div>
+      ) : null}
+
+      <ToastRegion toasts={toasts} remove={remove} />
     </main>
   );
 }

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { toNormalizedError } from "../../../../../lib/errors";
 
 const BASE = process.env.PLATFORM_CONTROL_API_BASE_URL || "http://langopen-control-plane";
 const API_KEY = process.env.PLATFORM_API_KEY || process.env.BOOTSTRAP_API_KEY || "";
@@ -56,8 +57,24 @@ async function proxy(req: NextRequest, ctx: { params: Promise<{ path: string[] }
     cache: "no-store"
   });
 
+  if (!resp.ok) {
+    const normalized = await toNormalizedError(resp, "Control API request failed.");
+    return NextResponse.json(
+      {
+        error: {
+          code: normalized.code,
+          title: normalized.title,
+          message: normalized.message,
+          action_label: normalized.actionLabel,
+          action_href: normalized.actionHref
+        }
+      },
+      { status: resp.status }
+    );
+  }
+
   const outHeaders = new Headers();
-  ["content-type", "cache-control", "connection"].forEach((name) => {
+  ["content-type", "cache-control", "connection", "x-request-id"].forEach((name) => {
     const value = resp.headers.get(name);
     if (value) {
       outHeaders.set(name, value);

@@ -30,7 +30,7 @@ async function request(base: string, path: string, opts: FetchOptions = {}): Pro
 export async function fetchData<T>(path: string): Promise<T> {
   const resp = await request(DATA_BASE, path);
   if (!resp.ok) {
-    throw new Error(`data api ${path} failed (${resp.status})`);
+    throw await toFriendlyError(resp, "Data API request failed.");
   }
   return (await resp.json()) as T;
 }
@@ -38,7 +38,7 @@ export async function fetchData<T>(path: string): Promise<T> {
 export async function fetchControl<T>(path: string): Promise<T> {
   const resp = await request(CONTROL_BASE, path);
   if (!resp.ok) {
-    throw new Error(`control api ${path} failed (${resp.status})`);
+    throw await toFriendlyError(resp, "Control API request failed.");
   }
   return (await resp.json()) as T;
 }
@@ -69,4 +69,20 @@ function trimTrailingSlash(input: string): string {
     return "";
   }
   return input.endsWith("/") ? input.slice(0, -1) : input;
+}
+
+async function toFriendlyError(resp: Response, fallback: string): Promise<Error> {
+  const text = await resp.text();
+  if (resp.status === 401 || resp.status === 403) {
+    return new Error("Your session is missing or expired. Re-authenticate to continue.");
+  }
+  if (!text) {
+    return new Error(fallback);
+  }
+  try {
+    const parsed = JSON.parse(text) as { error?: { message?: string }; message?: string };
+    return new Error(parsed.error?.message || parsed.message || fallback);
+  } catch {
+    return new Error(text);
+  }
 }
