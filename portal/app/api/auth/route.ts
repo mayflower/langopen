@@ -33,7 +33,7 @@ export async function GET(req: NextRequest) {
   const state = crypto.randomUUID();
   const verifier = randomVerifier();
   const challenge = pkceChallenge(verifier);
-  const nextPath = req.nextUrl.searchParams.get("next") || "/";
+  const nextPath = sanitizeNextPath(req.nextUrl.searchParams.get("next"));
 
   const url = new URL(authorizationEndpoint);
   url.searchParams.set("response_type", "code");
@@ -50,4 +50,11 @@ export async function GET(req: NextRequest) {
   res.cookies.set("oidc_verifier", verifier, { httpOnly: true, sameSite: "lax", secure, path: "/" });
   res.cookies.set("oidc_next", nextPath, { httpOnly: true, sameSite: "lax", secure, path: "/" });
   return res;
+}
+
+function sanitizeNextPath(nextPath: string | null): string {
+  if (!nextPath || !nextPath.startsWith("/") || nextPath.startsWith("//")) {
+    return "/";
+  }
+  return nextPath;
 }

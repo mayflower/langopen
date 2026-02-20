@@ -22,7 +22,7 @@ export async function GET(req: NextRequest) {
   const code = req.nextUrl.searchParams.get("code");
   const storedState = req.cookies.get("oidc_state")?.value;
   const verifier = req.cookies.get("oidc_verifier")?.value;
-  const nextPath = req.cookies.get("oidc_next")?.value || "/";
+  const nextPath = sanitizeNextPath(req.cookies.get("oidc_next")?.value);
 
   if (!state || !code || !storedState || !verifier || state !== storedState) {
     return NextResponse.json({ error: "invalid_callback", message: "state or code validation failed" }, { status: 400 });
@@ -98,4 +98,11 @@ export async function GET(req: NextRequest) {
   res.cookies.delete("oidc_verifier");
   res.cookies.delete("oidc_next");
   return res;
+}
+
+function sanitizeNextPath(nextPath: string | undefined): string {
+  if (!nextPath || !nextPath.startsWith("/") || nextPath.startsWith("//")) {
+    return "/";
+  }
+  return nextPath;
 }
