@@ -34,14 +34,22 @@ spec:
             - containerPort: {{ .Values.portal.service.targetPort }}
               name: http
           env:
+            {{- if .Values.portal.env.openauthIssuerUrl }}
             - name: OPENAUTH_ISSUER_URL
               value: {{ .Values.portal.env.openauthIssuerUrl | quote }}
+            {{- end }}
+            {{- if .Values.portal.env.openauthClientId }}
             - name: OPENAUTH_CLIENT_ID
               value: {{ .Values.portal.env.openauthClientId | quote }}
+            {{- end }}
+            {{- if .Values.portal.env.openauthRedirectUri }}
             - name: OPENAUTH_REDIRECT_URI
               value: {{ .Values.portal.env.openauthRedirectUri | quote }}
+            {{- end }}
+            {{- if .Values.portal.env.portalSessionSecret }}
             - name: PORTAL_SESSION_SECRET
               value: {{ .Values.portal.env.portalSessionSecret | quote }}
+            {{- end }}
             - name: PLATFORM_DATA_API_BASE_URL
               value: {{ .Values.portal.env.platformDataApiBaseUrl | quote }}
             - name: PLATFORM_CONTROL_API_BASE_URL
