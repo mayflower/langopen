@@ -24,6 +24,15 @@ func TestHelmDefaultsEnforceSecurity(t *testing.T) {
 	if !strings.Contains(rendered, "kind: NetworkPolicy") || !strings.Contains(rendered, "default-deny-egress") {
 		t.Fatalf("expected default deny egress network policy in rendered chart")
 	}
+	if !strings.Contains(rendered, "backend-egress") {
+		t.Fatalf("expected backend egress network policy for postgres/redis")
+	}
+	if !strings.Contains(rendered, "kubernetes.io/metadata.name: \"postgresql\"") || !strings.Contains(rendered, "port: 5432") {
+		t.Fatalf("expected backend egress policy to allow postgres namespace on tcp/5432")
+	}
+	if !strings.Contains(rendered, "kubernetes.io/metadata.name: \"redis\"") || !strings.Contains(rendered, "port: 6379") {
+		t.Fatalf("expected backend egress policy to allow redis namespace on tcp/6379")
+	}
 	if !strings.Contains(rendered, "runtime-egress-https") {
 		t.Fatalf("expected runtime HTTPS egress policy for runtime-runner and builder")
 	}

@@ -91,6 +91,7 @@ portal:
 
 networkPolicy:
   enabled: true
+  allowBackendEgress: true
   allowHttpsEgressForRuntime: true
   runtimeEgressComponents:
     - runtime-runner

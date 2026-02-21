@@ -131,6 +131,18 @@ networkPolicy:
   enabled: true
   allowDns: true
   egressCidrs: []
+  allowBackendEgress: true
+  postgresNamespace: postgresql
+  postgresPort: 5432
+  postgresPodSelector:
+    cluster-name: dbserver
+    spilo-role: master
+  redisNamespace: redis
+  redisPort: 6379
+  redisPodSelector:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/instance: redis
+    app.kubernetes.io/component: master
   allowHttpsEgressForRuntime: true
   runtimeEgressComponents:
     - runtime-runner
