@@ -23,12 +23,14 @@ It implements LangGraph-compatible APIs and runtime semantics so teams can run a
 ## Documentation (Diátaxis)
 
 - Docs index: [`/docs/README.md`](/docs/README.md)
-- Tutorial: [`/docs/tutorials/run-langopen-locally.md`](/docs/tutorials/run-langopen-locally.md)
+- Tutorial: [`/docs/tutorials/deploy-langopen-on-kubernetes-and-use-portal.md`](/docs/tutorials/deploy-langopen-on-kubernetes-and-use-portal.md)
 - How-to: [`/docs/how-to/deploy-and-run-cluster-smoke-tests.md`](/docs/how-to/deploy-and-run-cluster-smoke-tests.md)
 - Reference: [`/docs/reference/platform-reference.md`](/docs/reference/platform-reference.md)
 - Explanation: [`/docs/explanation/architecture-and-compatibility.md`](/docs/explanation/architecture-and-compatibility.md)
 
-## Quickstart
+## Developer Entrypoints
+
+LangOpen runtime operation is Kubernetes-first. The commands below are useful for code-level development and debugging, not as a full production-equivalent platform run.
 
 ```bash
 # Go tests across modules in workspace

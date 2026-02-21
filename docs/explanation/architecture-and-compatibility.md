@@ -1,46 +1,58 @@
 # Explanation: Architecture and compatibility model
 
-## System planes
+## Kubernetes-first platform model
 
-LangOpen is intentionally split into operational planes so compatibility and isolation can evolve independently.
+LangOpen is designed as a Kubernetes-native control/data/runtime platform, not as a standalone single-process app. Core assumptions in code and deployment artifacts rely on:
 
-- Control plane: deployment, build, and policy orchestration (`/services/control-plane`, `/services/builder`, `/services/operator`).
-- Data plane: request handling, run state, queue processing, and stream/cancel semantics (`/services/api-server`, `/services/worker`).
-- Sandbox/runtime plane: execution runtime path (`/services/runtime-runner`) and Kubernetes runtime isolation choices (gVisor/Kata via Helm/runtime classes).
-- Observability plane: metrics/log/trace endpoints and dashboards configured through Helm and cluster tooling.
-- Portal plane: user-facing interface in `/portal` for platform workflows.
+- multi-service composition (API server, worker, control plane, builder, runtime-runner, portal),
+- Kubernetes networking/service discovery,
+- Helm-managed runtime policy and security defaults,
+- in-cluster operational checks.
 
-This split keeps user-facing API behavior stable while allowing infrastructure internals to change safely.
+That is why operational documentation should start from cluster deployment and portal access, not local single-binary execution.
+
+## System planes and users
+
+LangOpen separates concerns by plane and by user intent:
+
+- Control plane: deployment lifecycle, builds, API keys, policy changes.
+- Data plane: assistants, threads, runs, SSE stream and cancel semantics.
+- Runtime plane: worker orchestration and runtime-runner execution.
+- Portal plane: operator-facing web workflows and diagnostics.
+- Observability plane: metrics/logs/traces and Grafana links.
+
+Portal users are operators and platform engineers coordinating deployments, builds, key rotation, and run diagnostics.
 
 ## Request and run lifecycle
 
-A typical threaded run follows this flow:
+A run request crosses multiple components:
 
-1. Client calls the API server thread/run endpoint.
-2. API server persists state and pushes a wake-up signal into Redis using configured queue/prefix keys.
-3. Worker consumes wake-up events, resolves run details from Postgres, and executes via runtime mode.
-4. Runtime emits events and outputs; worker updates run status and publishes stream events.
-5. API server forwards stream events (including resume-aware flow using buffered event IDs where configured).
-6. Cancel requests propagate through cancel key/channel semantics and are applied by the worker.
+1. Client or portal sends run request to API server.
+2. API server persists run state and emits queue wake-up signals.
+3. Worker consumes pending runs and executes through runtime-runner (runtime executor mode).
+4. Runtime-runner resolves graph target and dependencies, executes graph, and returns output/events.
+5. Worker updates terminal status and publishes stream events.
+6. API server serves live/reconnect stream and cancel handling.
 
-This design separates API request latency from execution latency while preserving stream semantics expected by LangGraph-compatible clients.
+This decomposition keeps API behavior compatible while execution and isolation remain controllable at platform level.
 
-## Why compatibility is validated this way
+## Why compatibility checks are split
 
-Compatibility is checked on two axes because no single check catches all regressions:
+LangOpen validates compatibility through both static and behavioral checks:
 
-- Contract parity: `/scripts/check_openapi_parity.py` compares local and upstream path/method coverage.
-- Behavioral smoke validation: `/scripts/cluster-smoke.sh`, `/scripts/parity-smoke.sh`, and `/scripts/agent-compat-smoke.sh` exercise run, stream, cancel, and deployment behavior in real environments.
+- Static contract parity (`check_openapi_parity.py`) catches path/method drift.
+- Behavioral smoke suites catch execution, stream, cancel, and deployment regressions in a real cluster.
 
-Contract parity catches schema drift; smoke checks catch runtime and integration drift.
+Both are required because API shape parity does not guarantee runtime semantics.
 
-## Security and runtime isolation model
+## Portal as control surface
 
-LangOpen is built to run with hardened runtime defaults while still supporting iterative development:
+The portal is not a cosmetic dashboard. It is the primary control surface for platform users:
 
-- Runtime class defaults in Helm target gVisor-backed execution for major components.
-- Worker runtime mode delegates agent execution to runtime-runner, enabling tighter execution boundaries.
-- Network policy templates support deny-by-default style egress with controlled HTTPS allowances for runtime/build components.
-- Operator and deployment controls provide a path toward stricter sandbox profiles (including Kata-based policies) without changing public APIs.
+- Deployments page drives source/build/policy actions.
+- Builds page tracks build outcome and logs.
+- API Keys page handles project-scoped credential lifecycle.
+- Threads/Runs pages provide run operations and stream diagnostics.
+- Attention page provides aggregated operational signals and Grafana deep links.
 
-The intent is secure-by-default operation with explicit knobs for stricter isolation and operational tradeoffs.
+That user journey should be explicit in documentation because it defines day-to-day platform operation.
