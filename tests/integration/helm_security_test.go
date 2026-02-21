@@ -24,6 +24,15 @@ func TestHelmDefaultsEnforceSecurity(t *testing.T) {
 	if !strings.Contains(rendered, "kind: NetworkPolicy") || !strings.Contains(rendered, "default-deny-egress") {
 		t.Fatalf("expected default deny egress network policy in rendered chart")
 	}
+	if !strings.Contains(rendered, "runtime-egress-https") {
+		t.Fatalf("expected runtime HTTPS egress policy for runtime-runner and builder")
+	}
+	if !strings.Contains(rendered, "app.kubernetes.io/component") || !strings.Contains(rendered, "runtime-runner") || !strings.Contains(rendered, "builder") {
+		t.Fatalf("expected component-scoped runtime egress policy selectors")
+	}
+	if !strings.Contains(rendered, "port: 443") {
+		t.Fatalf("expected runtime HTTPS egress policy to allow tcp/443")
+	}
 	if strings.Contains(rendered, "automountServiceAccountToken: true") {
 		t.Fatalf("security regression: found automountServiceAccountToken=true")
 	}

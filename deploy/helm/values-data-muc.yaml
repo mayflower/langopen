@@ -91,6 +91,12 @@ portal:
 
 networkPolicy:
   enabled: true
+  allowHttpsEgressForRuntime: true
+  runtimeEgressComponents:
+    - runtime-runner
+    - builder
+  runtimeEgressPorts:
+    - 443
 
 observability:
   alerts:

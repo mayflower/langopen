@@ -37,6 +37,13 @@ require_cmd jq
 BOOTSTRAP_KEY="$(kubectl -n "$NAMESPACE" get secret langopen-runtime-secrets -o jsonpath='{.data.BOOTSTRAP_API_KEY}' | base64 --decode)"
 [[ -n "$BOOTSTRAP_KEY" ]] || fail "BOOTSTRAP_API_KEY is empty in secret/langopen-runtime-secrets"
 
+for provider_key in OPENAI_API_KEY GROQ_API_KEY ANTHROPIC_API_KEY; do
+  value="$(kubectl -n "$NAMESPACE" get secret langopen-runtime-secrets -o jsonpath=\"{.data.${provider_key}}\" 2>/dev/null | base64 --decode || true)"
+  if [[ -z "$value" ]]; then
+    echo "warning: ${provider_key} is missing in secret/langopen-runtime-secrets; provider-backed agents may fail preflight"
+  fi
+done
+
 kubectl -n "$NAMESPACE" run "$SMOKE_POD_NAME" --image="$SMOKE_POD_IMAGE" --restart=Never --command -- sleep 600 >/dev/null
 kubectl -n "$NAMESPACE" wait --for=condition=Ready "pod/$SMOKE_POD_NAME" --timeout=120s >/dev/null
 

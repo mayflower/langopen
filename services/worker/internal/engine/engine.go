@@ -83,6 +83,7 @@ type pendingRun struct {
 	RepoPath        string
 	RepoURL         string
 	GitRef          string
+	RuntimeMetadata map[string]any
 }
 
 type runCorrelation struct {
@@ -143,15 +144,28 @@ type runtimeRunnerExecutor struct {
 }
 
 func (e *runtimeRunnerExecutor) Execute(ctx context.Context, run pendingRun) (executeResult, error) {
+	runtimeMeta := map[string]any{
+		"repo_url":  run.RepoURL,
+		"git_ref":   run.GitRef,
+		"repo_path": run.RepoPath,
+		"graph_id":  run.GraphID,
+	}
+	for key, value := range run.RuntimeMetadata {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		runtimeMeta[key] = value
+	}
 	payload := map[string]any{
-		"run_id":        run.ID,
-		"thread_id":     run.ThreadID,
-		"assistant_id":  run.AssistantID,
-		"input":         run.Input,
-		"command":       run.Command,
-		"configurable":  run.Configurable,
-		"metadata":      run.Metadata,
-		"checkpoint_id": run.CheckpointID,
+		"run_id":           run.ID,
+		"thread_id":        run.ThreadID,
+		"assistant_id":     run.AssistantID,
+		"input":            run.Input,
+		"command":          run.Command,
+		"configurable":     run.Configurable,
+		"metadata":         run.Metadata,
+		"checkpoint_id":    run.CheckpointID,
+		"runtime_metadata": runtimeMeta,
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(e.baseURL, "/")+"/execute", bytes.NewReader(body))
@@ -470,6 +484,19 @@ func (w *Worker) fetchNextPendingRun(ctx context.Context) (pendingRun, error) {
 		}
 		run.Configurable = cfg
 	}
+	run.RuntimeMetadata = map[string]any{}
+	if existingMeta, ok := run.Metadata["runtime_metadata"].(map[string]any); ok {
+		for key, value := range existingMeta {
+			if strings.TrimSpace(key) == "" {
+				continue
+			}
+			run.RuntimeMetadata[key] = value
+		}
+	}
+	run.RuntimeMetadata["repo_url"] = run.RepoURL
+	run.RuntimeMetadata["git_ref"] = run.GitRef
+	run.RuntimeMetadata["repo_path"] = run.RepoPath
+	run.RuntimeMetadata["graph_id"] = run.GraphID
 
 	_, err = tx.Exec(ctx, `UPDATE runs SET status='running', started_at=COALESCE(started_at, NOW()), updated_at=NOW() WHERE id=$1`, run.ID)
 	if err != nil {

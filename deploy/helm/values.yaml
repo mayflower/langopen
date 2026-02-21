@@ -62,6 +62,10 @@ runtimeRunner:
   enabled: true
   replicas: 1
   runtimeClassName: gvisor
+  defaultPythonVersion: "3.11"
+  supportedPythonVersions: "3.11,3.12,3.13"
+  compatProfile: "langchain-community"
+  enableCompatShims: true
   service:
     type: ClusterIP
     port: 80
@@ -127,10 +131,17 @@ networkPolicy:
   enabled: true
   allowDns: true
   egressCidrs: []
+  allowHttpsEgressForRuntime: true
+  runtimeEgressComponents:
+    - runtime-runner
+    - builder
+  runtimeEgressPorts:
+    - 443
 
 extraEnv:
   apiServer: []
   worker: []
+  runtimeRunner: []
   controlPlane: []
   builder: []
   operator: []
@@ -139,6 +150,7 @@ extraEnv:
 extraEnvFrom:
   apiServer: []
   worker: []
+  runtimeRunner: []
   controlPlane: []
   builder: []
   operator: []

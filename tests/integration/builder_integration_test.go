@@ -46,6 +46,146 @@ func TestValidateLanggraphAndRequirements(t *testing.T) {
 	}
 }
 
+func TestValidateReturnsRuntimeMetadata(t *testing.T) {
+	tmp := t.TempDir()
+	graphFile := filepath.Join(tmp, "graph.py")
+	if err := os.WriteFile(graphFile, []byte("graph = object()\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "requirements.txt"), []byte("langgraph\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	langgraphJSON := map[string]any{
+		"graphs":         map[string]string{"default": "graph.py:graph"},
+		"dependencies":   []string{"."},
+		"python_version": "3.11",
+		"pip_installer":  "pip",
+	}
+	b, _ := json.Marshal(langgraphJSON)
+	if err := os.WriteFile(filepath.Join(tmp, "langgraph.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := builderapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	resp := doBuilderReq(t, ts.URL+"/internal/v1/builds/validate", map[string]any{"repo_path": tmp})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(body))
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := out["python_version"].(string); got != "3.11" {
+		t.Fatalf("expected python_version=3.11, got %q", got)
+	}
+	if got, _ := out["pip_installer"].(string); got != "pip" {
+		t.Fatalf("expected pip_installer=pip, got %q", got)
+	}
+	graphs, _ := out["resolved_graphs"].(map[string]any)
+	if got, _ := graphs["default"].(string); got != "graph.py:graph" {
+		t.Fatalf("expected resolved_graphs.default=graph.py:graph, got %q", got)
+	}
+	deps, _ := out["resolved_dependencies"].([]any)
+	if len(deps) == 0 {
+		t.Fatalf("expected at least one resolved dependency, got %#v", out["resolved_dependencies"])
+	}
+}
+
+func TestValidateSupportsPyprojectDependency(t *testing.T) {
+	tmp := t.TempDir()
+	graphDir := filepath.Join(tmp, "app")
+	if err := os.MkdirAll(graphDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(graphDir, "graph.py"), []byte("graph = object()\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(graphDir, "pyproject.toml"), []byte("[project]\nname='demo'\nversion='0.1.0'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	langgraphJSON := map[string]any{
+		"graphs":       map[string]string{"default": "./app/graph.py:graph"},
+		"dependencies": []string{"./app"},
+	}
+	b, _ := json.Marshal(langgraphJSON)
+	if err := os.WriteFile(filepath.Join(tmp, "langgraph.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := builderapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	resp := doBuilderReq(t, ts.URL+"/internal/v1/builds/validate", map[string]any{"repo_path": tmp})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(body))
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	deps, _ := out["resolved_dependencies"].([]any)
+	if len(deps) != 1 {
+		t.Fatalf("expected one dependency descriptor, got %#v", out["resolved_dependencies"])
+	}
+	item, _ := deps[0].(map[string]any)
+	if got, _ := item["kind"].(string); got != "pyproject" {
+		t.Fatalf("expected kind=pyproject, got %q", got)
+	}
+}
+
+func TestValidateSupportsSetupDependency(t *testing.T) {
+	tmp := t.TempDir()
+	graphDir := filepath.Join(tmp, "pkg")
+	if err := os.MkdirAll(graphDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(graphDir, "graph.py"), []byte("graph = object()\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(graphDir, "setup.py"), []byte("from setuptools import setup\nsetup(name='demo', version='0.1.0')\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	langgraphJSON := map[string]any{
+		"graphs":       map[string]string{"default": "./pkg/graph.py:graph"},
+		"dependencies": []string{"./pkg"},
+	}
+	b, _ := json.Marshal(langgraphJSON)
+	if err := os.WriteFile(filepath.Join(tmp, "langgraph.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := builderapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	resp := doBuilderReq(t, ts.URL+"/internal/v1/builds/validate", map[string]any{"repo_path": tmp})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(body))
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	deps, _ := out["resolved_dependencies"].([]any)
+	if len(deps) != 1 {
+		t.Fatalf("expected one dependency descriptor, got %#v", out["resolved_dependencies"])
+	}
+	item, _ := deps[0].(map[string]any)
+	if got, _ := item["kind"].(string); got != "setup" {
+		t.Fatalf("expected kind=setup, got %q", got)
+	}
+}
+
 func TestValidateRejectsInvalidGraphTarget(t *testing.T) {
 	tmp := t.TempDir()
 	if err := os.WriteFile(filepath.Join(tmp, "graph.py"), []byte("graph = object()\n"), 0o644); err != nil {

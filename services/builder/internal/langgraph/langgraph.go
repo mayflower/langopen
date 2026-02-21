@@ -10,15 +10,29 @@ import (
 )
 
 type Config struct {
-	Graphs       map[string]string `json:"graphs"`
-	Dependencies []string          `json:"dependencies"`
-	Env          any               `json:"env,omitempty"`
+	Graphs        map[string]string `json:"graphs"`
+	Dependencies  []string          `json:"dependencies"`
+	Env           any               `json:"env,omitempty"`
+	PythonVersion string            `json:"python_version,omitempty"`
+	PipInstaller  string            `json:"pip_installer,omitempty"`
+}
+
+type ResolvedDependency struct {
+	Kind    string   `json:"kind"`
+	Source  string   `json:"source"`
+	Path    string   `json:"path,omitempty"`
+	Install string   `json:"install"`
+	Files   []string `json:"files,omitempty"`
 }
 
 type ValidationResult struct {
-	Valid    bool     `json:"valid"`
-	Errors   []string `json:"errors,omitempty"`
-	Warnings []string `json:"warnings,omitempty"`
+	Valid                bool                 `json:"valid"`
+	Errors               []string             `json:"errors,omitempty"`
+	Warnings             []string             `json:"warnings,omitempty"`
+	PythonVersion        string               `json:"python_version,omitempty"`
+	PipInstaller         string               `json:"pip_installer,omitempty"`
+	ResolvedGraphs       map[string]string    `json:"resolved_graphs,omitempty"`
+	ResolvedDependencies []ResolvedDependency `json:"resolved_dependencies,omitempty"`
 }
 
 func Parse(path string) (Config, error) {
@@ -34,7 +48,12 @@ func Parse(path string) (Config, error) {
 }
 
 func Validate(repoRoot, configPath string) ValidationResult {
-	res := ValidationResult{Valid: true}
+	res := ValidationResult{
+		Valid:          true,
+		PythonVersion:  "3.11",
+		PipInstaller:   "pip",
+		ResolvedGraphs: map[string]string{},
+	}
 	cfg, err := Parse(configPath)
 	if err != nil {
 		return ValidationResult{Valid: false, Errors: []string{err.Error()}}
@@ -43,12 +62,19 @@ func Validate(repoRoot, configPath string) ValidationResult {
 	if err != nil {
 		return ValidationResult{Valid: false, Errors: []string{fmt.Sprintf("resolve repo root: %v", err)}}
 	}
+	if strings.TrimSpace(cfg.PythonVersion) != "" {
+		res.PythonVersion = strings.TrimSpace(cfg.PythonVersion)
+	}
+	if strings.TrimSpace(cfg.PipInstaller) != "" {
+		res.PipInstaller = strings.TrimSpace(cfg.PipInstaller)
+	}
 
 	if len(cfg.Graphs) == 0 {
 		res.Valid = false
 		res.Errors = append(res.Errors, "graphs is required and cannot be empty")
 	}
 	for name, target := range cfg.Graphs {
+		target = strings.TrimSpace(target)
 		if target == "" {
 			res.Valid = false
 			res.Errors = append(res.Errors, fmt.Sprintf("graph %q target is empty", name))
@@ -60,69 +86,131 @@ func Validate(repoRoot, configPath string) ValidationResult {
 			res.Errors = append(res.Errors, fmt.Sprintf("graph %q has invalid target %q", name, target))
 			continue
 		}
-		file := filepath.Clean(strings.TrimSpace(target[:i]))
-		if filepath.IsAbs(file) || !isPathWithinRoot(repoAbs, filepath.Join(repoAbs, file)) {
-			res.Valid = false
-			res.Errors = append(res.Errors, fmt.Sprintf("graph %q file path must be within repo root: %q", name, file))
-			continue
+		moduleOrPath := strings.TrimSpace(target[:i])
+		if looksLikePath(moduleOrPath) {
+			file := filepath.Clean(moduleOrPath)
+			if filepath.IsAbs(file) || !isPathWithinRoot(repoAbs, filepath.Join(repoAbs, file)) {
+				res.Valid = false
+				res.Errors = append(res.Errors, fmt.Sprintf("graph %q file path must be within repo root: %q", name, file))
+				continue
+			}
+			graphPath := filepath.Join(repoAbs, file)
+			stat, statErr := os.Stat(graphPath)
+			if statErr != nil {
+				res.Valid = false
+				res.Errors = append(res.Errors, fmt.Sprintf("graph %q file not found: %s", name, graphPath))
+				continue
+			}
+			if stat.IsDir() {
+				res.Valid = false
+				res.Errors = append(res.Errors, fmt.Sprintf("graph %q file path points to a directory: %s", name, graphPath))
+				continue
+			}
 		}
-		graphPath := filepath.Join(repoAbs, file)
-		stat, statErr := os.Stat(graphPath)
-		if statErr != nil {
-			res.Valid = false
-			res.Errors = append(res.Errors, fmt.Sprintf("graph %q file not found: %s", name, graphPath))
-			continue
-		}
-		if stat.IsDir() {
-			res.Valid = false
-			res.Errors = append(res.Errors, fmt.Sprintf("graph %q file path points to a directory: %s", name, graphPath))
-		}
+		res.ResolvedGraphs[name] = target
 	}
 
-	if len(cfg.Dependencies) == 0 {
-		res.Valid = false
-		res.Errors = append(res.Errors, "dependencies must include at least one directory")
+	deps := cfg.Dependencies
+	if len(deps) == 0 {
+		deps = []string{"."}
+		res.Warnings = append(res.Warnings, "dependencies missing; defaulting to repo root")
 	}
-	for _, dep := range cfg.Dependencies {
-		cleanDep := filepath.Clean(strings.TrimSpace(dep))
-		if cleanDep == "" {
+	resolved := make([]ResolvedDependency, 0, len(deps))
+	for _, dep := range deps {
+		item, depErr := normalizeDependency(repoAbs, dep)
+		if depErr != nil {
 			res.Valid = false
-			res.Errors = append(res.Errors, "dependency path cannot be empty")
+			res.Errors = append(res.Errors, depErr.Error())
 			continue
 		}
-		depPath := filepath.Join(repoAbs, cleanDep)
-		if filepath.IsAbs(cleanDep) || !isPathWithinRoot(repoAbs, depPath) {
-			res.Valid = false
-			res.Errors = append(res.Errors, fmt.Sprintf("dependency path must be within repo root: %q", dep))
-			continue
-		}
-		info, statErr := os.Stat(depPath)
-		if statErr != nil {
-			res.Valid = false
-			res.Errors = append(res.Errors, fmt.Sprintf("dependency directory not found: %s", depPath))
-			continue
-		}
-		if !info.IsDir() {
-			res.Valid = false
-			res.Errors = append(res.Errors, fmt.Sprintf("dependency path is not a directory: %s", depPath))
-			continue
-		}
-		requirementsPath := filepath.Join(depPath, "requirements.txt")
-		requirementsInfo, statErr := os.Stat(requirementsPath)
-		if statErr != nil {
-			res.Valid = false
-			res.Errors = append(res.Errors, fmt.Sprintf("requirements.txt missing in dependency path: %s", depPath))
-			continue
-		}
-		if requirementsInfo.IsDir() {
-			res.Valid = false
-			res.Errors = append(res.Errors, fmt.Sprintf("requirements.txt path is a directory in dependency path: %s", depPath))
-		}
+		resolved = append(resolved, item)
 	}
+	res.ResolvedDependencies = resolved
+
 	if !res.Valid && len(res.Errors) == 0 {
 		res.Errors = append(res.Errors, "validation failed")
 	}
 	return res
+}
+
+func normalizeDependency(repoAbs, dep string) (ResolvedDependency, error) {
+	cleanDep := strings.TrimSpace(dep)
+	if cleanDep == "" {
+		return ResolvedDependency{}, errors.New("dependency path cannot be empty")
+	}
+
+	if !looksLikePath(cleanDep) {
+		return ResolvedDependency{
+			Kind:    "package",
+			Source:  cleanDep,
+			Install: "pip install " + cleanDep,
+		}, nil
+	}
+
+	depPath := filepath.Join(repoAbs, filepath.Clean(cleanDep))
+	if filepath.IsAbs(cleanDep) || !isPathWithinRoot(repoAbs, depPath) {
+		return ResolvedDependency{}, fmt.Errorf("dependency path must be within repo root: %q", dep)
+	}
+	info, statErr := os.Stat(depPath)
+	if statErr != nil {
+		return ResolvedDependency{}, fmt.Errorf("dependency directory not found: %s", depPath)
+	}
+	if !info.IsDir() {
+		if strings.EqualFold(filepath.Base(depPath), "requirements.txt") {
+			rel, _ := filepath.Rel(repoAbs, depPath)
+			return ResolvedDependency{
+				Kind:    "requirements",
+				Source:  cleanDep,
+				Path:    filepath.ToSlash(filepath.Dir(rel)),
+				Install: "pip install -r " + filepath.ToSlash(rel),
+				Files:   []string{filepath.ToSlash(rel)},
+			}, nil
+		}
+		return ResolvedDependency{}, fmt.Errorf("dependency path is not a directory: %s", depPath)
+	}
+
+	requirementsPath := filepath.Join(depPath, "requirements.txt")
+	if requirementsInfo, err := os.Stat(requirementsPath); err == nil && !requirementsInfo.IsDir() {
+		relDir, _ := filepath.Rel(repoAbs, depPath)
+		relReq, _ := filepath.Rel(repoAbs, requirementsPath)
+		return ResolvedDependency{
+			Kind:    "requirements",
+			Source:  cleanDep,
+			Path:    filepath.ToSlash(relDir),
+			Install: "pip install -r " + filepath.ToSlash(relReq),
+			Files:   []string{filepath.ToSlash(relReq)},
+		}, nil
+	}
+
+	pyprojectPath := filepath.Join(depPath, "pyproject.toml")
+	if pyprojectInfo, err := os.Stat(pyprojectPath); err == nil && !pyprojectInfo.IsDir() {
+		relDir, _ := filepath.Rel(repoAbs, depPath)
+		relPyproject, _ := filepath.Rel(repoAbs, pyprojectPath)
+		path := filepath.ToSlash(relDir)
+		return ResolvedDependency{
+			Kind:    "pyproject",
+			Source:  cleanDep,
+			Path:    path,
+			Install: "pip install " + path,
+			Files:   []string{filepath.ToSlash(relPyproject)},
+		}, nil
+	}
+
+	setupPath := filepath.Join(depPath, "setup.py")
+	if setupInfo, err := os.Stat(setupPath); err == nil && !setupInfo.IsDir() {
+		relDir, _ := filepath.Rel(repoAbs, depPath)
+		relSetup, _ := filepath.Rel(repoAbs, setupPath)
+		path := filepath.ToSlash(relDir)
+		return ResolvedDependency{
+			Kind:    "setup",
+			Source:  cleanDep,
+			Path:    path,
+			Install: "pip install " + path,
+			Files:   []string{filepath.ToSlash(relSetup)},
+		}, nil
+	}
+
+	return ResolvedDependency{}, fmt.Errorf("dependency directory missing requirements.txt, pyproject.toml, or setup.py: %s", depPath)
 }
 
 func isPathWithinRoot(root, candidate string) bool {
@@ -134,6 +222,16 @@ func isPathWithinRoot(root, candidate string) bool {
 		return true
 	}
 	return !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && rel != ".."
+}
+
+func looksLikePath(value string) bool {
+	if value == "." || value == ".." {
+		return true
+	}
+	if strings.HasPrefix(value, "./") || strings.HasPrefix(value, "../") || strings.HasPrefix(value, "/") {
+		return true
+	}
+	return strings.Contains(value, "/") || strings.Contains(value, "\\")
 }
 
 func indexRune(s string, sep rune) int {

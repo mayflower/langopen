@@ -33,6 +33,29 @@ spec:
           ports:
             - containerPort: {{ .Values.runtimeRunner.service.targetPort }}
               name: http
+          env:
+            - name: RUNTIME_RUNNER_DEFAULT_PYTHON_VERSION
+              value: {{ .Values.runtimeRunner.defaultPythonVersion | quote }}
+            - name: RUNTIME_RUNNER_SUPPORTED_PYTHON_VERSIONS
+              value: {{ .Values.runtimeRunner.supportedPythonVersions | quote }}
+            - name: RUNTIME_RUNNER_COMPAT_PROFILE
+              value: {{ .Values.runtimeRunner.compatProfile | quote }}
+            - name: RUNTIME_RUNNER_ENABLE_COMPAT_SHIMS
+              value: {{ ternary "true" "false" .Values.runtimeRunner.enableCompatShims | quote }}
+          {{- range .Values.extraEnv.runtimeRunner }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+          {{- end }}
+          {{- if or .Values.global.envFromSecret (gt (len .Values.extraEnvFrom.runtimeRunner) 0) }}
+          envFrom:
+            {{- if .Values.global.envFromSecret }}
+            - secretRef:
+                name: {{ .Values.global.envFromSecret }}
+            {{- end }}
+            {{- with .Values.extraEnvFrom.runtimeRunner }}
+{{ toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
           volumeMounts:
             - name: tmp
               mountPath: /tmp
