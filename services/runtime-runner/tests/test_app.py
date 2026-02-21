@@ -179,6 +179,20 @@ class RuntimeRunnerAppTests(unittest.TestCase):
         self.assertEqual(result["payload"], {"hello": "world"})
         self.assertEqual(result["configurable"], {"foo": "bar"})
 
+    def test_invoke_target_supports_async_graph_factory(self):
+        class ProducedGraph:
+            async def ainvoke(self, payload, configurable=None):
+                return {"ok": True, "payload": payload, "configurable": configurable}
+
+        async def factory(config):
+            return ProducedGraph()
+
+        req = APP.ExecuteRequest(run_id="run_test", input={"question": "ping"}, configurable={"model": "openai:gpt-4o-mini"})
+        result = APP._invoke_target(factory, req)
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["payload"], {"question": "ping"})
+        self.assertEqual(result["configurable"], {"model": "openai:gpt-4o-mini"})
+
 
 if __name__ == "__main__":
     unittest.main()

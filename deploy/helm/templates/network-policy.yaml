@@ -125,5 +125,37 @@ spec:
         - protocol: TCP
           port: {{ . }}
 {{- end }}
+---
+{{- if .Values.networkPolicy.allowRuntimeElasticsearchEgress }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "langopen.fullname" . }}-runtime-elasticsearch-egress
+  labels:
+    {{- include "langopen.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "langopen.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+{{ toYaml .Values.networkPolicy.runtimeElasticsearchEgressComponents | nindent 10 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.runtimeElasticsearchNamespace | quote }}
+          podSelector:
+            matchLabels:
+{{ toYaml .Values.networkPolicy.runtimeElasticsearchPodSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.runtimeElasticsearchPort }}
+{{- end }}
 {{- end }}
 {{- end }}

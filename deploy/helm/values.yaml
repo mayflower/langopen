@@ -160,6 +160,14 @@ networkPolicy:
     - builder
   runtimeEgressPorts:
     - 443
+  allowRuntimeElasticsearchEgress: false
+  runtimeElasticsearchNamespace: eck-stack
+  runtimeElasticsearchPort: 9200
+  runtimeElasticsearchEgressComponents:
+    - runtime-runner
+  runtimeElasticsearchPodSelector:
+    common.k8s.elastic.co/type: elasticsearch
+    elasticsearch.k8s.elastic.co/cluster-name: elasticsearch
 
 extraEnv:
   apiServer: []

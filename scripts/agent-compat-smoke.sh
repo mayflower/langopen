@@ -36,7 +36,24 @@ kcurl() {
 
 secret_value() {
   local key="$1"
-  kubectl -n "$NAMESPACE" get secret langopen-runtime-secrets -o jsonpath="{.data.${key}}" 2>/dev/null | base64 --decode || true
+  local value
+  value="$(kubectl -n "$NAMESPACE" get secret langopen-runtime-secrets -o jsonpath="{.data.${key}}" 2>/dev/null | base64 --decode || true)"
+  if [[ -n "$value" ]]; then
+    printf '%s' "$value"
+    return 0
+  fi
+
+  case "$key" in
+    ELASTICSEARCH_USER)
+      printf '%s' "elastic"
+      ;;
+    ELASTICSEARCH_PASSWORD)
+      kubectl -n eck-stack get secret elasticsearch-es-elastic-user -o jsonpath='{.data.elastic}' 2>/dev/null | base64 --decode || true
+      ;;
+    ELASTICSEARCH_URL)
+      printf '%s' "https://elasticsearch-es-http.eck-stack.svc.cluster.local:9200"
+      ;;
+  esac
 }
 
 assert_fixture_commit_window() {
@@ -61,15 +78,15 @@ WORKER_EXECUTOR="$(kubectl -n "$NAMESPACE" get deploy -l app.kubernetes.io/compo
 [[ "$WORKER_EXECUTOR" == "runtime" ]] || fail "expected LANGOPEN_EXECUTOR=runtime, got '$WORKER_EXECUTOR'"
 
 fixtures=(
-  "new-langgraph-project|langchain-ai/new-langgraph-project|e7d94c8a78401574fb29e261d6b0acfc9ed3f1e3|agent|.|OPENAI_API_KEY"
-  "react-agent|langchain-ai/react-agent|0e68628a2217072a79edbc22d0b9efbb13112da5|agent|.|OPENAI_API_KEY"
-  "retrieval-agent-template|langchain-ai/retrieval-agent-template|062c3400e51a3b25351a7dfe8f0446a1d4713fb8|retrieval_graph|.|OPENAI_API_KEY"
-  "agent-inbox-example|langchain-ai/agent-inbox-langgraph-example|f56c3326c7cc6652e56431240b669e5ca4c72f96|agent|.|OPENAI_API_KEY"
-  "oap-tools-agent|langchain-ai/oap-langgraph-tools-agent|8bf78d70671f1a6e34fe545066ae6fd47a4687be|agent|.|OPENAI_API_KEY"
+  "new-langgraph-project|langchain-ai/new-langgraph-project|e7d94c8a78401574fb29e261d6b0acfc9ed3f1e3|agent|.|OPENAI_API_KEY|{}|compat smoke: reply with OK"
+  "react-agent|langchain-ai/react-agent|0e68628a2217072a79edbc22d0b9efbb13112da5|agent|.|OPENAI_API_KEY|{\"model\":\"openai:gpt-4o-mini\",\"max_search_results\":1,\"system_prompt\":\"You are a concise assistant. Reply in one short sentence and avoid tool use unless required.\"}|compat smoke: reply with OK and avoid tools"
+  "retrieval-agent-template|langchain-ai/retrieval-agent-template|062c3400e51a3b25351a7dfe8f0446a1d4713fb8|retrieval_graph|.|OPENAI_API_KEY,ELASTICSEARCH_URL,ELASTICSEARCH_USER,ELASTICSEARCH_PASSWORD|{\"user_id\":\"compat-smoke\",\"retriever_provider\":\"elastic-local\",\"embedding_model\":\"openai/text-embedding-3-small\",\"query_model\":\"openai:gpt-4o-mini\",\"response_model\":\"openai:gpt-4o-mini\",\"search_kwargs\":{\"k\":1}}|compat smoke: answer from retrieved context or say no results"
+  "agent-inbox-example|langchain-ai/agent-inbox-langgraph-example|f56c3326c7cc6652e56431240b669e5ca4c72f96|agent|.|OPENAI_API_KEY|{}|compat smoke: reply with OK"
+  "oap-tools-agent|langchain-ai/oap-langgraph-tools-agent|8bf78d70671f1a6e34fe545066ae6fd47a4687be|agent|.|OPENAI_API_KEY|{\"model_name\":\"openai:gpt-4o-mini\",\"temperature\":0,\"max_tokens\":128}|compat smoke: reply with OK and no tools"
 )
 
 for item in "${fixtures[@]}"; do
-  IFS='|' read -r name repo sha graph repo_path required_env <<<"$item"
+  IFS='|' read -r name repo sha graph repo_path required_env config_json prompt_text <<<"$item"
   if ! assert_fixture_commit_window "$repo" "$sha"; then
     fail "fixture ${name} commit ${sha} for ${repo} is outside ${WINDOW_START}..${WINDOW_END} or cannot be verified"
   fi
@@ -86,6 +103,8 @@ run_agent_case() {
   local graph_id="$4"
   local repo_path="$5"
   local required_env_csv="$6"
+  local config_json="$7"
+  local prompt_text="$8"
   local repo_url="https://github.com/${repo}"
 
   echo "[compat] deploying ${name} (${repo_url} ${repo_path}#${sha})"
@@ -119,8 +138,13 @@ run_agent_case() {
   asst_id="$(printf '%s' "$asst_json" | jq -r '.id // empty')"
   [[ -n "$asst_id" ]] || { CASE_ERROR="create_assistant:$(printf '%s' "$asst_json" | tr '\n' ' ')"; return 1; }
 
-  local run_json status run_id err_type err_msg
-  run_json="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d "{\"assistant_id\":\"${asst_id}\",\"input\":{\"messages\":[{\"role\":\"user\",\"content\":\"compat smoke ${name}\"}]}}" "$API_BASE/api/v1/runs/wait?timeout_seconds=${RUN_TIMEOUT_SECONDS}")"
+  local run_json status run_id err_type err_msg run_payload
+  run_payload="$(jq -cn \
+    --arg assistant_id "$asst_id" \
+    --arg prompt "$prompt_text" \
+    --argjson cfg "$config_json" \
+    '{assistant_id:$assistant_id,input:{messages:[{role:"user",content:$prompt}]},configurable:$cfg}')"
+  run_json="$(kcurl -H "X-Api-Key: ${BOOTSTRAP_KEY}" -H "Content-Type: application/json" -d "$run_payload" "$API_BASE/api/v1/runs/wait?timeout_seconds=${RUN_TIMEOUT_SECONDS}")"
   status="$(printf '%s' "$run_json" | jq -r '.status // empty')"
   if [[ "$status" != "success" ]]; then
     run_id="$(printf '%s' "$run_json" | jq -r '.id // ""')"
@@ -137,8 +161,8 @@ run_agent_case() {
 failures=()
 for item in "${fixtures[@]}"; do
   CASE_ERROR=""
-  IFS='|' read -r name repo sha graph repo_path required_env <<<"$item"
-  if ! run_agent_case "$name" "$repo" "$sha" "$graph" "$repo_path" "$required_env"; then
+  IFS='|' read -r name repo sha graph repo_path required_env config_json prompt_text <<<"$item"
+  if ! run_agent_case "$name" "$repo" "$sha" "$graph" "$repo_path" "$required_env" "$config_json" "$prompt_text"; then
     failures+=("${name}|${repo}|${sha}|${CASE_ERROR:-unknown}")
   fi
 done

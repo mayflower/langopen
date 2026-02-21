@@ -788,40 +788,83 @@ def _invoke_target(target_obj: Any, req: ExecuteRequest) -> Any:
     payload = req.input
     cfg = _as_dict(req.configurable)
 
-    def _invoke_sync() -> Any:
+    def _invoke_runnable(obj: Any) -> Any:
         try:
-            return target_obj.invoke(payload, configurable=cfg)
+            return obj.invoke(payload, configurable=cfg)
         except TypeError:
-            return target_obj.invoke(payload)
+            return obj.invoke(payload)
 
-    def _invoke_async() -> Any:
+    def _invoke_runnable_async(obj: Any) -> Any:
         try:
-            coro = target_obj.ainvoke(payload, configurable=cfg)
+            coro = obj.ainvoke(payload, configurable=cfg)
         except TypeError:
-            coro = target_obj.ainvoke(payload)
+            coro = obj.ainvoke(payload)
         return asyncio.run(coro)
 
     if hasattr(target_obj, "invoke") and callable(target_obj.invoke):
         try:
-            result = _invoke_sync()
+            result = _invoke_runnable(target_obj)
         except Exception:
             if hasattr(target_obj, "ainvoke") and callable(target_obj.ainvoke):
-                result = _invoke_async()
+                result = _invoke_runnable_async(target_obj)
             else:
                 raise
     elif hasattr(target_obj, "ainvoke") and callable(target_obj.ainvoke):
-        result = _invoke_async()
+        result = _invoke_runnable_async(target_obj)
     elif callable(target_obj):
+        signature: inspect.Signature | None = None
         try:
-            result = target_obj(payload, cfg)
-        except TypeError:
+            signature = inspect.signature(target_obj)
+        except Exception:
+            signature = None
+
+        def _binds(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
+            if signature is None:
+                return True
             try:
-                result = target_obj(payload)
+                signature.bind(*args, **kwargs)
+                return True
             except TypeError:
-                try:
-                    result = target_obj(input=payload, configurable=cfg)
-                except TypeError:
-                    result = target_obj()
+                return False
+
+        candidate_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        # Prefer config-oriented graph factories first (e.g. async graph(config)).
+        for key in ("config", "configurable", "runnable_config", "cfg"):
+            candidate_calls.append(((), {key: cfg}))
+        candidate_calls.append(((cfg,), {}))
+        candidate_calls.append(((), {}))
+        # Backward-compatible payload call variants.
+        candidate_calls.append(((payload, cfg), {}))
+        candidate_calls.append(((payload,), {}))
+        candidate_calls.append(((), {"input": payload, "configurable": cfg}))
+
+        result = None
+        invoked = False
+        for args, kwargs in candidate_calls:
+            if not _binds(args, kwargs):
+                continue
+            invoked = True
+            try:
+                result = target_obj(*args, **kwargs)
+                break
+            except TypeError:
+                if signature is None:
+                    continue
+                raise
+        if not invoked:
+            raise RuntimeRunnerError("graph_target_resolution_failed", "resolved graph target callable signature is unsupported")
+        if inspect.isawaitable(result):
+            result = asyncio.run(result)
+        # Support graph-factory targets that return a runnable graph instance.
+        if hasattr(result, "invoke") and callable(getattr(result, "invoke", None)):
+            try:
+                return _invoke_runnable(result)
+            except Exception:
+                if hasattr(result, "ainvoke") and callable(getattr(result, "ainvoke", None)):
+                    return _invoke_runnable_async(result)
+                raise
+        if hasattr(result, "ainvoke") and callable(getattr(result, "ainvoke", None)):
+            return _invoke_runnable_async(result)
     else:
         raise RuntimeRunnerError("graph_target_resolution_failed", "resolved graph target is not callable")
 
@@ -895,9 +938,16 @@ def execute(req: ExecuteRequest) -> ExecuteResponse:
                 target_obj = _resolve_target(graph_target, repo_root, repo_path)
             except RuntimeRunnerError as target_err:
                 # Best-effort compat retry for dynamic asyncpg import failures.
-                if target_err.code == "graph_target_resolution_failed" and "asyncpg" in str(target_err.details.get("error", "")):
+                if target_err.code != "graph_target_resolution_failed":
+                    raise
+                target_err_text = str(target_err.details.get("error", ""))
+                if "asyncpg" in target_err_text:
                     _install_with_pip(pybin, ["asyncpg"])
                     compat_actions.append("compat_install:asyncpg")
+                    target_obj = _resolve_target(graph_target, repo_root, repo_path)
+                elif "cannot import name 'Converter' from 'attr'" in target_err_text:
+                    _install_with_pip(pybin, ["attrs>=24.2.0"])
+                    compat_actions.append("compat_install:attrs>=24.2.0")
                     target_obj = _resolve_target(graph_target, repo_root, repo_path)
                 else:
                     raise

@@ -97,6 +97,7 @@ networkPolicy:
   enabled: true
   allowBackendEgress: true
   allowHttpsEgressForRuntime: true
+  allowRuntimeElasticsearchEgress: true
   runtimeEgressComponents:
     - runtime-runner
     - builder
