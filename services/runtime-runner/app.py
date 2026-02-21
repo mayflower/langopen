@@ -229,6 +229,56 @@ def _git_ref(req: ExecuteRequest) -> str:
     return _lookup(req, "git_ref") or "main"
 
 
+def _is_commit_ref(git_ref: str) -> bool:
+    ref = str(git_ref or "").strip().lower()
+    return bool(ref) and bool(re.fullmatch(r"[0-9a-f]{7,40}", ref))
+
+
+def _clone_checkout_ref(repo_url: str, git_ref: str, repo_dir: Path) -> None:
+    if _is_commit_ref(git_ref):
+        subprocess.run(
+            ["git", "clone", "--no-checkout", repo_url, str(repo_dir)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "fetch", "--depth", "1", "origin", git_ref],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "checkout", "--detach", "FETCH_HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return
+    subprocess.run(
+        ["git", "clone", "--depth", "1", "--branch", git_ref, repo_url, str(repo_dir)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _refresh_checkout_ref(git_ref: str, repo_dir: Path) -> None:
+    fetch_ref = git_ref
+    subprocess.run(
+        ["git", "-C", str(repo_dir), "fetch", "--depth", "1", "origin", fetch_ref],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo_dir), "reset", "--hard", "FETCH_HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _resolve_repo_subpath(repo_dir: Path, repo_subpath: str) -> Path:
     text = str(repo_subpath or "").strip()
     if text in {"", "/", "."}:
@@ -258,12 +308,7 @@ def _materialize_repo_path(req: ExecuteRequest) -> str:
         cache_root.mkdir(parents=True, exist_ok=True)
         if not (repo_dir / ".git").is_dir():
             try:
-                subprocess.run(
-                    ["git", "clone", "--depth", "1", "--branch", git_ref, repo_url, str(repo_dir)],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
+                _clone_checkout_ref(repo_url, git_ref, repo_dir)
             except subprocess.CalledProcessError as exc:
                 raise RuntimeRunnerError(
                     "repo_clone_failed",
@@ -272,18 +317,7 @@ def _materialize_repo_path(req: ExecuteRequest) -> str:
                 ) from exc
         elif _env_bool("RUNTIME_RUNNER_GIT_REFRESH", False):
             try:
-                subprocess.run(
-                    ["git", "-C", str(repo_dir), "fetch", "--depth", "1", "origin", git_ref],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                subprocess.run(
-                    ["git", "-C", str(repo_dir), "reset", "--hard", "FETCH_HEAD"],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
+                _refresh_checkout_ref(git_ref, repo_dir)
             except subprocess.CalledProcessError as exc:
                 raise RuntimeRunnerError(
                     "repo_refresh_failed",

@@ -5,6 +5,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 def load_app_module():
@@ -123,6 +124,30 @@ class RuntimeRunnerAppTests(unittest.TestCase):
                 APP._writable_paths = original
             self.assertTrue(p1.is_dir())
             self.assertTrue(p2.is_dir())
+
+    def test_clone_checkout_ref_uses_branch_clone_for_named_refs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            with patch.object(APP.subprocess, "run") as run_mock:
+                APP._clone_checkout_ref("https://github.com/langchain-ai/react-agent", "main", repo_dir)
+                self.assertEqual(run_mock.call_count, 1)
+                cmd = run_mock.call_args.args[0]
+                self.assertEqual(cmd[:5], ["git", "clone", "--depth", "1", "--branch"])
+                self.assertEqual(cmd[5], "main")
+
+    def test_clone_checkout_ref_uses_fetch_for_commit_sha(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            sha = "0e68628a2217072a79edbc22d0b9efbb13112da5"
+            with patch.object(APP.subprocess, "run") as run_mock:
+                APP._clone_checkout_ref("https://github.com/langchain-ai/react-agent", sha, repo_dir)
+                self.assertEqual(run_mock.call_count, 3)
+                clone_cmd = run_mock.call_args_list[0].args[0]
+                fetch_cmd = run_mock.call_args_list[1].args[0]
+                checkout_cmd = run_mock.call_args_list[2].args[0]
+                self.assertEqual(clone_cmd[:3], ["git", "clone", "--no-checkout"])
+                self.assertEqual(fetch_cmd[-1], sha)
+                self.assertEqual(checkout_cmd[-2:], ["--detach", "FETCH_HEAD"])
 
 
 if __name__ == "__main__":
