@@ -665,6 +665,16 @@ _PROVIDER_BY_REQUIREMENT = {
 
 
 _ENV_PATTERN = re.compile(r"\b([A-Z][A-Z0-9_]*_API_KEY)\b")
+_PROVIDER_HINT_PATTERNS: dict[str, re.Pattern[str]] = {
+    "OPENAI_API_KEY": re.compile(r"\b(openai|chatopenai|openaiembeddings)\b", re.IGNORECASE),
+    "GROQ_API_KEY": re.compile(r"\b(groq|chatgroq)\b", re.IGNORECASE),
+    "ANTHROPIC_API_KEY": re.compile(r"\b(anthropic|chatanthropic)\b", re.IGNORECASE),
+    "GOOGLE_API_KEY": re.compile(r"\b(google|gemini|chatgooglegenerativeai)\b", re.IGNORECASE),
+    "COHERE_API_KEY": re.compile(r"\b(cohere|chatcohere)\b", re.IGNORECASE),
+    "MISTRAL_API_KEY": re.compile(r"\b(mistral|chatmistral)\b", re.IGNORECASE),
+    "TOGETHER_API_KEY": re.compile(r"\b(together|chattogether)\b", re.IGNORECASE),
+    "FIREWORKS_API_KEY": re.compile(r"\b(fireworks|chatfireworks)\b", re.IGNORECASE),
+}
 
 
 def _scan_requirement_names(repo_root: Path, plan: list[dict[str, Any]]) -> set[str]:
@@ -689,8 +699,9 @@ def _scan_requirement_names(repo_root: Path, plan: list[dict[str, Any]]) -> set[
     return names
 
 
-def _scan_repo_for_api_keys(repo_root: Path) -> set[str]:
-    keys: set[str] = set()
+def _scan_repo_for_env_hints(repo_root: Path) -> tuple[set[str], set[str]]:
+    explicit_keys: set[str] = set()
+    provider_hints: set[str] = set()
     count = 0
     for py_file in repo_root.rglob("*.py"):
         count += 1
@@ -700,17 +711,21 @@ def _scan_repo_for_api_keys(repo_root: Path) -> set[str]:
             text = py_file.read_text(encoding="utf-8")
         except Exception:
             continue
-        keys.update(_ENV_PATTERN.findall(text))
-    return keys
+        explicit_keys.update(_ENV_PATTERN.findall(text))
+        for env_name, pattern in _PROVIDER_HINT_PATTERNS.items():
+            if pattern.search(text):
+                provider_hints.add(env_name)
+    return explicit_keys, provider_hints
 
 
 def _detect_required_env(repo_root: Path, plan: list[dict[str, Any]]) -> list[str]:
     required: set[str] = set()
+    explicit_keys, provider_hints = _scan_repo_for_env_hints(repo_root)
+    required.update(explicit_keys)
     req_names = _scan_requirement_names(repo_root, plan)
     for req_name, env_name in _PROVIDER_BY_REQUIREMENT.items():
-        if req_name in req_names:
+        if req_name in req_names and env_name in provider_hints:
             required.add(env_name)
-    required.update(_scan_repo_for_api_keys(repo_root))
     return sorted(required)
 
 
@@ -806,11 +821,32 @@ def _invoke_target(target_obj: Any, req: ExecuteRequest) -> Any:
     payload = req.input
     cfg = _as_dict(req.configurable)
 
+    def _invoke_sync() -> Any:
+        try:
+            return target_obj.invoke(payload, configurable=cfg)
+        except TypeError:
+            return target_obj.invoke(payload)
+
+    def _invoke_async() -> Any:
+        try:
+            coro = target_obj.ainvoke(payload, configurable=cfg)
+        except TypeError:
+            coro = target_obj.ainvoke(payload)
+        return asyncio.run(coro)
+
     if hasattr(target_obj, "invoke") and callable(target_obj.invoke):
         try:
-            result = target_obj.invoke(payload, configurable=cfg)
-        except TypeError:
-            result = target_obj.invoke(payload)
+            result = _invoke_sync()
+        except Exception as invoke_err:
+            if hasattr(target_obj, "ainvoke") and callable(target_obj.ainvoke):
+                try:
+                    result = _invoke_async()
+                except Exception:
+                    raise invoke_err
+            else:
+                raise
+    elif hasattr(target_obj, "ainvoke") and callable(target_obj.ainvoke):
+        result = _invoke_async()
     elif callable(target_obj):
         try:
             result = target_obj(payload, cfg)

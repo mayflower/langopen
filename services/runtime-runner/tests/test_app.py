@@ -89,6 +89,12 @@ class RuntimeRunnerAppTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             (repo_root / "requirements.txt").write_text("langchain-groq\n", encoding="utf-8")
+            (repo_root / "graph.py").write_text(
+                "from langchain_groq import ChatGroq\n"
+                "def build():\n"
+                "    return ChatGroq(model='llama-3.1-8b-instant')\n",
+                encoding="utf-8",
+            )
             req = APP.ExecuteRequest(run_id="run_test")
             plan = APP._dependency_install_plan(repo_root, {"dependencies": ["."]}, req)
 
@@ -101,6 +107,15 @@ class RuntimeRunnerAppTests(unittest.TestCase):
             finally:
                 if old_value is not None:
                     os.environ["GROQ_API_KEY"] = old_value
+
+    def test_preflight_does_not_require_unused_provider_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "requirements.txt").write_text("langchain-openai\n", encoding="utf-8")
+            (repo_root / "graph.py").write_text("def build():\n    return {'ok': True}\n", encoding="utf-8")
+            req = APP.ExecuteRequest(run_id="run_test")
+            plan = APP._dependency_install_plan(repo_root, {"dependencies": ["."]}, req)
+            self.assertEqual(APP._detect_required_env(repo_root, plan), [])
 
     def test_execution_environment_applies_and_restores_env_and_cwd(self):
         old_cwd = os.getcwd()
@@ -148,6 +163,19 @@ class RuntimeRunnerAppTests(unittest.TestCase):
                 self.assertEqual(clone_cmd[:3], ["git", "clone", "--no-checkout"])
                 self.assertEqual(fetch_cmd[-1], sha)
                 self.assertEqual(checkout_cmd[-2:], ["--detach", "FETCH_HEAD"])
+
+    def test_invoke_target_falls_back_to_ainvoke_when_invoke_fails(self):
+        class AsyncOnlyTarget:
+            def invoke(self, *_args, **_kwargs):
+                raise RuntimeError('No synchronous function provided to "call_model".')
+
+            async def ainvoke(self, payload, configurable=None):
+                return {"payload": payload, "configurable": configurable}
+
+        req = APP.ExecuteRequest(run_id="run_test", input={"hello": "world"}, configurable={"foo": "bar"})
+        result = APP._invoke_target(AsyncOnlyTarget(), req)
+        self.assertEqual(result["payload"], {"hello": "world"})
+        self.assertEqual(result["configurable"], {"foo": "bar"})
 
 
 if __name__ == "__main__":
