@@ -615,6 +615,15 @@ def _ensure_compat_profile(pybin: Path, profile: str, actions: list[str]) -> Non
     if missing:
         _install_with_pip(pybin, missing)
         actions.append(f"compat_install:{','.join(missing)}")
+    # Generic compatibility guard: some stacks import `Converter` from `attr`.
+    try:
+        attr_mod = importlib.import_module("attr")
+        if not hasattr(attr_mod, "Converter"):
+            _install_with_pip(pybin, ["attrs>=24.2.0"])
+            actions.append("compat_install:attrs>=24.2.0")
+    except Exception:
+        _install_with_pip(pybin, ["attrs>=24.2.0"])
+        actions.append("compat_install:attrs>=24.2.0")
 
 
 def _apply_langchain_shims(actions: list[str]) -> None:
@@ -787,18 +796,25 @@ def _resolve_target(target: str, repo_root: Path, repo_path: str) -> Any:
 def _invoke_target(target_obj: Any, req: ExecuteRequest) -> Any:
     payload = req.input
     cfg = _as_dict(req.configurable)
+    run_config = {"configurable": cfg} if cfg else {}
 
     def _invoke_runnable(obj: Any) -> Any:
         try:
-            return obj.invoke(payload, configurable=cfg)
+            return obj.invoke(payload, config=run_config)
         except TypeError:
-            return obj.invoke(payload)
+            try:
+                return obj.invoke(payload, configurable=cfg)
+            except TypeError:
+                return obj.invoke(payload)
 
     def _invoke_runnable_async(obj: Any) -> Any:
         try:
-            coro = obj.ainvoke(payload, configurable=cfg)
+            coro = obj.ainvoke(payload, config=run_config)
         except TypeError:
-            coro = obj.ainvoke(payload)
+            try:
+                coro = obj.ainvoke(payload, configurable=cfg)
+            except TypeError:
+                coro = obj.ainvoke(payload)
         return asyncio.run(coro)
 
     if hasattr(target_obj, "invoke") and callable(target_obj.invoke):
@@ -944,10 +960,6 @@ def execute(req: ExecuteRequest) -> ExecuteResponse:
                 if "asyncpg" in target_err_text:
                     _install_with_pip(pybin, ["asyncpg"])
                     compat_actions.append("compat_install:asyncpg")
-                    target_obj = _resolve_target(graph_target, repo_root, repo_path)
-                elif "cannot import name 'Converter' from 'attr'" in target_err_text:
-                    _install_with_pip(pybin, ["attrs>=24.2.0"])
-                    compat_actions.append("compat_install:attrs>=24.2.0")
                     target_obj = _resolve_target(graph_target, repo_root, repo_path)
                 else:
                     raise
