@@ -90,8 +90,10 @@ class RuntimeRunnerAppTests(unittest.TestCase):
             repo_root = Path(tmp)
             (repo_root / "requirements.txt").write_text("langchain-groq\n", encoding="utf-8")
             (repo_root / "graph.py").write_text(
+                "import os\n"
                 "from langchain_groq import ChatGroq\n"
                 "def build():\n"
+                "    os.getenv('GROQ_API_KEY')\n"
                 "    return ChatGroq(model='llama-3.1-8b-instant')\n",
                 encoding="utf-8",
             )

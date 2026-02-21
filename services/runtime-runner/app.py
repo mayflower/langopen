@@ -644,37 +644,11 @@ def _apply_langchain_shims(actions: list[str]) -> None:
         pass
 
 
-_PROVIDER_BY_REQUIREMENT = {
-    "langchain-groq": "GROQ_API_KEY",
-    "groq": "GROQ_API_KEY",
-    "openai": "OPENAI_API_KEY",
-    "langchain-openai": "OPENAI_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "langchain-anthropic": "ANTHROPIC_API_KEY",
-    "langchain-google-genai": "GOOGLE_API_KEY",
-    "google-generativeai": "GOOGLE_API_KEY",
-    "cohere": "COHERE_API_KEY",
-    "langchain-cohere": "COHERE_API_KEY",
-    "mistralai": "MISTRAL_API_KEY",
-    "langchain-mistralai": "MISTRAL_API_KEY",
-    "together": "TOGETHER_API_KEY",
-    "langchain-together": "TOGETHER_API_KEY",
-    "fireworks-ai": "FIREWORKS_API_KEY",
-    "langchain-fireworks": "FIREWORKS_API_KEY",
-}
-
-
-_ENV_PATTERN = re.compile(r"\b([A-Z][A-Z0-9_]*_API_KEY)\b")
-_PROVIDER_HINT_PATTERNS: dict[str, re.Pattern[str]] = {
-    "OPENAI_API_KEY": re.compile(r"\b(openai|chatopenai|openaiembeddings)\b", re.IGNORECASE),
-    "GROQ_API_KEY": re.compile(r"\b(groq|chatgroq)\b", re.IGNORECASE),
-    "ANTHROPIC_API_KEY": re.compile(r"\b(anthropic|chatanthropic)\b", re.IGNORECASE),
-    "GOOGLE_API_KEY": re.compile(r"\b(google|gemini|chatgooglegenerativeai)\b", re.IGNORECASE),
-    "COHERE_API_KEY": re.compile(r"\b(cohere|chatcohere)\b", re.IGNORECASE),
-    "MISTRAL_API_KEY": re.compile(r"\b(mistral|chatmistral)\b", re.IGNORECASE),
-    "TOGETHER_API_KEY": re.compile(r"\b(together|chattogether)\b", re.IGNORECASE),
-    "FIREWORKS_API_KEY": re.compile(r"\b(fireworks|chatfireworks)\b", re.IGNORECASE),
-}
+_ENV_ACCESS_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"os\.getenv\(\s*['\"]([A-Z][A-Z0-9_]*_API_KEY)['\"]"),
+    re.compile(r"os\.environ\.get\(\s*['\"]([A-Z][A-Z0-9_]*_API_KEY)['\"]"),
+    re.compile(r"os\.environ\[\s*['\"]([A-Z][A-Z0-9_]*_API_KEY)['\"]\s*\]"),
+]
 
 
 def _scan_requirement_names(repo_root: Path, plan: list[dict[str, Any]]) -> set[str]:
@@ -701,7 +675,6 @@ def _scan_requirement_names(repo_root: Path, plan: list[dict[str, Any]]) -> set[
 
 def _scan_repo_for_env_hints(repo_root: Path) -> tuple[set[str], set[str]]:
     explicit_keys: set[str] = set()
-    provider_hints: set[str] = set()
     count = 0
     for py_file in repo_root.rglob("*.py"):
         count += 1
@@ -711,21 +684,15 @@ def _scan_repo_for_env_hints(repo_root: Path) -> tuple[set[str], set[str]]:
             text = py_file.read_text(encoding="utf-8")
         except Exception:
             continue
-        explicit_keys.update(_ENV_PATTERN.findall(text))
-        for env_name, pattern in _PROVIDER_HINT_PATTERNS.items():
-            if pattern.search(text):
-                provider_hints.add(env_name)
-    return explicit_keys, provider_hints
+        for pattern in _ENV_ACCESS_PATTERNS:
+            explicit_keys.update(pattern.findall(text))
+    return explicit_keys, set()
 
 
 def _detect_required_env(repo_root: Path, plan: list[dict[str, Any]]) -> list[str]:
     required: set[str] = set()
-    explicit_keys, provider_hints = _scan_repo_for_env_hints(repo_root)
+    explicit_keys, _ = _scan_repo_for_env_hints(repo_root)
     required.update(explicit_keys)
-    req_names = _scan_requirement_names(repo_root, plan)
-    for req_name, env_name in _PROVIDER_BY_REQUIREMENT.items():
-        if req_name in req_names and env_name in provider_hints:
-            required.add(env_name)
     return sorted(required)
 
 
@@ -837,12 +804,9 @@ def _invoke_target(target_obj: Any, req: ExecuteRequest) -> Any:
     if hasattr(target_obj, "invoke") and callable(target_obj.invoke):
         try:
             result = _invoke_sync()
-        except Exception as invoke_err:
+        except Exception:
             if hasattr(target_obj, "ainvoke") and callable(target_obj.ainvoke):
-                try:
-                    result = _invoke_async()
-                except Exception:
-                    raise invoke_err
+                result = _invoke_async()
             else:
                 raise
     elif hasattr(target_obj, "ainvoke") and callable(target_obj.ainvoke):
