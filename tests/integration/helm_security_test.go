@@ -33,6 +33,9 @@ func TestHelmDefaultsEnforceSecurity(t *testing.T) {
 	if !strings.Contains(rendered, "kubernetes.io/metadata.name: \"redis\"") || !strings.Contains(rendered, "port: 6379") {
 		t.Fatalf("expected backend egress policy to allow redis namespace on tcp/6379")
 	}
+	if !strings.Contains(rendered, "worker-runtime-runner-egress") || !strings.Contains(rendered, "port: 8083") {
+		t.Fatalf("expected worker egress policy to allow runtime-runner connectivity on tcp/8083")
+	}
 	if !strings.Contains(rendered, "runtime-egress-https") {
 		t.Fatalf("expected runtime HTTPS egress policy for runtime-runner and builder")
 	}

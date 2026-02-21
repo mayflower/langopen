@@ -143,6 +143,13 @@ networkPolicy:
     app.kubernetes.io/name: redis
     app.kubernetes.io/instance: redis
     app.kubernetes.io/component: master
+  allowWorkerRuntimeRunnerEgress: true
+  runtimeRunnerNamespace: langopen
+  runtimeRunnerPort: 8083
+  runtimeRunnerPodSelector:
+    app.kubernetes.io/component: runtime-runner
+    app.kubernetes.io/instance: langopen
+    app.kubernetes.io/name: langopen
   allowHttpsEgressForRuntime: true
   runtimeEgressComponents:
     - runtime-runner
