@@ -20,6 +20,14 @@ It implements LangGraph-compatible APIs and runtime semantics so teams can run a
 - `tests/conformance`: API behavior tests.
 - `tests/integration`: Builder and migration integration tests.
 
+## Documentation (Diátaxis)
+
+- Docs index: [`/docs/README.md`](/docs/README.md)
+- Tutorial: [`/docs/tutorials/run-langopen-locally.md`](/docs/tutorials/run-langopen-locally.md)
+- How-to: [`/docs/how-to/deploy-and-run-cluster-smoke-tests.md`](/docs/how-to/deploy-and-run-cluster-smoke-tests.md)
+- Reference: [`/docs/reference/platform-reference.md`](/docs/reference/platform-reference.md)
+- Explanation: [`/docs/explanation/architecture-and-compatibility.md`](/docs/explanation/architecture-and-compatibility.md)
+
 ## Quickstart
 
 ```bash
@@ -50,6 +58,8 @@ export KUBECONFIG=~/.kube/data-lan-mayflower
 kubectl -n argocd apply -f ../argocd/data-muc/demo-apps/langopen.yaml
 ./scripts/cluster-smoke.sh
 ```
+
+Canonical operator flow: see [`/deploy/cluster/README.md`](/deploy/cluster/README.md) and [`/docs/how-to/deploy-and-run-cluster-smoke-tests.md`](/docs/how-to/deploy-and-run-cluster-smoke-tests.md).
 
 Related GitOps files:
 
