@@ -45,6 +45,16 @@ func TestHelmDefaultsEnforceSecurity(t *testing.T) {
 	if !strings.Contains(rendered, "port: 443") {
 		t.Fatalf("expected runtime HTTPS egress policy to allow tcp/443")
 	}
+	for _, mountPath := range []string{"mountPath: /tmp", "mountPath: /.cache", "mountPath: /var/tmp", "mountPath: /home/langopen"} {
+		if !strings.Contains(rendered, mountPath) {
+			t.Fatalf("expected runtime-runner writable mount %q", mountPath)
+		}
+	}
+	for _, envName := range []string{"name: RUNTIME_RUNNER_WRITABLE_HOME", "name: RUNTIME_RUNNER_CACHE_DIR", "name: XDG_CACHE_HOME", "name: PIP_CACHE_DIR"} {
+		if !strings.Contains(rendered, envName) {
+			t.Fatalf("expected runtime-runner env %q", envName)
+		}
+	}
 	if strings.Contains(rendered, "automountServiceAccountToken: true") {
 		t.Fatalf("security regression: found automountServiceAccountToken=true")
 	}

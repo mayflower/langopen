@@ -31,14 +31,24 @@ kcurl() {
   kubectl -n "$NAMESPACE" exec "$SMOKE_POD_NAME" -- curl -sS "$@"
 }
 
+secret_value() {
+  local key="$1"
+  kubectl -n "$NAMESPACE" get secret langopen-runtime-secrets -o jsonpath="{.data.${key}}" 2>/dev/null | base64 --decode || true
+}
+
 require_cmd kubectl
 require_cmd jq
 
-BOOTSTRAP_KEY="$(kubectl -n "$NAMESPACE" get secret langopen-runtime-secrets -o jsonpath='{.data.BOOTSTRAP_API_KEY}' | base64 --decode)"
+BOOTSTRAP_KEY="$(secret_value BOOTSTRAP_API_KEY)"
 [[ -n "$BOOTSTRAP_KEY" ]] || fail "BOOTSTRAP_API_KEY is empty in secret/langopen-runtime-secrets"
 
+DEPLOYMENT_VARS_KEY="$(secret_value DEPLOYMENT_VARS_ENCRYPTION_KEY)"
+if [[ -z "$DEPLOYMENT_VARS_KEY" ]]; then
+  echo "warning: DEPLOYMENT_VARS_ENCRYPTION_KEY is missing in secret/langopen-runtime-secrets; deployment variable encryption will not work in LANGOPEN_ENV=prod"
+fi
+
 for provider_key in OPENAI_API_KEY GROQ_API_KEY ANTHROPIC_API_KEY; do
-  value="$(kubectl -n "$NAMESPACE" get secret langopen-runtime-secrets -o jsonpath=\"{.data.${provider_key}}\" 2>/dev/null | base64 --decode || true)"
+  value="$(secret_value "$provider_key")"
   if [[ -z "$value" ]]; then
     echo "warning: ${provider_key} is missing in secret/langopen-runtime-secrets; provider-backed agents may fail preflight"
   fi

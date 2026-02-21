@@ -18,7 +18,14 @@ test.describe("Portal E2E flows", () => {
     await page.getByRole("button", { name: "Trigger build" }).click();
     await expect(page.getByText("Build queued.").first()).toBeVisible();
 
-    await page.getByRole("tab", { name: "Secrets" }).click();
+    await page.getByRole("tab", { name: "Variables" }).click();
+    await page.getByLabel("Key", { exact: true }).fill("GROQ_API_KEY");
+    await page.getByLabel("Value").fill("gsk_test");
+    await page.getByRole("button", { name: "Save variable" }).click();
+    await expect(page.getByText("Saved variable GROQ_API_KEY.").first()).toBeVisible();
+    await expect(page.getByText("GROQ_API_KEY").first()).toBeVisible();
+
+    await page.getByRole("tab", { name: "Secrets (legacy)" }).click();
     await page.getByLabel("Secret name").fill("anthropic-secret");
     await page.getByLabel("Target env key").fill("ANTHROPIC_API_KEY");
     await page.getByRole("button", { name: "Bind secret" }).click();

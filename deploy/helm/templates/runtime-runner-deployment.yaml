@@ -34,6 +34,8 @@ spec:
             - containerPort: {{ .Values.runtimeRunner.service.targetPort }}
               name: http
           env:
+            - name: LANGOPEN_ENV
+              value: {{ .Values.env.langopenEnv | quote }}
             - name: RUNTIME_RUNNER_DEFAULT_PYTHON_VERSION
               value: {{ .Values.runtimeRunner.defaultPythonVersion | quote }}
             - name: RUNTIME_RUNNER_SUPPORTED_PYTHON_VERSIONS
@@ -42,6 +44,24 @@ spec:
               value: {{ .Values.runtimeRunner.compatProfile | quote }}
             - name: RUNTIME_RUNNER_ENABLE_COMPAT_SHIMS
               value: {{ ternary "true" "false" .Values.runtimeRunner.enableCompatShims | quote }}
+            - name: RUNTIME_RUNNER_WRITABLE_HOME
+              value: {{ .Values.runtimeRunner.writableHome | quote }}
+            - name: RUNTIME_RUNNER_CACHE_DIR
+              value: {{ .Values.runtimeRunner.cacheDir | quote }}
+            - name: HOME
+              value: {{ .Values.runtimeRunner.writableHome | quote }}
+            - name: TMPDIR
+              value: "/tmp"
+            - name: TMP
+              value: "/tmp"
+            - name: TEMP
+              value: "/tmp"
+            - name: XDG_CACHE_HOME
+              value: {{ .Values.runtimeRunner.cacheDir | quote }}
+            - name: PIP_CACHE_DIR
+              value: {{ printf "%s/pip" .Values.runtimeRunner.cacheDir | quote }}
+            - name: UV_CACHE_DIR
+              value: {{ printf "%s/uv" .Values.runtimeRunner.cacheDir | quote }}
           {{- range .Values.extraEnv.runtimeRunner }}
             - name: {{ .name }}
               value: {{ .value | quote }}
@@ -59,6 +79,12 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: cache
+              mountPath: /.cache
+            - name: var-tmp
+              mountPath: /var/tmp
+            - name: home
+              mountPath: /home/langopen
           securityContext:
             runAsUser: 65532
             runAsGroup: 65532
@@ -72,6 +98,12 @@ spec:
             {{- toYaml .Values.runtimeRunner.resources | nindent 12 }}
       volumes:
         - name: tmp
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+        - name: var-tmp
+          emptyDir: {}
+        - name: home
           emptyDir: {}
 ---
 apiVersion: v1

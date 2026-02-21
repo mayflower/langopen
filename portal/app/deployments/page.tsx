@@ -17,7 +17,7 @@ import { Toolbar } from "../../components/ui/Toolbar";
 import { fetchPortalJSON, toPortalError, type PortalError } from "../../lib/client-api";
 import { compactId, formatDateTime } from "../../lib/format";
 import { useTableQueryState } from "../../lib/table-query";
-import { initialActionState, initialDataState } from "../../lib/ui-types";
+import { initialActionState, initialDataState, type DeploymentRuntimeVariable } from "../../lib/ui-types";
 
 type Deployment = {
   id: string;
@@ -39,7 +39,7 @@ type SecretBinding = {
   created_at: string;
 };
 
-type DetailTab = "overview" | "source" | "build" | "secrets" | "policy";
+type DetailTab = "overview" | "source" | "build" | "variables" | "secrets" | "policy";
 
 const DEFAULT_PROJECT = "proj_default";
 
@@ -65,9 +65,15 @@ export default function DeploymentsPage() {
   const [secretName, setSecretName] = useState("openai-secret");
   const [targetKey, setTargetKey] = useState("OPENAI_API_KEY");
   const [bindings, setBindings] = useState(initialDataState<SecretBinding>());
+  const [variables, setVariables] = useState(initialDataState<DeploymentRuntimeVariable>());
+  const [variableKey, setVariableKey] = useState("");
+  const [variableValue, setVariableValue] = useState("");
+  const [variableIsSecret, setVariableIsSecret] = useState(true);
+  const [variableQuickAdd, setVariableQuickAdd] = useState("");
 
   const [action, setAction] = useState(initialActionState());
   const [deletingBindingID, setDeletingBindingID] = useState("");
+  const [deletingVariableKey, setDeletingVariableKey] = useState("");
   const { state: table, setState: setTable } = useTableQueryState({ sort: "updated_at", order: "desc", page: 1, pageSize: 8 });
   const { toasts, push, remove } = useToastRegion();
 
@@ -76,11 +82,39 @@ export default function DeploymentsPage() {
   }, [projectID]);
 
   useEffect(() => {
-    if (!selectedDeploymentID) {
-      setBindings(initialDataState<SecretBinding>());
+    if (typeof window === "undefined") {
       return;
     }
-    void loadBindings(selectedDeploymentID);
+    const qs = new URLSearchParams(window.location.search);
+    const deploymentFromURL = qs.get("deployment_id");
+    const tabFromURL = qs.get("tab");
+    const prefillKeys = qs.get("prefill_keys");
+    if (deploymentFromURL) {
+      setSelectedDeploymentID(deploymentFromURL);
+    }
+    if (tabFromURL === "overview" || tabFromURL === "source" || tabFromURL === "build" || tabFromURL === "variables" || tabFromURL === "secrets" || tabFromURL === "policy") {
+      setTab(tabFromURL);
+    }
+    if (prefillKeys) {
+      const parsed = prefillKeys
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .join("\n");
+      if (parsed) {
+        setTab("variables");
+        setVariableQuickAdd(parsed);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!selectedDeploymentID) {
+      setBindings(initialDataState<SecretBinding>());
+      setVariables(initialDataState<DeploymentRuntimeVariable>());
+      return;
+    }
+    void Promise.all([loadBindings(selectedDeploymentID), loadVariables(selectedDeploymentID)]);
   }, [selectedDeploymentID, projectID]);
 
   const selectedDeployment = useMemo(
@@ -138,6 +172,19 @@ export default function DeploymentsPage() {
     } catch (err) {
       const normalized = err as PortalError;
       setBindings((prev) => ({ ...prev, loading: false, error: normalized.message }));
+    }
+  }
+
+  async function loadVariables(deploymentID: string) {
+    setVariables((prev) => ({ ...prev, loading: true, error: "" }));
+    try {
+      const rows = await fetchPortalJSON<DeploymentRuntimeVariable[]>(
+        `/api/platform/control/internal/v1/deployments/${encodeURIComponent(deploymentID)}/variables?project_id=${encodeURIComponent(projectID)}`
+      );
+      setVariables({ loading: false, error: "", items: rows });
+    } catch (err) {
+      const normalized = err as PortalError;
+      setVariables((prev) => ({ ...prev, loading: false, error: normalized.message }));
     }
   }
 
@@ -280,6 +327,101 @@ export default function DeploymentsPage() {
       push("error", normalized.message);
     } finally {
       setDeletingBindingID("");
+    }
+  }
+
+  async function upsertVariable(e: FormEvent) {
+    e.preventDefault();
+    if (!selectedDeploymentID) {
+      push("warning", "Select a deployment first.");
+      return;
+    }
+    if (!variableKey.trim()) {
+      push("warning", "Variable key is required.");
+      return;
+    }
+    setAction({ phase: "pending", message: "Saving deployment variable..." });
+    try {
+      await fetchPortalJSON(`/api/platform/control/internal/v1/deployments/${encodeURIComponent(selectedDeploymentID)}/variables`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_id: projectID,
+          key: variableKey.trim(),
+          value: variableValue,
+          is_secret: variableIsSecret
+        })
+      });
+      setAction({ phase: "success", message: "Variable saved." });
+      setVariableValue("");
+      push("success", `Saved variable ${variableKey.trim()}.`);
+      await loadVariables(selectedDeploymentID);
+    } catch (err) {
+      const normalized = err as PortalError;
+      setAction({ phase: "error", message: normalized.message });
+      push("error", normalized.message);
+    }
+  }
+
+  async function quickAddVariables() {
+    if (!selectedDeploymentID) {
+      push("warning", "Select a deployment first.");
+      return;
+    }
+    const keys = Array.from(
+      new Set(
+        variableQuickAdd
+          .split(/[\n,]/)
+          .map((item) => item.trim())
+          .filter(Boolean)
+      )
+    );
+    if (keys.length === 0) {
+      push("warning", "Enter one or more keys in quick-add.");
+      return;
+    }
+    setAction({ phase: "pending", message: `Adding ${keys.length} variables...` });
+    try {
+      for (const key of keys) {
+        await fetchPortalJSON(`/api/platform/control/internal/v1/deployments/${encodeURIComponent(selectedDeploymentID)}/variables`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            project_id: projectID,
+            key,
+            value: "",
+            is_secret: true
+          })
+        });
+      }
+      setVariableQuickAdd("");
+      setAction({ phase: "success", message: `Added ${keys.length} variables.` });
+      push("success", `Added ${keys.length} variables.`);
+      await loadVariables(selectedDeploymentID);
+    } catch (err) {
+      const normalized = err as PortalError;
+      setAction({ phase: "error", message: normalized.message });
+      push("error", normalized.message);
+    }
+  }
+
+  async function deleteVariable(key: string) {
+    if (!selectedDeploymentID) {
+      return;
+    }
+    setDeletingVariableKey(key);
+    try {
+      await fetchPortalJSON(
+        `/api/platform/control/internal/v1/deployments/${encodeURIComponent(selectedDeploymentID)}/variables/${encodeURIComponent(key)}?project_id=${encodeURIComponent(projectID)}`,
+        { method: "DELETE" }
+      );
+      push("success", `Deleted variable ${key}.`);
+      await loadVariables(selectedDeploymentID);
+    } catch (err) {
+      const normalized = err as PortalError;
+      push("error", normalized.message);
+    } finally {
+      setDeletingVariableKey("");
     }
   }
 
@@ -439,7 +581,8 @@ export default function DeploymentsPage() {
                   ["overview", "Overview"],
                   ["source", "Source"],
                   ["build", "Build"],
-                  ["secrets", "Secrets"],
+                  ["variables", "Variables"],
+                  ["secrets", "Secrets (legacy)"],
                   ["policy", "Policy"]
                 ] as [DetailTab, string][]).map(([value, label]) => (
                   <button
@@ -459,7 +602,7 @@ export default function DeploymentsPage() {
                 <>
                   {tab === "overview" ? (
                     <section className="ui-stack">
-                      <InlineAlert type="info">Select tabs to update source, trigger builds, bind secrets, or apply runtime policy.</InlineAlert>
+                      <InlineAlert type="info">Select tabs to update source, trigger builds, manage runtime variables, bind legacy secrets, or apply runtime policy.</InlineAlert>
                       <div className="ui-kpi-grid">
                         <article className="ui-kpi">
                           <span className="ui-muted">Repository</span>
@@ -516,6 +659,82 @@ export default function DeploymentsPage() {
                         </Button>
                       </div>
                     </form>
+                  ) : null}
+
+                  {tab === "variables" ? (
+                    <section className="ui-stack">
+                      <InlineAlert type="info">Runtime variables are applied to all runs for this deployment. Values are encrypted at rest and always masked in reads.</InlineAlert>
+                      <form className="ui-stack" onSubmit={upsertVariable}>
+                        <Toolbar>
+                          <Field id="dep-var-key" label="Key" value={variableKey} onChange={(e) => setVariableKey(e.target.value)} required />
+                          <Field id="dep-var-value" label="Value" value={variableValue} onChange={(e) => setVariableValue(e.target.value)} />
+                          <Select id="dep-var-secret" label="Secret" value={variableIsSecret ? "true" : "false"} onChange={(e) => setVariableIsSecret(e.target.value === "true")}>
+                            <option value="true">Secret</option>
+                            <option value="false">Non-secret</option>
+                          </Select>
+                        </Toolbar>
+                        <div className="ui-row">
+                          <Button type="submit" variant="primary" busy={action.phase === "pending"}>
+                            Save variable
+                          </Button>
+                          <Button type="button" variant="secondary" onClick={() => selectedDeployment ? void loadVariables(selectedDeployment.id) : undefined}>
+                            Refresh
+                          </Button>
+                        </div>
+                      </form>
+                      <label htmlFor="dep-var-quick-add" className="ui-field">
+                        <span className="ui-field__label">Quick add keys</span>
+                        <span className="ui-field__control">
+                          <textarea
+                            id="dep-var-quick-add"
+                            value={variableQuickAdd}
+                            onChange={(e) => setVariableQuickAdd(e.target.value)}
+                            placeholder={"OPENAI_API_KEY\nGROQ_API_KEY"}
+                            rows={4}
+                          />
+                        </span>
+                        <span className="ui-field__hint">Paste comma or newline separated keys to create masked variable rows quickly.</span>
+                      </label>
+                      <div className="ui-row">
+                        <Button type="button" variant="ghost" onClick={() => void quickAddVariables()} busy={action.phase === "pending"}>
+                          Quick add keys
+                        </Button>
+                      </div>
+                      {variables.error ? <InlineAlert type="error">{variables.error}</InlineAlert> : null}
+                      {variables.loading ? <InlineAlert type="info">Loading variables...</InlineAlert> : null}
+                      {!variables.loading && variables.items.length === 0 ? (
+                        <EmptyState title="No runtime variables" description="Add deployment runtime variables to satisfy agent/provider requirements." />
+                      ) : null}
+                      {variables.items.length > 0 ? (
+                        <DataTable
+                          dense
+                          rows={variables.items}
+                          columns={[
+                            { key: "key", header: "Key", render: (row) => <code>{row.key}</code> },
+                            { key: "is_secret", header: "Secret", render: (row) => (row.is_secret ? "yes" : "no") },
+                            { key: "value", header: "Value", render: (row) => <code>{row.value_masked || "********"}</code> },
+                            { key: "updated", header: "Updated", render: (row) => formatDateTime(row.updated_at) },
+                            {
+                              key: "action",
+                              header: "Action",
+                              render: (row) => (
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void deleteVariable(row.key);
+                                  }}
+                                  disabled={deletingVariableKey === row.key}
+                                >
+                                  Delete
+                                </Button>
+                              )
+                            }
+                          ]}
+                        />
+                      ) : null}
+                    </section>
                   ) : null}
 
                   {tab === "secrets" ? (
@@ -592,7 +811,7 @@ export default function DeploymentsPage() {
                   ) : null}
                 </>
               ) : (
-                <EmptyState title="No deployment selected" description="Select a deployment on the left to manage source, builds, secrets, and policy." />
+                <EmptyState title="No deployment selected" description="Select a deployment on the left to manage source, builds, runtime variables, secrets, and policy." />
               )}
 
               {action.message ? (

@@ -2,6 +2,7 @@ package integration
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -1471,6 +1472,186 @@ func TestControlPlaneSecretBindingProjectScope(t *testing.T) {
 	deleteAllowedResp.Body.Close()
 }
 
+func TestControlPlaneDeploymentVariableLifecycle(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://example.invalid")
+	t.Setenv("LANGOPEN_ENV", "prod")
+	t.Setenv("DEPLOYMENT_VARS_ENCRYPTION_KEY", base64.RawStdEncoding.EncodeToString([]byte("12345678901234567890123456789012")))
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doControlPlaneReq(t, ts.URL+"/internal/v1/deployments", map[string]any{
+		"project_id": "proj_default",
+		"repo_url":   "https://github.com/acme/agent",
+		"git_ref":    "main",
+		"repo_path":  ".",
+	})
+	if createResp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("expected 201, got %d body=%s", createResp.StatusCode, string(b))
+	}
+	var dep map[string]any
+	if err := json.NewDecoder(createResp.Body).Decode(&dep); err != nil {
+		t.Fatal(err)
+	}
+	createResp.Body.Close()
+	depID, _ := dep["id"].(string)
+	if depID == "" {
+		t.Fatal("missing deployment id")
+	}
+
+	upsertResp := doControlPlaneReqWithHeaders(t, http.MethodPut, ts.URL+"/internal/v1/deployments/"+depID+"/variables", map[string]any{
+		"project_id": "proj_default",
+		"key":        "OPENAI_API_KEY",
+		"value":      "sk-test-secret",
+		"is_secret":  true,
+	}, nil)
+	if upsertResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(upsertResp.Body)
+		t.Fatalf("expected 200, got %d body=%s", upsertResp.StatusCode, string(b))
+	}
+	var upserted map[string]any
+	if err := json.NewDecoder(upsertResp.Body).Decode(&upserted); err != nil {
+		t.Fatal(err)
+	}
+	upsertResp.Body.Close()
+	if got, _ := upserted["key"].(string); got != "OPENAI_API_KEY" {
+		t.Fatalf("expected key OPENAI_API_KEY, got %q", got)
+	}
+	if masked, _ := upserted["value_masked"].(string); masked == "" || strings.Contains(masked, "sk-test-secret") {
+		t.Fatalf("expected masked value without plaintext leak, got %q", masked)
+	}
+
+	listReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/deployments/"+depID+"/variables?project_id=proj_default", nil)
+	listResp, err := http.DefaultClient.Do(listReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(listResp.Body)
+		t.Fatalf("expected 200, got %d body=%s", listResp.StatusCode, string(b))
+	}
+	var items []map[string]any
+	if err := json.NewDecoder(listResp.Body).Decode(&items); err != nil {
+		t.Fatal(err)
+	}
+	listResp.Body.Close()
+	if len(items) != 1 {
+		t.Fatalf("expected 1 variable, got %d", len(items))
+	}
+	if masked, _ := items[0]["value_masked"].(string); masked == "" || strings.Contains(masked, "sk-test-secret") {
+		t.Fatalf("expected masked value in list response, got %q", masked)
+	}
+
+	deleteReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/internal/v1/deployments/"+depID+"/variables/OPENAI_API_KEY?project_id=proj_default", nil)
+	deleteResp, err := http.DefaultClient.Do(deleteReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(deleteResp.Body)
+		t.Fatalf("expected 200, got %d body=%s", deleteResp.StatusCode, string(b))
+	}
+	deleteResp.Body.Close()
+
+	listAfterReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/deployments/"+depID+"/variables?project_id=proj_default", nil)
+	listAfterResp, err := http.DefaultClient.Do(listAfterReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listAfterResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(listAfterResp.Body)
+		t.Fatalf("expected 200, got %d body=%s", listAfterResp.StatusCode, string(b))
+	}
+	var after []map[string]any
+	if err := json.NewDecoder(listAfterResp.Body).Decode(&after); err != nil {
+		t.Fatal(err)
+	}
+	listAfterResp.Body.Close()
+	if len(after) != 0 {
+		t.Fatalf("expected no variables after delete, got %d", len(after))
+	}
+}
+
+func TestControlPlaneDeploymentVariableProjectScope(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "")
+	t.Setenv("BUILDER_URL", "http://example.invalid")
+	t.Setenv("LANGOPEN_ENV", "prod")
+	t.Setenv("DEPLOYMENT_VARS_ENCRYPTION_KEY", base64.RawStdEncoding.EncodeToString([]byte("12345678901234567890123456789012")))
+
+	h := controlplaneapi.NewHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doControlPlaneReq(t, ts.URL+"/internal/v1/deployments", map[string]any{
+		"project_id": "proj_a",
+		"repo_url":   "https://github.com/acme/agent",
+		"git_ref":    "main",
+		"repo_path":  ".",
+	})
+	if createResp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("expected 201, got %d body=%s", createResp.StatusCode, string(b))
+	}
+	var dep map[string]any
+	if err := json.NewDecoder(createResp.Body).Decode(&dep); err != nil {
+		t.Fatal(err)
+	}
+	createResp.Body.Close()
+	depID, _ := dep["id"].(string)
+	if depID == "" {
+		t.Fatal("missing deployment id")
+	}
+
+	upsertDenied := doControlPlaneReqWithHeaders(t, http.MethodPut, ts.URL+"/internal/v1/deployments/"+depID+"/variables", map[string]any{
+		"project_id": "proj_b",
+		"key":        "OPENAI_API_KEY",
+		"value":      "secret",
+		"is_secret":  true,
+	}, nil)
+	if upsertDenied.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(upsertDenied.Body)
+		t.Fatalf("expected 404 for cross-project upsert, got %d body=%s", upsertDenied.StatusCode, string(b))
+	}
+	upsertDenied.Body.Close()
+
+	upsertAllowed := doControlPlaneReqWithHeaders(t, http.MethodPut, ts.URL+"/internal/v1/deployments/"+depID+"/variables", map[string]any{
+		"project_id": "proj_a",
+		"key":        "OPENAI_API_KEY",
+		"value":      "secret",
+		"is_secret":  true,
+	}, nil)
+	if upsertAllowed.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(upsertAllowed.Body)
+		t.Fatalf("expected 200 for same-project upsert, got %d body=%s", upsertAllowed.StatusCode, string(b))
+	}
+	upsertAllowed.Body.Close()
+
+	listDeniedReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/deployments/"+depID+"/variables?project_id=proj_b", nil)
+	listDeniedResp, err := http.DefaultClient.Do(listDeniedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listDeniedResp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(listDeniedResp.Body)
+		t.Fatalf("expected 404 for cross-project list, got %d body=%s", listDeniedResp.StatusCode, string(b))
+	}
+	listDeniedResp.Body.Close()
+
+	deleteDeniedReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/internal/v1/deployments/"+depID+"/variables/OPENAI_API_KEY?project_id=proj_b", nil)
+	deleteDeniedResp, err := http.DefaultClient.Do(deleteDeniedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteDeniedResp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(deleteDeniedResp.Body)
+		t.Fatalf("expected 404 for cross-project delete, got %d body=%s", deleteDeniedResp.StatusCode, string(b))
+	}
+	deleteDeniedResp.Body.Close()
+}
+
 func TestControlPlaneRBAC(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", "")
 	t.Setenv("BUILDER_URL", "http://example.invalid")
@@ -1591,6 +1772,13 @@ func TestMigrationContainsRequiredIndexes(t *testing.T) {
 	}
 	if !bytes.Contains(secretBindingsRaw, []byte("deployment_secret_bindings")) {
 		t.Fatal("missing deployment_secret_bindings migration")
+	}
+	runtimeVarsRaw, err := os.ReadFile(filepath.Join(root, "db", "migrations", "006_deployment_runtime_variables.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(runtimeVarsRaw, []byte("deployment_runtime_variables")) {
+		t.Fatal("missing deployment_runtime_variables migration")
 	}
 }
 

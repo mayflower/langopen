@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"langopen.dev/pkg/contracts"
+	pkgcrypto "langopen.dev/pkg/crypto"
 	"langopen.dev/pkg/observability"
 )
 
@@ -54,6 +55,7 @@ type API struct {
 	strictAgentSync     bool
 	agentNamespace      string
 	defaultAgentImage   string
+	deploymentVarCipher *pkgcrypto.AESGCM
 }
 
 type state struct {
@@ -62,6 +64,7 @@ type state struct {
 	APIKeys             []map[string]any
 	Audit               []map[string]any
 	Secrets             []map[string]any
+	RuntimeVariables    []map[string]any
 	DeploymentRevisions map[string][]deploymentRevisionRecord
 }
 
@@ -115,7 +118,19 @@ type secretBindingRecord struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
+type deploymentRuntimeVariableRecord struct {
+	Key         string    `json:"key"`
+	IsSecret    bool      `json:"is_secret"`
+	ValueMasked string    `json:"value_masked"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 func New(logger *slog.Logger) *API {
+	cipher, err := pkgcrypto.NewAESGCMFromEnv()
+	if err != nil {
+		logger.Error("deployment_vars_cipher_init_failed", "error", err)
+		panic(err)
+	}
 	a := &API{
 		logger:              logger,
 		builder:             strings.TrimRight(strings.TrimSpace(os.Getenv("BUILDER_URL")), "/"),
@@ -124,6 +139,7 @@ func New(logger *slog.Logger) *API {
 		strictAgentSync:     envBoolOrDefault("CONTROL_PLANE_SYNC_AGENTDEPLOYMENT_STRICT", false),
 		agentNamespace:      envOrDefault("AGENT_DEPLOYMENT_NAMESPACE", "default"),
 		defaultAgentImage:   envOrDefault("AGENT_DEPLOYMENT_IMAGE", "ghcr.io/mayflower/langopen/agent-runtime:latest"),
+		deploymentVarCipher: cipher,
 	}
 	if a.builder == "" {
 		a.builder = "http://langopen-builder"
@@ -171,6 +187,9 @@ func New(logger *slog.Logger) *API {
 		v1.Post("/secrets/bind", a.bindSecret)
 		v1.Get("/secrets/bindings", a.listSecretBindings)
 		v1.Delete("/secrets/bindings/{binding_id}", a.deleteSecretBinding)
+		v1.Get("/deployments/{deployment_id}/variables", a.listDeploymentVariables)
+		v1.Put("/deployments/{deployment_id}/variables", a.upsertDeploymentVariable)
+		v1.Delete("/deployments/{deployment_id}/variables/{key}", a.deleteDeploymentVariable)
 		v1.Get("/audit", a.listAudit)
 	})
 	r.Route("/v2", func(v2 chi.Router) {
@@ -954,6 +973,7 @@ func (a *API) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 		_, _ = tx.Exec(r.Context(), `DELETE FROM builds WHERE deployment_id=$1`, deploymentID)
 		_, _ = tx.Exec(r.Context(), `DELETE FROM deployment_revisions WHERE deployment_id=$1`, deploymentID)
 		_, _ = tx.Exec(r.Context(), `DELETE FROM deployment_secret_bindings WHERE deployment_id=$1`, deploymentID)
+		_, _ = tx.Exec(r.Context(), `DELETE FROM deployment_runtime_variables WHERE deployment_id=$1`, deploymentID)
 		tag, err := tx.Exec(r.Context(), `DELETE FROM deployments WHERE id=$1`, deploymentID)
 		if err != nil {
 			contracts.WriteError(w, http.StatusInternalServerError, "db_delete_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
@@ -1013,6 +1033,14 @@ func (a *API) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 		remainingSecrets = append(remainingSecrets, secret)
 	}
 	a.state.Secrets = remainingSecrets
+	remainingVars := make([]map[string]any, 0, len(a.state.RuntimeVariables))
+	for _, item := range a.state.RuntimeVariables {
+		if depID, _ := item["deployment_id"].(string); depID == deploymentID {
+			continue
+		}
+		remainingVars = append(remainingVars, item)
+	}
+	a.state.RuntimeVariables = remainingVars
 
 	a.state.Audit = append(a.state.Audit, map[string]any{
 		"event":         "deployment.deleted",
@@ -1924,6 +1952,283 @@ func (a *API) deleteSecretBinding(w http.ResponseWriter, r *http.Request) {
 	})
 	a.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "binding_id": bindingID})
+}
+
+func (a *API) listDeploymentVariables(w http.ResponseWriter, r *http.Request) {
+	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
+	projectID, err := a.resolveProjectID(r.Context(), r.URL.Query().Get("project_id"))
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if deploymentID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	dep, err := a.getDeployment(r.Context(), deploymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if projectID != "" && dep.ProjectID != projectID {
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	if a.pg != nil {
+		rows, err := a.pg.Query(r.Context(), `
+			SELECT key, is_secret, updated_at
+			FROM deployment_runtime_variables
+			WHERE deployment_id=$1
+			ORDER BY updated_at DESC
+			LIMIT 500
+		`, deploymentID)
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_query_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		defer rows.Close()
+		out := make([]deploymentRuntimeVariableRecord, 0)
+		for rows.Next() {
+			var rec deploymentRuntimeVariableRecord
+			if err := rows.Scan(&rec.Key, &rec.IsSecret, &rec.UpdatedAt); err != nil {
+				contracts.WriteError(w, http.StatusInternalServerError, "db_scan_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+				return
+			}
+			rec.ValueMasked = maskRuntimeVariableValue()
+			out = append(out, rec)
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make([]deploymentRuntimeVariableRecord, 0)
+	for _, item := range a.state.RuntimeVariables {
+		if depID, _ := item["deployment_id"].(string); depID != deploymentID {
+			continue
+		}
+		key, _ := item["key"].(string)
+		isSecret, _ := item["is_secret"].(bool)
+		updatedAt, _ := item["updated_at"].(time.Time)
+		out = append(out, deploymentRuntimeVariableRecord{
+			Key:         key,
+			IsSecret:    isSecret,
+			ValueMasked: maskRuntimeVariableValue(),
+			UpdatedAt:   updatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *API) upsertDeploymentVariable(w http.ResponseWriter, r *http.Request) {
+	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
+	if deploymentID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	var req struct {
+		ProjectID string `json:"project_id"`
+		Key       string `json:"key"`
+		Value     string `json:"value"`
+		IsSecret  *bool  `json:"is_secret"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	projectID, err := a.resolveProjectID(r.Context(), req.ProjectID)
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	key := strings.TrimSpace(req.Key)
+	if key == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_variable", "key is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	dep, err := a.getDeployment(r.Context(), deploymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if projectID != "" && dep.ProjectID != projectID {
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if a.deploymentVarCipher == nil {
+		contracts.WriteError(w, http.StatusInternalServerError, "deployment_vars_cipher_missing", "deployment vars encryption is not configured", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	isSecret := true
+	if req.IsSecret != nil {
+		isSecret = *req.IsSecret
+	}
+	ciphertext, err := a.deploymentVarCipher.EncryptString(req.Value)
+	if err != nil {
+		contracts.WriteError(w, http.StatusInternalServerError, "deployment_var_encrypt_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	now := time.Now().UTC()
+	if a.pg != nil {
+		_, err := a.pg.Exec(r.Context(), `
+			INSERT INTO deployment_runtime_variables (id, deployment_id, key, value_ciphertext, is_secret, created_at, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$6)
+			ON CONFLICT (deployment_id, key)
+			DO UPDATE SET value_ciphertext=EXCLUDED.value_ciphertext, is_secret=EXCLUDED.is_secret, updated_at=EXCLUDED.updated_at
+		`, contracts.NewID("drv"), deploymentID, key, ciphertext, isSecret, now)
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_upsert_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		_ = a.writeAudit(r.Context(), dep.ProjectID, "deployment.variable.upserted", map[string]any{
+			"deployment_id": deploymentID,
+			"key":           key,
+			"is_secret":     isSecret,
+		})
+		writeJSON(w, http.StatusOK, deploymentRuntimeVariableRecord{
+			Key:         key,
+			IsSecret:    isSecret,
+			ValueMasked: maskRuntimeVariableValue(),
+			UpdatedAt:   now,
+		})
+		return
+	}
+
+	a.mu.Lock()
+	replaced := false
+	for i, item := range a.state.RuntimeVariables {
+		if depID, _ := item["deployment_id"].(string); depID == deploymentID {
+			if existingKey, _ := item["key"].(string); existingKey == key {
+				a.state.RuntimeVariables[i] = map[string]any{
+					"id":               item["id"],
+					"deployment_id":    deploymentID,
+					"key":              key,
+					"value_ciphertext": ciphertext,
+					"is_secret":        isSecret,
+					"created_at":       item["created_at"],
+					"updated_at":       now,
+				}
+				replaced = true
+				break
+			}
+		}
+	}
+	if !replaced {
+		a.state.RuntimeVariables = append(a.state.RuntimeVariables, map[string]any{
+			"id":               contracts.NewID("drv"),
+			"deployment_id":    deploymentID,
+			"key":              key,
+			"value_ciphertext": ciphertext,
+			"is_secret":        isSecret,
+			"created_at":       now,
+			"updated_at":       now,
+		})
+	}
+	a.state.Audit = append(a.state.Audit, map[string]any{
+		"event":         "deployment.variable.upserted",
+		"timestamp":     now,
+		"deployment_id": deploymentID,
+		"key":           key,
+		"is_secret":     isSecret,
+	})
+	a.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, deploymentRuntimeVariableRecord{
+		Key:         key,
+		IsSecret:    isSecret,
+		ValueMasked: maskRuntimeVariableValue(),
+		UpdatedAt:   now,
+	})
+}
+
+func (a *API) deleteDeploymentVariable(w http.ResponseWriter, r *http.Request) {
+	deploymentID := strings.TrimSpace(chi.URLParam(r, "deployment_id"))
+	key := strings.TrimSpace(chi.URLParam(r, "key"))
+	if deploymentID == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_deployment_id", "deployment_id is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if key == "" {
+		contracts.WriteError(w, http.StatusBadRequest, "invalid_variable_key", "key is required", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	projectID, err := a.resolveProjectID(r.Context(), r.URL.Query().Get("project_id"))
+	if err != nil {
+		contracts.WriteError(w, http.StatusForbidden, "project_scope_violation", "project_id does not match API key scope", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	dep, err := a.getDeployment(r.Context(), deploymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		contracts.WriteError(w, http.StatusInternalServerError, "deployment_lookup_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	if projectID != "" && dep.ProjectID != projectID {
+		contracts.WriteError(w, http.StatusNotFound, "deployment_not_found", "deployment not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+
+	if a.pg != nil {
+		tag, err := a.pg.Exec(r.Context(), `DELETE FROM deployment_runtime_variables WHERE deployment_id=$1 AND key=$2`, deploymentID, key)
+		if err != nil {
+			contracts.WriteError(w, http.StatusInternalServerError, "db_delete_failed", err.Error(), observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		if tag.RowsAffected() == 0 {
+			contracts.WriteError(w, http.StatusNotFound, "deployment_variable_not_found", "deployment variable not found", observability.RequestIDFromContext(r.Context()))
+			return
+		}
+		_ = a.writeAudit(r.Context(), dep.ProjectID, "deployment.variable.deleted", map[string]any{
+			"deployment_id": deploymentID,
+			"key":           key,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "key": key})
+		return
+	}
+
+	a.mu.Lock()
+	next := make([]map[string]any, 0, len(a.state.RuntimeVariables))
+	found := false
+	for _, item := range a.state.RuntimeVariables {
+		if depID, _ := item["deployment_id"].(string); depID == deploymentID {
+			if existingKey, _ := item["key"].(string); existingKey == key {
+				found = true
+				continue
+			}
+		}
+		next = append(next, item)
+	}
+	if !found {
+		a.mu.Unlock()
+		contracts.WriteError(w, http.StatusNotFound, "deployment_variable_not_found", "deployment variable not found", observability.RequestIDFromContext(r.Context()))
+		return
+	}
+	a.state.RuntimeVariables = next
+	a.state.Audit = append(a.state.Audit, map[string]any{
+		"event":         "deployment.variable.deleted",
+		"timestamp":     time.Now().UTC(),
+		"deployment_id": deploymentID,
+		"key":           key,
+	})
+	a.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "key": key})
+}
+
+func maskRuntimeVariableValue() string {
+	return "********"
 }
 
 func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {

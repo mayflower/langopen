@@ -39,6 +39,7 @@ function createInitialState() {
       dep: 3,
       build: 2,
       binding: 2,
+      variable: 2,
       key: 2,
       run: 3
     },
@@ -85,6 +86,16 @@ function createInitialState() {
         secret_name: "openai-secret",
         target_key: "OPENAI_API_KEY",
         created_at: "2026-02-20T07:25:00Z"
+      }
+    ],
+    runtimeVariables: [
+      {
+        id: "var_1",
+        deployment_id: "dep_alpha",
+        key: "OPENAI_API_KEY",
+        value_masked: "********",
+        is_secret: true,
+        updated_at: "2026-02-20T07:26:00Z"
       }
     ],
     apiKeys: [
@@ -178,6 +189,45 @@ async function handleControl(method, path, url, req, res) {
       state.assistants = state.assistants.filter((assistant) => assistant.deployment_id !== depID);
       return sendJSON(res, 200, { ok: true });
     }
+  }
+
+  const variableListMatch = path.match(/^\/internal\/v1\/deployments\/([^/]+)\/variables$/);
+  if (variableListMatch) {
+    const depID = decodeURIComponent(variableListMatch[1]);
+    if (method === "GET") {
+      const rows = state.runtimeVariables
+        .filter((item) => item.deployment_id === depID)
+        .map(({ key, is_secret, value_masked, updated_at }) => ({ key, is_secret, value_masked, updated_at }));
+      return sendJSON(res, 200, rows);
+    }
+    if (method === "PUT") {
+      const body = await readJSON(req);
+      const key = body.key || "OPENAI_API_KEY";
+      const row = {
+        id: `var_${state.counters.variable++}`,
+        deployment_id: depID,
+        key,
+        value_masked: "********",
+        is_secret: body.is_secret !== false,
+        updated_at: "2026-02-20T08:03:30Z"
+      };
+      state.runtimeVariables = state.runtimeVariables.filter((item) => !(item.deployment_id === depID && item.key === key));
+      state.runtimeVariables.unshift(row);
+      return sendJSON(res, 200, {
+        key: row.key,
+        is_secret: row.is_secret,
+        value_masked: row.value_masked,
+        updated_at: row.updated_at
+      });
+    }
+  }
+
+  const variableDeleteMatch = path.match(/^\/internal\/v1\/deployments\/([^/]+)\/variables\/([^/]+)$/);
+  if (method === "DELETE" && variableDeleteMatch) {
+    const depID = decodeURIComponent(variableDeleteMatch[1]);
+    const key = decodeURIComponent(variableDeleteMatch[2]);
+    state.runtimeVariables = state.runtimeVariables.filter((item) => !(item.deployment_id === depID && item.key === key));
+    return sendJSON(res, 200, { status: "deleted", key });
   }
 
   if (method === "POST" && path === "/internal/v1/sources/validate") {

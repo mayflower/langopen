@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import importlib
 import inspect
@@ -18,8 +19,16 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 # Some dependency stacks call Path.home()/expanduser and fail when the container UID
-# does not exist in /etc/passwd; force a writable home in our tmp volume.
-os.environ.setdefault("HOME", "/tmp")
+# does not exist in /etc/passwd; force a writable home in a mounted writable volume.
+_DEFAULT_HOME = os.getenv("RUNTIME_RUNNER_WRITABLE_HOME", "/home/langopen").strip() or "/home/langopen"
+_DEFAULT_CACHE = os.getenv("RUNTIME_RUNNER_CACHE_DIR", "/.cache").strip() or "/.cache"
+os.environ.setdefault("HOME", _DEFAULT_HOME)
+os.environ.setdefault("TMPDIR", "/tmp")
+os.environ.setdefault("TMP", "/tmp")
+os.environ.setdefault("TEMP", "/tmp")
+os.environ.setdefault("XDG_CACHE_HOME", _DEFAULT_CACHE)
+os.environ.setdefault("PIP_CACHE_DIR", f"{_DEFAULT_CACHE}/pip")
+os.environ.setdefault("UV_CACHE_DIR", f"{_DEFAULT_CACHE}/uv")
 _orig_getpwuid = pwd.getpwuid
 
 
@@ -27,7 +36,7 @@ def _safe_getpwuid(uid: int) -> pwd.struct_passwd:
     try:
         return _orig_getpwuid(uid)
     except KeyError:
-        home = os.getenv("HOME", "/tmp")
+        home = os.getenv("HOME", _DEFAULT_HOME)
         return pwd.struct_passwd(("langopen", "x", uid, uid, "langopen", home, "/sbin/nologin"))
 
 
@@ -63,6 +72,7 @@ class ExecuteRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     checkpoint_id: str = ""
     runtime_metadata: Any = None
+    runtime_env: dict[str, str] = Field(default_factory=dict)
 
 
 class EventItem(BaseModel):
@@ -90,11 +100,34 @@ _REQUIREMENTS_LOCKS: dict[str, threading.Lock] = {}
 _REQUIREMENTS_LOCKS_GUARD = threading.Lock()
 _REPO_LOCKS: dict[str, threading.Lock] = {}
 _REPO_LOCKS_GUARD = threading.Lock()
+_EXECUTION_ENV_LOCK = threading.Lock()
 
 
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _writable_paths() -> list[Path]:
+    return [
+        Path("/tmp"),
+        Path("/var/tmp"),
+        Path(os.getenv("XDG_CACHE_HOME", _DEFAULT_CACHE)),
+        Path(os.getenv("HOME", _DEFAULT_HOME)),
+    ]
+
+
+def _assert_writable_paths() -> None:
+    for path in _writable_paths():
+        path.mkdir(parents=True, exist_ok=True)
+        sentinel = path / f".langopen-write-check-{os.getpid()}"
+        sentinel.write_text("ok\n", encoding="utf-8")
+        sentinel.unlink()
+
+
+@app.on_event("startup")
+def _startup_self_check() -> None:
+    _assert_writable_paths()
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -118,6 +151,38 @@ def _env_list(name: str, default: str) -> list[str]:
         if text:
             out.append(text)
     return out
+
+
+def _normalize_runtime_env(raw: Any) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        k = str(key or "").strip()
+        if not k:
+            continue
+        out[k] = str(value if value is not None else "")
+    return out
+
+
+@contextlib.contextmanager
+def _execution_environment(runtime_env: dict[str, str], repo_path: str) -> Any:
+    old_cwd = os.getcwd()
+    previous = {key: os.environ.get(key) for key in runtime_env}
+    with _EXECUTION_ENV_LOCK:
+        try:
+            for key, value in runtime_env.items():
+                os.environ[key] = value
+            if repo_path:
+                os.chdir(repo_path)
+            yield
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            os.chdir(old_cwd)
 
 
 def _repo_lock(key: str) -> threading.Lock:
@@ -775,33 +840,35 @@ def execute(req: ExecuteRequest) -> ExecuteResponse:
         repo_path = _repo_path(req)
         repo_root = _find_repo_root(repo_path)
         langgraph_cfg = _load_langgraph_config(repo_root)
+        runtime_env = _normalize_runtime_env(req.runtime_env)
 
-        graph_target = _graph_target(req, langgraph_cfg)
-        if not graph_target:
-            raise RuntimeRunnerError("graph_target_resolution_failed", "graph target is required")
+        with _execution_environment(runtime_env, repo_path):
+            graph_target = _graph_target(req, langgraph_cfg)
+            if not graph_target:
+                raise RuntimeRunnerError("graph_target_resolution_failed", "graph target is required")
 
-        python_version = _runtime_python_version(req, langgraph_cfg)
-        plan = _dependency_install_plan(repo_root, langgraph_cfg, req)
-        _, pybin = _ensure_plan_installed(repo_root, python_version, plan)
+            python_version = _runtime_python_version(req, langgraph_cfg)
+            plan = _dependency_install_plan(repo_root, langgraph_cfg, req)
+            _, pybin = _ensure_plan_installed(repo_root, python_version, plan)
 
-        compat_profile = str(os.getenv("RUNTIME_RUNNER_COMPAT_PROFILE", "langchain-community")).strip()
-        _ensure_compat_profile(pybin, compat_profile, compat_actions)
-        _apply_langchain_shims(compat_actions)
+            compat_profile = str(os.getenv("RUNTIME_RUNNER_COMPAT_PROFILE", "langchain-community")).strip()
+            _ensure_compat_profile(pybin, compat_profile, compat_actions)
+            _apply_langchain_shims(compat_actions)
 
-        _ensure_required_env(repo_root, plan)
+            _ensure_required_env(repo_root, plan)
 
-        try:
-            target_obj = _resolve_target(graph_target, repo_root, repo_path)
-        except RuntimeRunnerError as target_err:
-            # Best-effort compat retry for dynamic asyncpg import failures.
-            if target_err.code == "graph_target_resolution_failed" and "asyncpg" in str(target_err.details.get("error", "")):
-                _install_with_pip(pybin, ["asyncpg"])
-                compat_actions.append("compat_install:asyncpg")
+            try:
                 target_obj = _resolve_target(graph_target, repo_root, repo_path)
-            else:
-                raise
+            except RuntimeRunnerError as target_err:
+                # Best-effort compat retry for dynamic asyncpg import failures.
+                if target_err.code == "graph_target_resolution_failed" and "asyncpg" in str(target_err.details.get("error", "")):
+                    _install_with_pip(pybin, ["asyncpg"])
+                    compat_actions.append("compat_install:asyncpg")
+                    target_obj = _resolve_target(graph_target, repo_root, repo_path)
+                else:
+                    raise
 
-        raw_result = _invoke_target(target_obj, req)
+            raw_result = _invoke_target(target_obj, req)
 
         if isinstance(raw_result, dict):
             status = str(raw_result.get("status", "success")).strip() or "success"

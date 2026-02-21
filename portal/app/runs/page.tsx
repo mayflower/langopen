@@ -51,6 +51,7 @@ export default function RunsPage() {
   const [entries, setEntries] = useState<StreamEntry[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [actionMessage, setActionMessage] = useState("");
+  const [missingEnvKeys, setMissingEnvKeys] = useState<string[]>([]);
 
   useEffect(() => {
     void loadOptions();
@@ -73,6 +74,11 @@ export default function RunsPage() {
 
   const timeline = useMemo(() => [...entries].reverse(), [entries]);
   const latestEvent = entries[entries.length - 1];
+  const deploymentForContext = useMemo(() => {
+    const selectedThread = threads.find((thread) => thread.id === threadID);
+    const effectiveAssistantID = selectedThread?.assistant_id || assistantID;
+    return assistants.find((assistant) => assistant.id === effectiveAssistantID)?.deployment_id || "";
+  }, [assistants, assistantID, threadID, threads]);
 
   async function loadOptions() {
     setLoadError(null);
@@ -102,6 +108,7 @@ export default function RunsPage() {
     }
     setEntries([]);
     setLastEventID("-1");
+    setMissingEnvKeys([]);
     setActionMessage("Starting thread run...");
 
     try {
@@ -135,6 +142,7 @@ export default function RunsPage() {
     }
     setEntries([]);
     setLastEventID("-1");
+    setMissingEnvKeys([]);
     setActionMessage("Starting stateless run...");
 
     try {
@@ -242,6 +250,25 @@ export default function RunsPage() {
     if (parsed && typeof parsed.run_id === "string") {
       setRunID(parsed.run_id);
     }
+    const missing = extractMissingRequiredEnv(parsed);
+    if (missing.length > 0) {
+      setMissingEnvKeys(missing);
+    }
+  }
+
+  function openVariables() {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const params = new URLSearchParams();
+    if (deploymentForContext) {
+      params.set("deployment_id", deploymentForContext);
+    }
+    params.set("tab", "variables");
+    if (missingEnvKeys.length > 0) {
+      params.set("prefill_keys", missingEnvKeys.join(","));
+    }
+    window.location.assign(`/deployments?${params.toString()}`);
   }
 
   return (
@@ -316,6 +343,14 @@ export default function RunsPage() {
               </div>
 
               {actionMessage ? <InlineAlert type="info">{actionMessage}</InlineAlert> : null}
+              {missingEnvKeys.length > 0 ? (
+                <InlineAlert type="warning">
+                  Missing runtime variables detected: <code>{missingEnvKeys.join(", ")}</code>.{" "}
+                  <Button type="button" variant="ghost" onClick={openVariables}>
+                    Open deployment variables
+                  </Button>
+                </InlineAlert>
+              ) : null}
             </section>
           }
           right={
@@ -430,6 +465,35 @@ function parseJSON(input: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+function extractMissingRequiredEnv(payload: Record<string, unknown> | null): string[] {
+  if (!payload) {
+    return [];
+  }
+  const error = payload.error;
+  if (!error || typeof error !== "object") {
+    return [];
+  }
+  const errorObj = error as Record<string, unknown>;
+  if (errorObj.type !== "missing_required_env") {
+    return [];
+  }
+  const details = errorObj.details;
+  if (!details || typeof details !== "object") {
+    return [];
+  }
+  const missing = (details as Record<string, unknown>).missing;
+  if (!Array.isArray(missing)) {
+    return [];
+  }
+  return Array.from(
+    new Set(
+      missing
+        .map((item) => `${item ?? ""}`.trim())
+        .filter(Boolean)
+    )
+  );
 }
 
 async function toPortalError(resp: Response, fallback: string): Promise<PortalError> {

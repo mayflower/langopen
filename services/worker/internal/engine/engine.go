@@ -30,6 +30,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"langopen.dev/pkg/contracts"
+	pkgcrypto "langopen.dev/pkg/crypto"
 )
 
 var (
@@ -67,6 +68,7 @@ type Worker struct {
 	executorMode        string
 	executor            runExecutor
 	modeBSandboxStrict  bool
+	deploymentVarCipher *pkgcrypto.AESGCM
 }
 
 type pendingRun struct {
@@ -84,6 +86,10 @@ type pendingRun struct {
 	RepoURL         string
 	GitRef          string
 	RuntimeMetadata map[string]any
+	RuntimeEnv      map[string]string
+	DeploymentID    string
+	ProjectID       string
+	EnvDecryptErr   string
 }
 
 type runCorrelation struct {
@@ -166,6 +172,7 @@ func (e *runtimeRunnerExecutor) Execute(ctx context.Context, run pendingRun) (ex
 		"metadata":         run.Metadata,
 		"checkpoint_id":    run.CheckpointID,
 		"runtime_metadata": runtimeMeta,
+		"runtime_env":      run.RuntimeEnv,
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(e.baseURL, "/")+"/execute", bytes.NewReader(body))
@@ -217,6 +224,10 @@ func (e *runtimeRunnerExecutor) Execute(ctx context.Context, run pendingRun) (ex
 
 func New(cfg Config, logger *slog.Logger) (*Worker, error) {
 	initWorkerMetrics()
+	cipher, err := pkgcrypto.NewAESGCMFromEnv()
+	if err != nil {
+		return nil, err
+	}
 	w := &Worker{
 		cfg:    cfg,
 		logger: logger,
@@ -238,6 +249,7 @@ func New(cfg Config, logger *slog.Logger) (*Worker, error) {
 		stuckRunThreshold:   time.Duration(envIntOrDefault("STUCK_RUN_SECONDS", 300)) * time.Second,
 		executorMode:        strings.TrimSpace(strings.ToLower(envOrDefault("LANGOPEN_EXECUTOR", "runtime"))),
 		modeBSandboxStrict:  !envBoolOrDefault("MODE_B_ALLOW_SIMULATED_SANDBOX", false),
+		deploymentVarCipher: cipher,
 	}
 	if cfg.PostgresDSN != "" {
 		pg, err := pgxpool.New(context.Background(), cfg.PostgresDSN)
@@ -431,6 +443,8 @@ func (w *Worker) fetchNextPendingRun(ctx context.Context) (pendingRun, error) {
 			COALESCE(r.metadata_json, '{}'::jsonb),
 			COALESCE(r.checkpoint_id, ''),
 			COALESCE(a.graph_id, ''),
+			COALESCE(d.id, ''),
+			COALESCE(d.project_id, ''),
 			COALESCE(d.repo_path, ''),
 			COALESCE(d.repo_url, ''),
 			COALESCE(d.git_ref, '')
@@ -441,7 +455,7 @@ func (w *Worker) fetchNextPendingRun(ctx context.Context) (pendingRun, error) {
 		ORDER BY r.created_at ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
-	`).Scan(&run.ID, &run.ThreadID, &run.AssistantID, &run.StreamResumable, &rawInput, &rawMetadata, &run.CheckpointID, &run.GraphID, &run.RepoPath, &run.RepoURL, &run.GitRef)
+	`).Scan(&run.ID, &run.ThreadID, &run.AssistantID, &run.StreamResumable, &rawInput, &rawMetadata, &run.CheckpointID, &run.GraphID, &run.DeploymentID, &run.ProjectID, &run.RepoPath, &run.RepoURL, &run.GitRef)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return pendingRun{}, sql.ErrNoRows
@@ -497,6 +511,24 @@ func (w *Worker) fetchNextPendingRun(ctx context.Context) (pendingRun, error) {
 	run.RuntimeMetadata["git_ref"] = run.GitRef
 	run.RuntimeMetadata["repo_path"] = run.RepoPath
 	run.RuntimeMetadata["graph_id"] = run.GraphID
+	runtimeEnv, envErr := w.loadDeploymentRuntimeEnv(ctx, run.DeploymentID)
+	if envErr != nil {
+		run.EnvDecryptErr = envErr.Error()
+	} else {
+		run.RuntimeEnv = runtimeEnv
+	}
+	runRuntimeEnv := map[string]string{}
+	if run.RuntimeEnv != nil {
+		for key, value := range run.RuntimeEnv {
+			runRuntimeEnv[key] = value
+		}
+	}
+	if override := extractRuntimeEnv(run.Metadata); len(override) > 0 {
+		for key, value := range override {
+			runRuntimeEnv[key] = value
+		}
+	}
+	run.RuntimeEnv = runRuntimeEnv
 
 	_, err = tx.Exec(ctx, `UPDATE runs SET status='running', started_at=COALESCE(started_at, NOW()), updated_at=NOW() WHERE id=$1`, run.ID)
 	if err != nil {
@@ -587,6 +619,18 @@ func (w *Worker) executeRun(ctx context.Context, run pendingRun) {
 		}
 	}
 	w.emitStreamEvent(ctx, run, "run_started", map[string]any{"run_id": run.ID, "status": "running"})
+	if run.EnvDecryptErr != "" {
+		errPayload := map[string]any{
+			"type":    "deployment_env_decrypt_failed",
+			"message": run.EnvDecryptErr,
+			"run_id":  run.ID,
+		}
+		_ = w.updateRunResult(ctx, run.ID, contracts.RunStatusError, nil, errPayload)
+		_ = w.updateCronExecutionStatus(ctx, run.ID, "error")
+		w.emitStreamEvent(ctx, run, "run_failed", map[string]any{"run_id": run.ID, "status": "error", "error": errPayload})
+		_ = w.enqueueWebhookForRun(ctx, run.ID)
+		return
+	}
 
 	action = w.currentCancelAction(ctx, run.ID)
 	if action == "rollback" {
@@ -1082,6 +1126,66 @@ func (w *Worker) observeOperationalHealth(ctx context.Context) {
 			workerBackendUpGauge.WithLabelValues("redis").Set(1)
 		}
 	}
+}
+
+func (w *Worker) loadDeploymentRuntimeEnv(ctx context.Context, deploymentID string) (map[string]string, error) {
+	out := map[string]string{}
+	if w.pg == nil || strings.TrimSpace(deploymentID) == "" {
+		return out, nil
+	}
+	if w.deploymentVarCipher == nil {
+		return nil, errors.New("deployment vars cipher is not configured")
+	}
+	rows, err := w.pg.Query(ctx, `
+		SELECT key, value_ciphertext
+		FROM deployment_runtime_variables
+		WHERE deployment_id=$1
+	`, deploymentID)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "deployment_runtime_variables") && strings.Contains(strings.ToLower(err.Error()), "does not exist") {
+			return out, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key, ciphertext string
+		if err := rows.Scan(&key, &ciphertext); err != nil {
+			return nil, err
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		plaintext, err := w.deploymentVarCipher.DecryptString(ciphertext)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt deployment variable %q: %w", key, err)
+		}
+		out[key] = plaintext
+	}
+	return out, rows.Err()
+}
+
+func extractRuntimeEnv(metadata map[string]any) map[string]string {
+	out := map[string]string{}
+	addMap := func(raw map[string]any) {
+		for key, value := range raw {
+			trimmed := strings.TrimSpace(key)
+			if trimmed == "" {
+				continue
+			}
+			out[trimmed] = fmt.Sprintf("%v", value)
+		}
+	}
+	if raw, ok := metadata["runtime_env"].(map[string]any); ok {
+		addMap(raw)
+	}
+	if runtimeMeta, ok := metadata["runtime_metadata"].(map[string]any); ok {
+		if raw, ok := runtimeMeta["runtime_env"].(map[string]any); ok {
+			addMap(raw)
+		}
+	}
+	return out
 }
 
 func cancelKeyPrefix() string {

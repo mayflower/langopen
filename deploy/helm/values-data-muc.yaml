@@ -10,11 +10,13 @@ global:
   envFromSecret: langopen-runtime-secrets
 
 env:
+  langopenEnv: prod
   builderUrl: http://langopen-builder
   controlPlaneSyncAgentDeployment: true
   controlPlaneSyncAgentDeploymentStrict: false
   agentDeploymentNamespace: langopen
   agentDeploymentImage: ghcr.io/mayflower/langopen/api-server:latest
+  deploymentVarsEncryptionKey: ""
 
 apiServer:
   replicas: 1
@@ -50,6 +52,8 @@ worker:
 runtimeRunner:
   enabled: true
   replicas: 1
+  writableHome: /home/langopen
+  cacheDir: /.cache
 
 controlPlane:
   enabled: true

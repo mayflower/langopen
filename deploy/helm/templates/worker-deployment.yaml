@@ -34,6 +34,8 @@ spec:
             - containerPort: 9091
               name: metrics
           env:
+            - name: LANGOPEN_ENV
+              value: {{ .Values.env.langopenEnv | quote }}
             {{- if .Values.env.postgresDsn }}
             - name: POSTGRES_DSN
               value: {{ .Values.env.postgresDsn | quote }}
@@ -70,6 +72,10 @@ spec:
               value: {{ .Values.worker.sandboxTemplateName | quote }}
             - name: WORKER_METRICS_ADDR
               value: {{ .Values.worker.metricsAddr | quote }}
+            {{- if .Values.env.deploymentVarsEncryptionKey }}
+            - name: DEPLOYMENT_VARS_ENCRYPTION_KEY
+              value: {{ .Values.env.deploymentVarsEncryptionKey | quote }}
+            {{- end }}
           {{- range .Values.extraEnv.worker }}
             - name: {{ .name }}
               value: {{ .value | quote }}

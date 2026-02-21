@@ -101,6 +101,29 @@ class RuntimeRunnerAppTests(unittest.TestCase):
                 if old_value is not None:
                     os.environ["GROQ_API_KEY"] = old_value
 
+    def test_execution_environment_applies_and_restores_env_and_cwd(self):
+        old_cwd = os.getcwd()
+        old_value = os.environ.get("LANGOPEN_TEST_RUNTIME_ENV")
+        with tempfile.TemporaryDirectory() as tmp:
+            with APP._execution_environment({"LANGOPEN_TEST_RUNTIME_ENV": "set-value"}, tmp):
+                self.assertEqual(os.environ.get("LANGOPEN_TEST_RUNTIME_ENV"), "set-value")
+                self.assertEqual(Path(os.getcwd()).resolve(), Path(tmp).resolve())
+        self.assertEqual(os.getcwd(), old_cwd)
+        self.assertEqual(os.environ.get("LANGOPEN_TEST_RUNTIME_ENV"), old_value)
+
+    def test_writable_path_self_check_uses_declared_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p1 = Path(tmp) / "cache"
+            p2 = Path(tmp) / "home"
+            original = APP._writable_paths
+            APP._writable_paths = lambda: [p1, p2]
+            try:
+                APP._assert_writable_paths()
+            finally:
+                APP._writable_paths = original
+            self.assertTrue(p1.is_dir())
+            self.assertTrue(p2.is_dir())
+
 
 if __name__ == "__main__":
     unittest.main()

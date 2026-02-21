@@ -212,7 +212,8 @@ pre {
 }
 
 .ui-field input,
-.ui-field select {
+.ui-field select,
+.ui-field textarea {
   width: 100%;
   border: 0;
   background: transparent;
@@ -226,8 +227,14 @@ pre {
 }
 
 .ui-field input:focus,
-.ui-field select:focus {
+.ui-field select:focus,
+.ui-field textarea:focus {
   outline: none;
+}
+
+.ui-field textarea {
+  min-height: 96px;
+  resize: vertical;
 }
 
 .ui-field:focus-within .ui-field__control {
