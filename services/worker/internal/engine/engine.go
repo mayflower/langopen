@@ -257,7 +257,7 @@ func New(cfg Config, logger *slog.Logger) (*Worker, error) {
 		w.executor = &runtimeRunnerExecutor{
 			baseURL: runtimeURL,
 			httpClient: &http.Client{
-				Timeout: time.Duration(envIntOrDefault("RUNTIME_RUNNER_TIMEOUT_SECONDS", 120)) * time.Second,
+				Timeout: time.Duration(envIntOrDefault("RUNTIME_RUNNER_TIMEOUT_SECONDS", 900)) * time.Second,
 			},
 		}
 	}
@@ -317,6 +317,16 @@ func (w *Worker) runWakeupLoop(ctx context.Context) error {
 		result, err := w.redis.BLPop(ctx, 2*time.Second, w.cfg.QueueKey).Result()
 		if err != nil {
 			if errors.Is(err, redis.Nil) || errors.Is(err, context.DeadlineExceeded) {
+				// Fallback poll keeps execution progressing if wake signals are missed.
+				run, fetchErr := w.fetchNextPendingRun(ctx)
+				if fetchErr != nil {
+					if errors.Is(fetchErr, sql.ErrNoRows) {
+						continue
+					}
+					w.logger.Error("fetch_pending_run_failed", "error", fetchErr)
+					continue
+				}
+				w.executeRun(ctx, run)
 				continue
 			}
 			if errors.Is(err, context.Canceled) {
@@ -326,6 +336,16 @@ func (w *Worker) runWakeupLoop(ctx context.Context) error {
 			continue
 		}
 		if len(result) < 2 {
+			// Defensive fallback if Redis returns a malformed wakeup payload.
+			run, fetchErr := w.fetchNextPendingRun(ctx)
+			if fetchErr != nil {
+				if errors.Is(fetchErr, sql.ErrNoRows) {
+					continue
+				}
+				w.logger.Error("fetch_pending_run_failed", "error", fetchErr)
+				continue
+			}
+			w.executeRun(ctx, run)
 			continue
 		}
 		w.observeQueueDepth(ctx)

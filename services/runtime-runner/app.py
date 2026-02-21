@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import inspect
 import os
+import pwd
 import subprocess
 import sys
 import threading
@@ -13,6 +14,22 @@ from typing import Any
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
+
+# Some dependency stacks call Path.home()/expanduser and fail when the container UID
+# does not exist in /etc/passwd; force a writable home in our tmp volume.
+os.environ.setdefault("HOME", "/tmp")
+_orig_getpwuid = pwd.getpwuid
+
+
+def _safe_getpwuid(uid: int) -> pwd.struct_passwd:
+    try:
+        return _orig_getpwuid(uid)
+    except KeyError:
+        home = os.getenv("HOME", "/tmp")
+        return pwd.struct_passwd(("langopen", "x", uid, uid, "langopen", home, "/sbin/nologin"))
+
+
+pwd.getpwuid = _safe_getpwuid
 
 
 class ExecuteRequest(BaseModel):
@@ -81,7 +98,63 @@ def _graph_target(req: ExecuteRequest) -> str:
     return ""
 
 
+def _repo_url(req: ExecuteRequest) -> str:
+    cfg = _as_dict(req.configurable)
+    meta = _as_dict(req.metadata)
+    nested_meta = _as_dict(meta.get("metadata"))
+    for candidate in (
+        cfg.get("repo_url"),
+        meta.get("repo_url"),
+        nested_meta.get("repo_url"),
+        os.getenv("RUNTIME_RUNNER_DEFAULT_REPO_URL", ""),
+    ):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _repo_subpath(req: ExecuteRequest) -> str:
+    cfg = _as_dict(req.configurable)
+    meta = _as_dict(req.metadata)
+    nested_meta = _as_dict(meta.get("metadata"))
+    for candidate in (
+        cfg.get("repo_path"),
+        cfg.get("working_dir"),
+        meta.get("repo_path"),
+        nested_meta.get("repo_path"),
+        os.getenv("RUNTIME_RUNNER_DEFAULT_REPO_PATH", "."),
+    ):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return "."
+
+
+def _git_ref(req: ExecuteRequest) -> str:
+    cfg = _as_dict(req.configurable)
+    meta = _as_dict(req.metadata)
+    nested_meta = _as_dict(meta.get("metadata"))
+    for candidate in (
+        cfg.get("git_ref"),
+        meta.get("git_ref"),
+        nested_meta.get("git_ref"),
+        "main",
+    ):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return "main"
+
+
 def _repo_path(req: ExecuteRequest) -> str:
+    repo_url = _repo_url(req)
+    if repo_url:
+        cloned_path = _materialize_repo_path(req)
+        if cloned_path:
+            return cloned_path
+
+    # Local fallback: used for local/dev execution where no repo_url is supplied.
     cfg = _as_dict(req.configurable)
     meta = _as_dict(req.metadata)
     nested_meta = _as_dict(meta.get("metadata"))
@@ -98,10 +171,45 @@ def _repo_path(req: ExecuteRequest) -> str:
         path = Path(text).expanduser().resolve()
         if path.is_dir():
             return str(path)
-    cloned_path = _materialize_repo_path(req)
-    if cloned_path:
-        return cloned_path
     return ""
+
+
+def _materialize_repo_path(req: ExecuteRequest) -> str:
+    repo_url = _repo_url(req)
+    if not repo_url:
+        return ""
+
+    git_ref = _git_ref(req)
+    repo_subpath = _repo_subpath(req)
+    digest = hashlib.sha256(f"{repo_url}@{git_ref}".encode("utf-8")).hexdigest()
+    cache_root = Path(os.getenv("RUNTIME_RUNNER_REPO_CACHE_DIR", "/tmp/langopen-repo-cache")).expanduser().resolve()
+    repo_dir = cache_root / digest
+    lock = _repo_lock(digest)
+
+    with lock:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        if not (repo_dir / ".git").is_dir():
+            subprocess.run(
+                ["git", "clone", "--depth", "1", "--branch", git_ref, repo_url, str(repo_dir)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        elif _env_bool("RUNTIME_RUNNER_GIT_REFRESH", False):
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "fetch", "--depth", "1", "origin", git_ref],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "reset", "--hard", "FETCH_HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+    return str(_resolve_repo_subpath(repo_dir.resolve(), repo_subpath))
 
 
 def _requirements_file(req: ExecuteRequest, repo_path: str) -> str:
@@ -163,45 +271,6 @@ def _resolve_repo_subpath(repo_dir: Path, repo_subpath: str) -> Path:
     return target
 
 
-def _materialize_repo_path(req: ExecuteRequest) -> str:
-    cfg = _as_dict(req.configurable)
-    repo_url = str(cfg.get("repo_url") or "").strip()
-    if not repo_url:
-        return ""
-
-    git_ref = str(cfg.get("git_ref") or "main").strip() or "main"
-    repo_subpath = str(cfg.get("repo_path") or ".").strip() or "."
-    digest = hashlib.sha256(f"{repo_url}@{git_ref}".encode("utf-8")).hexdigest()
-    cache_root = Path(os.getenv("RUNTIME_RUNNER_REPO_CACHE_DIR", "/tmp/langopen-repo-cache")).expanduser().resolve()
-    repo_dir = cache_root / digest
-    lock = _repo_lock(digest)
-
-    with lock:
-        cache_root.mkdir(parents=True, exist_ok=True)
-        if not (repo_dir / ".git").is_dir():
-            subprocess.run(
-                ["git", "clone", "--depth", "1", "--branch", git_ref, repo_url, str(repo_dir)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        elif _env_bool("RUNTIME_RUNNER_GIT_REFRESH", False):
-            subprocess.run(
-                ["git", "-C", str(repo_dir), "fetch", "--depth", "1", "origin", git_ref],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run(
-                ["git", "-C", str(repo_dir), "reset", "--hard", "FETCH_HEAD"],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-
-    return str(_resolve_repo_subpath(repo_dir.resolve(), repo_subpath))
-
-
 def _ensure_requirements_installed(req_file: str) -> None:
     req_path = Path(req_file)
     req_bytes = req_path.read_bytes()
@@ -253,8 +322,17 @@ def _resolve_target(target: str, repo_path: str) -> Any:
     if not module_name or not attr_path:
         raise ValueError("graph target is missing module or object")
 
-    if repo_path and repo_path not in sys.path:
-        sys.path.insert(0, repo_path)
+    if repo_path:
+        repo_dir = Path(repo_path).expanduser().resolve()
+        repo_root = repo_dir
+        for parent in (repo_dir, *repo_dir.parents):
+            if (parent / ".git").is_dir():
+                repo_root = parent
+                break
+
+        for candidate in (str(repo_root), str(repo_dir)):
+            if candidate not in sys.path:
+                sys.path.insert(0, candidate)
 
     module = importlib.import_module(module_name)
     obj: Any = module
